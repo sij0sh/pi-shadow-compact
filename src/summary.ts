@@ -5,6 +5,7 @@ import {
   type Context,
   type Message,
   type Model,
+  type ModelThinkingLevel,
   type ModelsApiStreamOptions,
   type Usage,
 } from "@earendil-works/pi-ai";
@@ -68,6 +69,7 @@ export interface SummaryRequest {
   completion?: CompletionInterface;
   model?: Model<Api>;
   maxTokens?: number;
+  thinkingLevel?: ModelThinkingLevel;
 }
 
 export interface SummaryOutcome {
@@ -100,6 +102,9 @@ export async function runSummaryAgent(
   const options = {
     maxTokens: request.maxTokens ?? SUMMARY_MAX_TOKENS,
     ...(request.signal ? { signal: request.signal } : {}),
+    ...(model.reasoning && request.thinkingLevel && request.thinkingLevel !== "off"
+      ? { reasoning: request.thinkingLevel }
+      : {}),
     cacheRetention: "none" as const,
     sessionId: uuidv7(),
   };

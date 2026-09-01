@@ -222,6 +222,31 @@ describe("runSummaryAgent", () => {
     assert.deepEqual(result.usage, usage(1));
   });
 
+  it("forwards thinkingLevel as reasoning only for reasoning models", async () => {
+    const reasoningModel = { provider: "configured", id: "summary", reasoning: true } as Model<Api>;
+    const completion = new FakeCompletion([response(valid)]);
+    await runSummaryAgent(context([], reasoningModel), packet, config, {
+      completion,
+      thinkingLevel: "high",
+    });
+    assert.equal((completion.calls[0]!.options as { reasoning?: unknown }).reasoning, "high");
+
+    const off = new FakeCompletion([response(valid)]);
+    await runSummaryAgent(context([], summaryModel), packet, config, {
+      completion: off,
+      thinkingLevel: "off",
+    });
+    assert.equal("reasoning" in off.calls[0]!.options, false);
+
+    const plainModel = { provider: "p", id: "plain", api: "test" } as Model<Api>;
+    const plain = new FakeCompletion([response(valid)]);
+    await runSummaryAgent(context([], plainModel), packet, config, {
+      completion: plain,
+      thinkingLevel: "high",
+    });
+    assert.equal("reasoning" in plain.calls[0]!.options, false);
+  });
+
   it("runs on the session model for a blank configured pair", async () => {
     const completion = new FakeCompletion([response(valid)]);
     const finds: Array<[string, string]> = [];

@@ -58,6 +58,20 @@ To pin a model, set both fields to an exact provider key and model ID. This incl
 
 Model IDs can contain `/` or `:`, so provider and ID use separate fields.
 
+### Optional summarizer tuning
+
+```json
+{
+  "summaryMaxTokens": 32768,
+  "thinkingLevel": "high"
+}
+```
+
+- `summaryMaxTokens` caps the summary response. The default is `4096`, clamped to the model's own output limit. Raise it only for very large sessions.
+- `thinkingLevel` forwards a reasoning level (`minimal` through `max`, or `off`) to reasoning models. It is ignored for non-reasoning models.
+
+The background summary input budget comes from the model's registered context window in `~/.pi/agent/models.json` (`contextWindow`). If you override `summaryMaxTokens`, the extension still reserves at least half the context window for transcript evidence, so the input side never starves.
+
 Reload Pi after changing either file.
 
 ## Safety and native fallback

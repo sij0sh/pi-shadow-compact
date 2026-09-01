@@ -158,6 +158,22 @@ describe("shadow compact config loading", () => {
     });
   });
 
+  it("accepts summaryMaxTokens and thinkingLevel overrides", async (t) => {
+    const cwd = await temporaryCwd(t);
+    await writeJson(projectConfigPath(cwd), {
+      ...configBody(42, "provider", "model"),
+      summaryMaxTokens: 32_768,
+      thinkingLevel: "high",
+    });
+
+    assert.deepEqual(await loadConfig(context(cwd)), {
+      softCompactThresholdPercent: 42,
+      summarizerModel: { provider: "provider", id: "model" },
+      summaryMaxTokens: 32_768,
+      thinkingLevel: "high",
+    });
+  });
+
   for (const location of ["global", "project"] as const) {
     describe(`invalid ${location} config`, () => {
       async function writeBadConfig(cwd: string, value: unknown): Promise<string> {
@@ -262,18 +278,23 @@ describe("shadow compact config loading", () => {
         });
       }
 
-      for (const removedKey of ["summaryMaxTokens", "thinkingLevel"]) {
-        it(`removed key ${removedKey} throws with the file path`, async (t) => {
+      for (const invalid of [
+        { summaryMaxTokens: 0 },
+        { summaryMaxTokens: -1 },
+        { summaryMaxTokens: 1.5 },
+        { summaryMaxTokens: "4096" },
+        { summaryMaxTokens: null },
+        { thinkingLevel: "bogus" },
+        { thinkingLevel: 5 },
+      ]) {
+        it(`invalid ${JSON.stringify(invalid)} throws with the file path`, async (t) => {
           const cwd = await temporaryCwd(t);
-          const path = await writeBadConfig(cwd, {
-            ...configBody(60),
-            [removedKey]: removedKey === "summaryMaxTokens" ? 4096 : "high",
-          });
+          const path = await writeBadConfig(cwd, { ...configBody(60), ...invalid });
 
           await assertLoadError(
             loadConfig(context(cwd)),
             path,
-            new RegExp(`has unknown key: ${removedKey}`),
+            /summaryMaxTokens must be a positive integer|thinkingLevel must be one of/,
           );
         });
       }

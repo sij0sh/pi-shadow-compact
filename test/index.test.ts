@@ -19,6 +19,25 @@ it("uses the default summary token cap and no reasoning without overrides", asyn
     const options = f.registry.optionsList[0];
     assert.ok(options);
     assert.equal(options.maxTokens, 4096);
+    assert.equal((options as { reasoning?: unknown }).reasoning, undefined);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+it("honors summaryMaxTokens and thinkingLevel overrides", async () => {
+  const f = await fixture({
+    softCompactThresholdPercent: 60,
+    summarizerModel: { provider: "", id: "" },
+    summaryMaxTokens: 32_768,
+    thinkingLevel: "high",
+  });
+  try {
+    await startPreparation(f);
+    const options = f.registry.optionsList[0];
+    assert.ok(options);
+    assert.equal(options.maxTokens, 32_768);
+    assert.equal((options as { reasoning?: unknown }).reasoning, "high");
   } finally {
     await f.cleanup();
   }

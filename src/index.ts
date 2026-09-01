@@ -64,7 +64,8 @@ export default function shadowCompact(pi: ExtensionAPI): void {
 
     try {
       const model = resolveSummarizerModel(ctx, config);
-      const maxTokens = Math.min(SUMMARY_MAX_TOKENS, model.maxTokens ?? SUMMARY_MAX_TOKENS);
+      const maxTokens =
+        config.summaryMaxTokens ?? Math.min(SUMMARY_MAX_TOKENS, model.maxTokens ?? SUMMARY_MAX_TOKENS);
       // Keep evidence usable when a large override is budgeted: never reserve more than
       // half the context window, so the input side always retains room to work with.
       const reservedTokens = Math.min(
@@ -86,6 +87,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         signal: controller.signal,
         model,
         maxTokens,
+        ...(config.thinkingLevel ? { thinkingLevel: config.thinkingLevel } : {}),
       });
 
       const current = ctx.sessionManager.getBranch();

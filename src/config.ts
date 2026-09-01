@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import {
   CONFIG_DIR_NAME,
   getAgentDir,
@@ -8,12 +9,24 @@ import {
 
 export const DEFAULT_SOFT_COMPACT_THRESHOLD_PERCENT = 60;
 
+export const THINKING_LEVELS = [
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+] as const satisfies readonly ModelThinkingLevel[];
+
 export interface ShadowCompactConfig {
   softCompactThresholdPercent: number;
   summarizerModel: {
     provider: string;
     id: string;
   };
+  summaryMaxTokens?: number;
+  thinkingLevel?: ModelThinkingLevel;
 }
 
 export function defaultConfig(): ShadowCompactConfig {
@@ -62,7 +75,12 @@ export function parseConfig(source: string, path: string): ShadowCompactConfig {
   }
   const record = value as Record<string, unknown>;
   for (const key of Object.keys(record)) {
-    if (key !== "softCompactThresholdPercent" && key !== "summarizerModel") {
+    if (
+      key !== "softCompactThresholdPercent" &&
+      key !== "summarizerModel" &&
+      key !== "summaryMaxTokens" &&
+      key !== "thinkingLevel"
+    ) {
       throw new Error(`${path} has unknown key: ${key}`);
     }
   }
@@ -97,8 +115,29 @@ export function parseConfig(source: string, path: string): ShadowCompactConfig {
     throw new Error(`${path} summarizerModel.provider and .id must both be blank or both be set`);
   }
 
-  return {
+  const config: ShadowCompactConfig = {
     softCompactThresholdPercent: rawThreshold,
     summarizerModel: { provider, id },
   };
+
+  const rawMaxTokens = record.summaryMaxTokens;
+  if (rawMaxTokens !== undefined) {
+    if (typeof rawMaxTokens !== "number" || !Number.isInteger(rawMaxTokens) || rawMaxTokens < 1) {
+      throw new Error(`${path} summaryMaxTokens must be a positive integer`);
+    }
+    config.summaryMaxTokens = rawMaxTokens;
+  }
+
+  const rawThinkingLevel = record.thinkingLevel;
+  if (rawThinkingLevel !== undefined) {
+    if (
+      typeof rawThinkingLevel !== "string" ||
+      !THINKING_LEVELS.includes(rawThinkingLevel as ModelThinkingLevel)
+    ) {
+      throw new Error(`${path} thinkingLevel must be one of: ${THINKING_LEVELS.join(", ")}`);
+    }
+    config.thinkingLevel = rawThinkingLevel as ModelThinkingLevel;
+  }
+
+  return config;
 }
