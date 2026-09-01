@@ -1,10 +1,7 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 import test from "node:test";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
-import { NORMALIZED_PACKET_MAX_CHARS } from "../src/constants.js";
-import { normalizeSnapshot } from "../src/normalize.js";
-import type { SessionSnapshot } from "../src/types.js";
+import { NORMALIZED_PACKET_MAX_CHARS, normalizeSnapshot } from "../src/normalize.js";
 
 const cwd = "/work/project";
 let sequence = 0;
@@ -19,20 +16,7 @@ function entry(value: object): SessionEntry {
   } as SessionEntry;
 }
 
-function snapshot(sourceEntries: SessionEntry[], previousSummary?: string): SessionSnapshot {
-  return {
-    sessionId: "session",
-    leafId: sourceEntries.at(-1)?.id ?? "leaf",
-    firstKeptEntryId: sourceEntries[0]?.id ?? "leaf",
-    cwd,
-    branch: sourceEntries,
-    sourceEntries,
-    source: "branchEntries",
-    ...(previousSummary === undefined ? {} : { previousSummary }),
-  };
-}
-
-test("normalizes conversational and tool evidence without thinking or metadata", () => {
+test("normalizes conversation, tool, bash, custom message, and branch evidence", () => {
   sequence = 0;
   const entries = [
     entry({
@@ -101,10 +85,9 @@ test("normalizes conversational and tool evidence without thinking or metadata",
     entry({ type: "branch_summary", fromId: "old", summary: "Tried another route" }),
     entry({ type: "compaction", summary: "must be omitted", firstKeptEntryId: "x", tokensBefore: 1 }),
     entry({ type: "custom", customType: "state", data: { secret: "must be omitted" } }),
-    entry({ type: "custom_message", customType: "internal", content: "[shadow-compact:probe:abc]", display: false }),
   ];
 
-  const packet = normalizeSnapshot(snapshot(entries));
+  const packet = normalizeSnapshot({ cwd, entries });
   assert.deepEqual(packet.evidence.map((item) => item.kind), [
     "user",
     "assistant",
@@ -118,57 +101,88 @@ test("normalizes conversational and tool evidence without thinking or metadata",
     "E0001", "E0002", "E0003", "E0004", "E0005", "E0006", "E0007",
   ]);
 
+  assert.equal(packet.evidence[0]?.text, "Inspect ./src/a.ts");
+  assert.equal(packet.evidence[1]?.text, "I will inspect it.");
+  assert.equal(
+    packet.evidence[2]?.text,
+    `tool: edit\nargs: {"edits":[{"newText":"new","oldText":"old"}],"path":"./src/a.ts","token":"[REDACTED]"}`,
+  );
+  assert.equal(
+    packet.evidence[3]?.text,
+    "tool: edit\nstatus: ok\noutput:\nEdited ./src/a.ts password=[REDACTED]\ndiff:\n-old\n+new",
+  );
+  assert.equal(packet.evidence[4]?.text, "command: pwd\nexit: 0\noutput:\n.\n");
+  assert.equal(packet.evidence[5]?.text, "Remember this");
+  assert.equal(packet.evidence[6]?.text, "Tried another route");
+
   const text = packet.evidence.map((item) => item.text).join("\n");
-  assert.match(text, /\.\/src\/a\.ts/);
-  assert.match(text, /\[REDACTED\]/);
-  assert.match(text, /diff:\n-old\n\+new/);
-  assert.doesNotMatch(text, /private reasoning|hunter2|secret command|must be omitted|shadow-compact/);
-  assert.equal(packet.digest, createHash("sha256").update(JSON.stringify(packet.evidence)).digest("hex"));
-  assert.equal(packet.digest.length, 64);
-  assert.equal(packet.truncated, false);
-  assert.equal(packet.usedPreviousCheckpointFallback, false);
+  assert.doesNotMatch(text, /private reasoning|hunter2|secret command|must be omitted/);
 });
 
-test("bounds individual output deterministically and marks truncation", () => {
+test("redacts bearer tokens, JWTs, API keys, env-var secrets, and URL credentials", () => {
   sequence = 0;
-  const large = `${"start".repeat(6_000)}TAIL_SENTINEL`;
-  const result = entry({
-    type: "message",
-    message: {
-      role: "toolResult",
-      toolCallId: "call",
-      toolName: "read",
-      content: [{ type: "text", text: large }],
-      isError: false,
-      timestamp: 1,
-    },
-  });
-
-  const first = normalizeSnapshot(snapshot([result]));
-  const second = normalizeSnapshot(snapshot([result]));
-  assert.deepEqual(first, second);
-  assert.equal(first.truncated, true);
-  assert.match(first.evidence[0]?.text ?? "", /truncated \d+ chars/);
-  assert.match(first.evidence[0]?.text ?? "", /TAIL_SENTINEL$/);
-  assert.ok((first.evidence[0]?.text.length ?? Infinity) < large.length);
-});
-
-test("keeps one contiguous newest suffix when a middle record does not fit", () => {
-  sequence = 0;
+  const content = [
+    "Authorization: Bearer live-token-abc123",
+    "jwt: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+    "key sk-abcdefghij0123456789",
+    "MY_API_KEY=supersecretvalue",
+    "password=hunter2",
+    "login at https://admin:p4ssw0rd@example.com/api",
+  ].join("\n");
   const entries = [
-    entry({ type: "message", message: { role: "user", content: "old-small", timestamp: 1 } }),
-    entry({ type: "message", message: { role: "user", content: `middle:${"x".repeat(3_000)}`, timestamp: 2 } }),
-    entry({ type: "message", message: { role: "user", content: "new-small", timestamp: 3 } }),
+    entry({ type: "message", message: { role: "user", content, timestamp: 1 } }),
   ];
 
-  const packet = normalizeSnapshot(snapshot(entries, "Earlier checkpoint"), 1_000);
-  const text = packet.evidence.map((item) => item.text).join("\n");
-  assert.match(text, /Earlier checkpoint/);
-  assert.match(text, /new-small/);
-  assert.doesNotMatch(text, /middle:|old-small/);
+  const packet = normalizeSnapshot({ cwd, entries });
+  const text = packet.evidence[0]?.text ?? "";
+  assert.match(text, /Bearer \[REDACTED\]/);
+  assert.match(text, /\[REDACTED JWT\]/);
+  assert.match(text, /key \[REDACTED\]/);
+  assert.match(text, /MY_API_KEY=\[REDACTED\]/);
+  assert.match(text, /password=\[REDACTED\]/);
+  assert.match(text, /https:\/\/\[REDACTED\]@example\.com\/api/);
+  assert.doesNotMatch(text, /live-token|eyJhbGci|sk-abcdefghij|supersecretvalue|hunter2|admin:p4ssw0rd/);
 });
 
-test("caps oversized packets using the checkpoint and newest evidence", () => {
+test("promotes previous summary to the first previous_checkpoint evidence", () => {
+  sequence = 0;
+  const entries = [
+    entry({ type: "message", message: { role: "user", content: "current ask", timestamp: 1 } }),
+  ];
+
+  const packet = normalizeSnapshot({ cwd, previousSummary: "Earlier checkpoint", entries });
+  assert.equal(packet.evidence[0]?.kind, "previous_checkpoint");
+  assert.equal(packet.evidence[0]?.sourceEntryId, "checkpoint");
+  assert.equal(packet.evidence[0]?.text, "Earlier checkpoint");
+  assert.equal(packet.evidence[1]?.kind, "user");
+  assert.deepEqual(
+    packet.evidence.map((item) => item.evidenceId),
+    ["E0001", "E0002"],
+  );
+
+  const without = normalizeSnapshot({ cwd, entries });
+  assert.ok(without.evidence.every((item) => item.kind !== "previous_checkpoint"));
+});
+
+test("truncates oversized items deterministically with a head and tail sentinel", () => {
+  sequence = 0;
+  const large = `HEAD_MARKER${"x".repeat(45_000)}TAIL_SENTINEL`;
+  const result = entry({
+    type: "message",
+    message: { role: "user", content: large, timestamp: 1 },
+  });
+
+  const first = normalizeSnapshot({ cwd, entries: [result] });
+  const second = normalizeSnapshot({ cwd, entries: [result] });
+  assert.deepEqual(first, second);
+  const text = first.evidence[0]?.text ?? "";
+  assert.ok(text.startsWith("HEAD_MARKER"));
+  assert.ok(text.endsWith("TAIL_SENTINEL"));
+  assert.match(text, /\n\.\.\.\[truncated \d+ chars\]\.\.\.\n/);
+  assert.ok(text.length < large.length);
+});
+
+test("caps packets by dropping oldest evidence and keeping the newest", () => {
   sequence = 0;
   const entries = Array.from({ length: 8 }, (_, index) =>
     entry({
@@ -177,11 +191,10 @@ test("caps oversized packets using the checkpoint and newest evidence", () => {
     }),
   );
 
-  const packet = normalizeSnapshot(snapshot(entries, "Earlier verified checkpoint"));
-  assert.equal(packet.truncated, true);
-  assert.equal(packet.usedPreviousCheckpointFallback, true);
-  assert.equal(packet.evidence[0]?.kind, "previous_checkpoint");
+  const packet = normalizeSnapshot({ cwd, previousSummary: "Earlier verified checkpoint", entries });
+  const text = packet.evidence.map((item) => item.text).join("\n");
+  assert.ok(JSON.stringify({ evidence: packet.evidence }).length <= NORMALIZED_PACKET_MAX_CHARS);
   assert.match(packet.evidence.at(-1)?.text ?? "", /^message-7:/);
-  assert.ok(JSON.stringify(packet.evidence).length <= NORMALIZED_PACKET_MAX_CHARS);
+  assert.doesNotMatch(text, /message-0:/);
   assert.ok(packet.evidence.length < entries.length + 1);
 });

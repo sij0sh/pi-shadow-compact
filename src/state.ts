@@ -1,178 +1,104 @@
-import { randomUUID } from "node:crypto";
 import type { Usage } from "@earendil-works/pi-ai";
-import { ADOPT_PREFIX, PROBE_PREFIX } from "./constants.js";
-import type { SnapshotIdentity } from "./types.js";
 
-export interface PreparedFileDetails {
+export interface FileDetails {
   readFiles: string[];
   modifiedFiles: string[];
 }
 
-export interface PreparedProvenance {
-  digest: string;
-  evidenceCount: number;
-  truncated: boolean;
-  usedPreviousCheckpointFallback: boolean;
-  evidenceRefs: string[];
-}
-
-export interface PreparedSummary {
-  snapshot: SnapshotIdentity;
+export interface PreparedResult {
+  sessionId: string;
+  leafId: string;
+  latestCompactionId: string | null;
+  firstKeptEntryId: string;
   summary: string;
   usage: Usage;
-  details: PreparedFileDetails & { provenance: PreparedProvenance };
+  details: FileDetails;
 }
 
-interface EpochState {
-  readonly epoch: number;
+interface Base {
+  readonly generation: number;
 }
 
-export interface IdleState extends EpochState {
+export interface IdleState extends Base {
   readonly phase: "idle";
+  readonly pendingNativeFallback: boolean;
 }
 
-export interface ProbingState extends EpochState {
-  readonly phase: "probing";
-  readonly marker: string;
-}
-
-export interface PreparingState extends EpochState {
+export interface PreparingState extends Base {
   readonly phase: "preparing";
-  readonly probeMarker: string;
   readonly controller: AbortController;
 }
 
-export interface ReadyState extends EpochState {
+export interface ReadyState extends Base {
   readonly phase: "ready";
-  readonly prepared: PreparedSummary;
+  readonly result: PreparedResult;
 }
 
-export interface AdoptingState extends EpochState {
-  readonly phase: "adopting";
-  readonly marker: string;
-  readonly prepared: PreparedSummary;
-  readonly promise: Promise<void>;
+export interface CommittingState extends Base {
+  readonly phase: "committing";
+  readonly result: PreparedResult;
+  readonly nonce: string;
 }
 
-export interface DisposedState extends EpochState {
-  readonly phase: "disposed";
-}
+export type ShadowCompactState = IdleState | PreparingState | ReadyState | CommittingState;
 
-export type ShadowCompactState =
-  | IdleState
-  | ProbingState
-  | PreparingState
-  | ReadyState
-  | AdoptingState
-  | DisposedState;
-
-export function isProbeMarker(value: unknown): value is string {
-  return typeof value === "string" && value.startsWith(PROBE_PREFIX) && value.endsWith("]");
-}
-
-export function isAdoptMarker(value: unknown): value is string {
-  return typeof value === "string" && value.startsWith(ADOPT_PREFIX) && value.endsWith("]");
-}
-
-/** Owns the state and cancellation resources for one extension instance. */
+/** Owns generation, cancellation, and one-shot commit state for one extension. */
 export class ShadowCompactStateController {
-  #state: ShadowCompactState = { phase: "idle", epoch: 0 };
-  #sequence = 0;
+  #state: ShadowCompactState = { phase: "idle", generation: 0, pendingNativeFallback: false };
 
   get current(): ShadowCompactState {
     return this.#state;
   }
 
-  beginProbe(): ProbingState | undefined {
+  startPreparing(): PreparingState | undefined {
     if (this.#state.phase !== "idle") return undefined;
-    const state: ProbingState = {
-      phase: "probing",
-      epoch: this.#state.epoch,
-      marker: this.#marker(PROBE_PREFIX),
-    };
-    this.#state = state;
-    return state;
-  }
-
-  beginPreparation(probeMarker: string): PreparingState | undefined {
-    if (this.#state.phase !== "probing" || this.#state.marker !== probeMarker) return undefined;
     const state: PreparingState = {
       phase: "preparing",
-      epoch: this.#nextEpoch(),
-      probeMarker,
+      generation: this.#state.generation,
       controller: new AbortController(),
     };
     this.#state = state;
     return state;
   }
 
-  publish(epoch: number, prepared: PreparedSummary): boolean {
-    if (this.#state.phase !== "preparing" || this.#state.epoch !== epoch) return false;
+  publish(generation: number, result: PreparedResult): boolean {
+    if (this.#state.phase !== "preparing" || this.#state.generation !== generation) return false;
     if (this.#state.controller.signal.aborted) return false;
-    this.#state = { phase: "ready", epoch, prepared };
+    this.#state = { phase: "ready", generation, result };
     return true;
   }
 
-  failPreparation(epoch: number): boolean {
-    if (this.#state.phase !== "preparing" || this.#state.epoch !== epoch) return false;
-    this.reset();
+  fail(generation: number): boolean {
+    if (this.#state.phase !== "preparing" || this.#state.generation !== generation) return false;
+    this.#state = { phase: "idle", generation, pendingNativeFallback: true };
     return true;
   }
 
-  beginAdoption(start: (marker: string) => Promise<void>): Promise<void> | undefined {
-    if (this.#state.phase === "adopting") return this.#state.promise;
+  clearPendingNativeFallback(): boolean {
+    if (this.#state.phase !== "idle" || !this.#state.pendingNativeFallback) return false;
+    this.#state = { phase: "idle", generation: this.#state.generation, pendingNativeFallback: false };
+    return true;
+  }
+
+  beginCommit(nonce: string): CommittingState | undefined {
     if (this.#state.phase !== "ready") return undefined;
-
-    const ready = this.#state;
-    const marker = this.#marker(ADOPT_PREFIX);
-    const promise = Promise.resolve().then(() => start(marker));
-    this.#state = {
-      phase: "adopting",
-      epoch: ready.epoch,
-      marker,
-      prepared: ready.prepared,
-      promise,
+    const state: CommittingState = {
+      phase: "committing",
+      generation: this.#state.generation,
+      result: this.#state.result,
+      nonce,
     };
-    return promise;
+    this.#state = state;
+    return state;
   }
 
-  isCurrent(epoch: number): boolean {
-    return this.#state.phase !== "disposed" && this.#state.epoch === epoch;
-  }
-
-  matchesProbe(marker: unknown): boolean {
-    return (
-      (this.#state.phase === "probing" && this.#state.marker === marker) ||
-      (this.#state.phase === "preparing" && this.#state.probeMarker === marker)
-    );
-  }
-
-  matchesAdoption(marker: unknown): boolean {
-    return this.#state.phase === "adopting" && this.#state.marker === marker;
-  }
-
+  /** Terminal for commit success, failure, and invalidation alike. */
   reset(): void {
-    if (this.#state.phase === "disposed") return;
-    this.#abortBackground();
-    this.#state = { phase: "idle", epoch: this.#nextEpoch() };
-  }
-
-  dispose(): void {
-    if (this.#state.phase === "disposed") return;
-    this.#abortBackground();
-    this.#state = { phase: "disposed", epoch: this.#nextEpoch() };
-  }
-
-  #abortBackground(): void {
     if (this.#state.phase === "preparing") this.#state.controller.abort();
-  }
-
-  #nextEpoch(): number {
-    return this.#state.epoch + 1;
-  }
-
-  #marker(prefix: string): string {
-    this.#sequence++;
-    return `${prefix}${randomUUID()}:${this.#sequence}]`;
+    this.#state = {
+      phase: "idle",
+      generation: this.#state.generation + 1,
+      pendingNativeFallback: false,
+    };
   }
 }

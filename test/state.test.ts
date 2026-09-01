@@ -3,9 +3,8 @@ import { describe, it } from "node:test";
 import type { Usage } from "@earendil-works/pi-ai";
 import {
   ShadowCompactStateController,
-  isAdoptMarker,
-  isProbeMarker,
-  type PreparedSummary,
+  type PreparingState,
+  type PreparedResult,
 } from "../src/state.js";
 
 const usage: Usage = {
@@ -17,150 +16,175 @@ const usage: Usage = {
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
 
-function prepared(summary = "checkpoint"): PreparedSummary {
+let resultSeq = 0;
+
+function prepared(): PreparedResult {
+  resultSeq++;
   return {
-    snapshot: {
-      sessionFile: "/tmp/session.jsonl",
-      sessionId: "session-1",
-      leafId: "leaf-1",
-      firstKeptEntryId: "kept-1",
-    },
-    summary,
+    sessionId: `session-${resultSeq}`,
+    leafId: `leaf-${resultSeq}`,
+    latestCompactionId: null,
+    firstKeptEntryId: `kept-${resultSeq}`,
+    summary: `summary-${resultSeq}`,
     usage,
-    details: {
-      readFiles: ["src/input.ts"],
-      modifiedFiles: ["src/output.ts"],
-      provenance: {
-        digest: "sha256:packet",
-        evidenceCount: 4,
-        truncated: false,
-        usedPreviousCheckpointFallback: false,
-        evidenceRefs: ["ev-1"],
-      },
-    },
+    details: { readFiles: ["src/a.ts"], modifiedFiles: ["src/b.ts"] },
   };
 }
 
-function prepare(controller: ShadowCompactStateController) {
-  const probe = controller.beginProbe();
-  assert.ok(probe);
-  const preparing = controller.beginPreparation(probe.marker);
+function prepare(controller: ShadowCompactStateController): PreparingState {
+  const preparing = controller.startPreparing();
   assert.ok(preparing);
   return preparing;
 }
 
 describe("ShadowCompactStateController", () => {
-  it("moves through probe, preparation, and ready with typed payloads", () => {
+  it("startPreparing only from idle", () => {
     const controller = new ShadowCompactStateController();
-    assert.deepEqual(controller.current, { phase: "idle", epoch: 0 });
-
-    const probe = controller.beginProbe();
-    assert.ok(probe);
-    assert.ok(isProbeMarker(probe.marker));
-    assert.equal(controller.beginProbe(), undefined);
-    assert.equal(controller.beginPreparation("wrong"), undefined);
-
-    const preparing = controller.beginPreparation(probe.marker);
-    assert.ok(preparing);
-    assert.equal(preparing.epoch, 1);
-    assert.equal(preparing.controller.signal.aborted, false);
-    assert.equal(controller.matchesProbe(probe.marker), true);
-
-    const result = prepared();
-    assert.equal(controller.publish(preparing.epoch, result), true);
-    assert.equal(controller.current.phase, "ready");
-    if (controller.current.phase === "ready") {
-      assert.equal(controller.current.prepared, result);
-      assert.equal(controller.current.prepared.snapshot.sessionFile, "/tmp/session.jsonl");
-      assert.equal(controller.current.prepared.details.provenance.digest, "sha256:packet");
-    }
-  });
-
-  it("rejects stale workers after reset and keeps epochs monotonic", () => {
-    const controller = new ShadowCompactStateController();
-    const first = prepare(controller);
-    controller.reset();
-
-    assert.equal(first.controller.signal.aborted, true);
-    assert.equal(controller.current.phase, "idle");
-    assert.equal(controller.current.epoch, 2);
-    assert.equal(controller.isCurrent(first.epoch), false);
-    assert.equal(controller.publish(first.epoch, prepared("stale")), false);
-    assert.equal(controller.failPreparation(first.epoch), false);
-
-    const second = prepare(controller);
-    assert.equal(second.epoch, 3);
-    assert.equal(controller.isCurrent(second.epoch), true);
-    assert.equal(controller.failPreparation(second.epoch), true);
-    assert.equal(second.controller.signal.aborted, true);
-    assert.equal(controller.current.epoch, 4);
-  });
-
-  it("shares one adoption promise and gives attempts unique markers", async () => {
-    const controller = new ShadowCompactStateController();
-    const preparing = prepare(controller);
-    const result = prepared();
-    assert.equal(controller.publish(preparing.epoch, result), true);
-
-    let starts = 0;
-    let release!: () => void;
-    const blocked = new Promise<void>((resolve) => { release = resolve; });
-    const first = controller.beginAdoption(async (marker) => {
-      starts++;
-      assert.ok(isAdoptMarker(marker));
-      await blocked;
+    assert.deepEqual(controller.current, {
+      phase: "idle",
+      generation: 0,
+      pendingNativeFallback: false,
     });
-    assert.ok(first);
-    const second = controller.beginAdoption(async () => { starts++; });
-    assert.equal(second, first);
-    assert.equal(starts, 0);
 
-    assert.equal(controller.current.phase, "adopting");
-    if (controller.current.phase === "adopting") {
-      assert.equal(controller.current.prepared, result);
-      assert.equal(controller.current.promise, first);
-      assert.equal(controller.matchesAdoption(controller.current.marker), true);
-      assert.equal(controller.matchesAdoption("wrong"), false);
-    }
+    const preparing = prepare(controller);
+    assert.equal(preparing.generation, 0);
+    assert.equal(preparing.controller.signal.aborted, false);
+    assert.equal(controller.startPreparing(), undefined);
 
-    await Promise.resolve();
-    assert.equal(starts, 1);
-    release();
-    await first;
+    // Not from preparing once published.
+    const result = prepared();
+    assert.equal(controller.publish(preparing.generation, result), true);
+    assert.equal(controller.startPreparing(), undefined);
 
-    const firstMarker = controller.current.phase === "adopting" ? controller.current.marker : "";
+    // Not from committing.
+    assert.ok(controller.beginCommit("nonce"));
+    assert.equal(controller.startPreparing(), undefined);
+
     controller.reset();
-    const nextPreparation = prepare(controller);
-    controller.publish(nextPreparation.epoch, prepared("next"));
-    const next = controller.beginAdoption(async () => {});
-    assert.ok(next);
-    if (controller.current.phase === "adopting") {
-      assert.notEqual(controller.current.marker, firstMarker);
-    }
-    await next;
+    const next = prepare(controller);
+    assert.equal(next.generation, 1);
   });
 
-  it("aborts only background work and disposal is terminal", () => {
+  it("publish only for matching generation and un-aborted controller", () => {
     const controller = new ShadowCompactStateController();
     const preparing = prepare(controller);
-    controller.dispose();
+    const result = prepared();
+
+    assert.equal(controller.publish(preparing.generation + 1, result), false);
+    const rejected = controller.current;
+    assert.equal(rejected.phase, "preparing");
+
+    assert.equal(controller.publish(preparing.generation, result), true);
+    const ready = controller.current;
+    assert.equal(ready.phase, "ready");
+    if (ready.phase === "ready") {
+      assert.equal(ready.result, result);
+    }
+
+    controller.reset();
+    const second = prepare(controller);
+    second.controller.abort();
+    assert.equal(controller.publish(second.generation, prepared()), false);
+    const aborted = controller.current;
+    assert.equal(aborted.phase, "preparing");
+  });
+
+  it("fail with matching generation sets pendingNativeFallback", () => {
+    const controller = new ShadowCompactStateController();
+    const preparing = prepare(controller);
+
+    assert.equal(controller.fail(preparing.generation + 1), false);
+    const stillPreparing = controller.current;
+    assert.equal(stillPreparing.phase, "preparing");
+
+    assert.equal(controller.fail(preparing.generation), true);
+    assert.deepEqual(controller.current, {
+      phase: "idle",
+      generation: preparing.generation,
+      pendingNativeFallback: true,
+    });
+
+    assert.equal(controller.fail(preparing.generation), false);
+    assert.equal(controller.fail(0), false);
+  });
+
+  it("clearPendingNativeFallback only once from idle", () => {
+    const controller = new ShadowCompactStateController();
+    assert.equal(controller.clearPendingNativeFallback(), false);
+
+    const preparing = prepare(controller);
+    assert.equal(controller.fail(preparing.generation), true);
+    assert.equal(controller.clearPendingNativeFallback(), true);
+    assert.deepEqual(controller.current, {
+      phase: "idle",
+      generation: preparing.generation,
+      pendingNativeFallback: false,
+    });
+    assert.equal(controller.clearPendingNativeFallback(), false);
+
+    // Not while preparing.
+    prepare(controller);
+    assert.equal(controller.clearPendingNativeFallback(), false);
+  });
+
+  it("beginCommit only from ready and carries result and nonce", () => {
+    const controller = new ShadowCompactStateController();
+    assert.equal(controller.beginCommit("nonce-early"), undefined);
+
+    const preparing = prepare(controller);
+    assert.equal(controller.beginCommit("nonce-preparing"), undefined);
+
+    const result = prepared();
+    assert.equal(controller.publish(preparing.generation, result), true);
+
+    const committing = controller.beginCommit("nonce-1");
+    assert.ok(committing);
+    assert.equal(committing.phase, "committing");
+    assert.equal(committing.generation, preparing.generation);
+    assert.equal(committing.nonce, "nonce-1");
+    assert.equal(committing.result, result);
+
+    assert.equal(controller.beginCommit("nonce-2"), undefined);
+  });
+
+  it("reset aborts preparing controller and stale publishes fail", () => {
+    const controller = new ShadowCompactStateController();
+    const preparing = prepare(controller);
+    controller.reset();
 
     assert.equal(preparing.controller.signal.aborted, true);
-    assert.equal(controller.current.phase, "disposed");
-    assert.equal(controller.current.epoch, 2);
-    assert.equal(controller.isCurrent(2), false);
-    assert.equal(controller.beginProbe(), undefined);
+    assert.deepEqual(controller.current, {
+      phase: "idle",
+      generation: 1,
+      pendingNativeFallback: false,
+    });
+    assert.equal(controller.publish(preparing.generation, prepared()), false);
+    assert.equal(controller.fail(preparing.generation), false);
 
+    const next = prepare(controller);
+    assert.equal(next.generation, 1);
+    assert.equal(controller.publish(next.generation, prepared()), true);
     controller.reset();
-    controller.dispose();
-    assert.deepEqual(controller.current, { phase: "disposed", epoch: 2 });
+    assert.deepEqual(controller.current, {
+      phase: "idle",
+      generation: 2,
+      pendingNativeFallback: false,
+    });
   });
 
-  it("recognizes only complete prefixed markers", () => {
-    assert.equal(isProbeMarker("[shadow-compact:probe:x]"), true);
-    assert.equal(isProbeMarker("[shadow-compact:probe:x"), false);
-    assert.equal(isProbeMarker("[shadow-compact:adopt:x]"), false);
-    assert.equal(isAdoptMarker("[shadow-compact:adopt:x]"), true);
-    assert.equal(isAdoptMarker(undefined), false);
+  it("reset from idle is idempotent", () => {
+    const controller = new ShadowCompactStateController();
+    controller.reset();
+    assert.deepEqual(controller.current, {
+      phase: "idle",
+      generation: 1,
+      pendingNativeFallback: false,
+    });
+    controller.reset();
+    assert.deepEqual(controller.current, {
+      phase: "idle",
+      generation: 2,
+      pendingNativeFallback: false,
+    });
   });
 });

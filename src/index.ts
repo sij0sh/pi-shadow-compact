@@ -1,151 +1,129 @@
-import type {
-  ExtensionAPI,
-  ExtensionContext,
-  SessionBeforeCompactEvent,
+import {
+  getAgentDir,
+  SettingsManager,
+  type ExtensionAPI,
+  type ExtensionContext,
+  type SessionBeforeCompactEvent,
+  type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { loadConfig, type ShadowCompactConfig } from "./config.js";
-import { NORMALIZED_PACKET_MAX_CHARS, SUMMARY_MAX_TOKENS } from "./constants.js";
 import { normalizeSnapshot } from "./normalize.js";
-import { captureSessionSnapshot } from "./session-snapshot.js";
+import { prepareSnapshot } from "./prepare.js";
+import { ShadowCompactStateController, type PreparedResult } from "./state.js";
 import {
-  ShadowCompactStateController,
-  type PreparedFileDetails,
-  type PreparedSummary,
-} from "./state.js";
-import { resolveSummarizerModel, runSummaryAgent } from "./summary-agent.js";
-import type { SessionSnapshot } from "./types.js";
+  SUMMARY_MAX_TOKENS,
+  resolveSummarizerModel,
+  runSummaryAgent,
+} from "./summary.js";
+import { randomUUID } from "node:crypto";
 
-function fileDetails(
-  event: SessionBeforeCompactEvent,
-  snapshot: SessionSnapshot,
-): PreparedFileDetails {
-  const read = new Set(event.preparation.fileOps.read);
-  const modified = new Set([
-    ...event.preparation.fileOps.written,
-    ...event.preparation.fileOps.edited,
-  ]);
+const COMMIT_NONCE_PREFIX = "[shadow-compact:commit:";
 
-  for (const entry of snapshot.sourceEntries) {
-    if (entry.type !== "compaction" || !entry.details || typeof entry.details !== "object") continue;
-    const details = entry.details as { readFiles?: unknown; modifiedFiles?: unknown };
-    if (Array.isArray(details.readFiles)) {
-      for (const path of details.readFiles) if (typeof path === "string") read.add(path);
-    }
-    if (Array.isArray(details.modifiedFiles)) {
-      for (const path of details.modifiedFiles) if (typeof path === "string") modified.add(path);
-    }
-  }
-
-  return {
-    readFiles: [...read].filter((path) => !modified.has(path)).sort(),
-    modifiedFiles: [...modified].sort(),
-  };
+function isCommitNonce(value: unknown): value is string {
+  return typeof value === "string" && value.startsWith(COMMIT_NONCE_PREFIX) && value.endsWith("]");
 }
 
-function packetBudget(contextWindow: number, maxTokens: number): number {
-  const reservedTokens = maxTokens * 7 + 8192;
-  const availableTokens = contextWindow - reservedTokens;
-  if (availableTokens < 4096) throw new Error("Summarizer model context window is too small");
-  return Math.min(NORMALIZED_PACKET_MAX_CHARS, availableTokens);
-}
-
-function isPreparedValid(ctx: ExtensionContext, prepared: PreparedSummary): boolean {
-  const snapshot = prepared.snapshot;
-  if (ctx.sessionManager.getSessionId() !== snapshot.sessionId) return false;
-  if (ctx.sessionManager.getSessionFile() !== snapshot.sessionFile) return false;
-
-  const branch = ctx.sessionManager.getBranch();
-  const cutIndex = branch.findIndex((entry) => entry.id === snapshot.firstKeptEntryId);
-  const leafIndex = branch.findIndex((entry) => entry.id === snapshot.leafId);
-  return cutIndex >= 0 && leafIndex >= cutIndex;
-}
-
-function compactionResult(prepared: PreparedSummary, event: SessionBeforeCompactEvent) {
-  return {
-    summary: prepared.summary,
-    firstKeptEntryId: prepared.snapshot.firstKeptEntryId,
-    tokensBefore: event.preparation.tokensBefore,
-    usage: prepared.usage,
-    details: prepared.details,
-  };
-}
-
-async function prepareSummary(
-  event: SessionBeforeCompactEvent,
-  ctx: ExtensionContext,
-  config: ShadowCompactConfig,
-  signal: AbortSignal,
-  customFocus?: string,
-): Promise<PreparedSummary> {
-  const snapshot = await captureSessionSnapshot(event, ctx);
-  if (signal.aborted) throw signal.reason ?? new Error("Summary preparation aborted");
-
-  const model = resolveSummarizerModel(ctx, config);
-  const maxTokens = Math.min(SUMMARY_MAX_TOKENS, model.maxTokens ?? SUMMARY_MAX_TOKENS);
-  const packet = normalizeSnapshot(snapshot, packetBudget(model.contextWindow, maxTokens));
-  if (packet.evidence.length === 0) throw new Error("No normalized evidence to summarize");
-
-  const result = await runSummaryAgent(ctx, packet, config, {
-    signal,
-    model,
-    maxTokens,
-    ...(customFocus?.trim() ? { customFocus } : {}),
-  });
-
-  return {
-    snapshot: {
-      ...(snapshot.sessionFile ? { sessionFile: snapshot.sessionFile } : {}),
-      sessionId: snapshot.sessionId,
-      leafId: snapshot.leafId,
-      firstKeptEntryId: snapshot.firstKeptEntryId,
-    },
-    summary: result.summary,
-    usage: result.usage,
-    details: {
-      ...fileDetails(event, snapshot),
-      provenance: {
-        digest: packet.digest,
-        evidenceCount: packet.evidence.length,
-        truncated: packet.truncated,
-        usedPreviousCheckpointFallback: packet.usedPreviousCheckpointFallback,
-        evidenceRefs: result.evidenceRefs,
-      },
-    },
-  };
+function isValidBranchAncestry(branch: SessionEntry[], result: PreparedResult): boolean {
+  return (
+    branch.some((entry) => entry.id === result.leafId) &&
+    branch.some((entry) => entry.id === result.firstKeptEntryId)
+  );
 }
 
 export default function shadowCompact(pi: ExtensionAPI): void {
   const state = new ShadowCompactStateController();
   let configPromise: Promise<ShadowCompactConfig> | undefined;
-  let reportedConfigError: string | undefined;
+  let reportedError: string | undefined;
 
   const reportError = (ctx: ExtensionContext, error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
-    if (reportedConfigError === message) return;
-    reportedConfigError = message;
+    if (reportedError === message) return;
+    reportedError = message;
     ctx.ui.notify(`shadow-compact: ${message}`, "error");
   };
 
   const configFor = async (ctx: ExtensionContext): Promise<ShadowCompactConfig> => {
     configPromise ??= loadConfig(ctx).then((config) => {
-      reportedConfigError = undefined;
+      reportedError = undefined;
       return config;
     });
     return configPromise;
   };
 
-  const resetConfig = (ctx: ExtensionContext) => {
-    configPromise = undefined;
-    reportedConfigError = undefined;
-    void configFor(ctx).catch((error) => reportError(ctx, error));
+  const prepare = async (
+    ctx: ExtensionContext,
+    config: ShadowCompactConfig,
+    branch: SessionEntry[],
+    controller: AbortController,
+  ): Promise<void> => {
+    const generation = state.current.generation;
+    const keepRecentTokens = SettingsManager.create(ctx.cwd, getAgentDir())
+      .getCompactionSettings().keepRecentTokens;
+    const snapshot = prepareSnapshot(branch, keepRecentTokens);
+    if (!snapshot) return;
+
+    try {
+      const model = resolveSummarizerModel(ctx, config);
+      const maxTokens = Math.min(SUMMARY_MAX_TOKENS, model.maxTokens ?? SUMMARY_MAX_TOKENS);
+      // Keep evidence usable when a large override is budgeted: never reserve more than
+      // half the context window, so the input side always retains room to work with.
+      const reservedTokens = Math.min(
+        maxTokens * 2 + 8192,
+        Math.floor(model.contextWindow / 2),
+      );
+      const budget = model.contextWindow - reservedTokens;
+      const packet = normalizeSnapshot(
+        {
+          cwd: ctx.cwd,
+          ...(snapshot.previousSummary === undefined ? {} : { previousSummary: snapshot.previousSummary }),
+          entries: [...snapshot.sourceEntries, ...snapshot.turnPrefixEntries],
+        },
+        budget,
+      );
+      if (packet.evidence.length === 0) throw new Error("No evidence is available to summarize");
+
+      const outcome = await runSummaryAgent(ctx, packet, config, {
+        signal: controller.signal,
+        model,
+        maxTokens,
+      });
+
+      const current = ctx.sessionManager.getBranch();
+      const result: PreparedResult = {
+        sessionId: ctx.sessionManager.getSessionId(),
+        leafId: ctx.sessionManager.getLeafId() ?? (current[current.length - 1]?.id ?? ""),
+        latestCompactionId: snapshot.latestCompactionId,
+        firstKeptEntryId: snapshot.firstKeptEntryId,
+        summary: outcome.summary,
+        usage: outcome.usage,
+        details: {
+          readFiles: snapshot.readFiles,
+          modifiedFiles: snapshot.modifiedFiles,
+        },
+      };
+      const valid =
+        ctx.sessionManager.getSessionId() === result.sessionId &&
+        isValidBranchAncestry(current, result) &&
+        latestCompactionId(current) === result.latestCompactionId;
+      if (!valid || !state.publish(generation, result)) state.reset();
+    } catch (error) {
+      if (!controller.signal.aborted) reportError(ctx, error);
+      state.fail(generation);
+    }
   };
 
-  pi.on("session_start", (_event, ctx) => {
+  const resultIsCurrent = (ctx: ExtensionContext, result: PreparedResult): boolean =>
+    ctx.sessionManager.getSessionId() === result.sessionId &&
+    isValidBranchAncestry(ctx.sessionManager.getBranch(), result) &&
+    latestCompactionId(ctx.sessionManager.getBranch()) === result.latestCompactionId;
+
+  pi.on("session_start", () => {
     state.reset();
-    resetConfig(ctx);
+    configPromise = undefined;
+    reportedError = undefined;
   });
 
-  pi.on("agent_settled", async (_event, ctx) => {
+  pi.on("turn_end", async (_event, ctx) => {
     if (state.current.phase !== "idle") return;
     const percent = ctx.getContextUsage()?.percent;
     if (percent === null || percent === undefined) return;
@@ -159,119 +137,92 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     }
     if (percent < config.softCompactThresholdPercent || state.current.phase !== "idle") return;
 
-    const probe = state.beginProbe();
-    if (!probe) return;
+    const prepared = state.startPreparing();
+    if (!prepared) return;
+    const branch = ctx.sessionManager.getBranch();
+    // Fire and forget: the live agent run continues immediately.
+    void prepare(ctx, config, branch, prepared.controller);
+  });
+
+  pi.on("agent_settled", async (_event, ctx) => {
+    if (state.clearPendingNativeFallback()) {
+      ctx.compact({});
+      return;
+    }
+
+    const current = state.current;
+    if (current.phase !== "ready") return;
+    if (!resultIsCurrent(ctx, current.result)) {
+      state.reset();
+      return;
+    }
+
+    const commit = state.beginCommit(`${COMMIT_NONCE_PREFIX}${randomUUID()}]`);
+    if (!commit) return;
     ctx.compact({
-      customInstructions: probe.marker,
-      onComplete: () => {
-        if (state.matchesProbe(probe.marker)) state.reset();
-      },
+      customInstructions: commit.nonce,
+      onComplete: () => state.reset(),
       onError: () => {
-        if (state.current.phase === "probing" && state.matchesProbe(probe.marker)) state.reset();
+        // The cached result failed; let Pi's native summarizer run once instead.
+        state.reset();
+        ctx.compact({});
       },
     });
   });
 
-  pi.on("session_before_compact", async (event, ctx) => {
-    if (state.matchesProbe(event.customInstructions)) {
-      const marker = event.customInstructions;
-      if (!marker) return { cancel: true };
-      const preparing = state.beginPreparation(marker);
-      if (!preparing) return { cancel: true };
-
-      void (async () => {
-        try {
-          const config = await configFor(ctx);
-          const prepared = await prepareSummary(
-            event,
-            ctx,
-            config,
-            preparing.controller.signal,
-          );
-          if (!state.isCurrent(preparing.epoch) || !isPreparedValid(ctx, prepared)) {
-            state.failPreparation(preparing.epoch);
-            return;
-          }
-          state.publish(preparing.epoch, prepared);
-        } catch (error) {
-          if (!preparing.controller.signal.aborted) reportError(ctx, error);
-          state.failPreparation(preparing.epoch);
-        }
-      })();
-
-      return { cancel: true };
-    }
-
-    if (state.matchesAdoption(event.customInstructions)) {
+  pi.on("session_before_compact", (event: SessionBeforeCompactEvent, ctx) => {
+    if (isCommitNonce(event.customInstructions)) {
       const current = state.current;
-      if (current.phase !== "adopting" || !isPreparedValid(ctx, current.prepared)) return;
-      return { compaction: compactionResult(current.prepared, event) };
+      if (current.phase !== "committing" || current.nonce !== event.customInstructions) return;
+      return {
+        compaction: {
+          summary: current.result.summary,
+          firstKeptEntryId: current.result.firstKeptEntryId,
+          tokensBefore: event.preparation.tokensBefore,
+          usage: current.result.usage,
+          details: current.result.details,
+        },
+      };
     }
 
     const current = state.current;
     if (
       event.reason !== "manual" &&
       current.phase === "ready" &&
-      isPreparedValid(ctx, current.prepared)
+      current.result.firstKeptEntryId === event.preparation.firstKeptEntryId &&
+      resultIsCurrent(ctx, current.result)
     ) {
-      return { compaction: compactionResult(current.prepared, event) };
+      return {
+        compaction: {
+          summary: current.result.summary,
+          firstKeptEntryId: current.result.firstKeptEntryId,
+          tokensBefore: event.preparation.tokensBefore,
+          usage: current.result.usage,
+          details: current.result.details,
+        },
+      };
     }
 
-    state.reset();
-    try {
-      const config = await configFor(ctx);
-      const prepared = await prepareSummary(
-        event,
-        ctx,
-        config,
-        event.signal,
-        event.reason === "manual" ? event.customInstructions : undefined,
-      );
-      return { compaction: compactionResult(prepared, event) };
-    } catch {
-      return;
-    }
+    // Manual compaction invalidates the cached checkpoint in any phase. A threshold
+    // boundary mismatch leaves the cache intact for a later matching request.
+    if (event.reason === "manual" || current.phase === "preparing") state.reset();
+    return;
   });
 
-  pi.on("input", async (event, ctx) => {
-    if (event.source === "extension") return { action: "continue" };
-
-    const current = state.current;
-    if (current.phase === "adopting") {
-      await current.promise.catch(() => undefined);
-      return { action: "continue" };
-    }
-    if (current.phase !== "ready") return { action: "continue" };
-    if (!isPreparedValid(ctx, current.prepared)) {
-      state.reset();
-      return { action: "continue" };
-    }
-
-    const promise = state.beginAdoption(
-      (marker) =>
-        new Promise<void>((resolve) => {
-          ctx.compact({
-            customInstructions: marker,
-            onComplete: () => {
-              state.reset();
-              resolve();
-            },
-            onError: () => {
-              state.reset();
-              resolve();
-            },
-          });
-        }),
-    );
-    await promise?.catch(() => undefined);
-    return { action: "continue" };
+  pi.on("session_compact", (event) => {
+    if (event.fromExtension) state.reset();
   });
-
-  pi.on("session_compact", () => state.reset());
-  pi.on("session_compact_failed", () => {
-    // Attempt callbacks own terminal state. The event has no marker, so it cannot
-    // safely distinguish an expected cancelled probe from a real compaction.
+  pi.on("session_compact_failed", (event) => {
+    if (event.fromExtension) state.reset();
   });
   pi.on("session_tree", () => state.reset());
-  pi.on("session_shutdown", () => state.dispose());
+  pi.on("session_shutdown", () => state.reset());
+}
+
+function latestCompactionId(branch: SessionEntry[]): string | null {
+  for (let index = branch.length - 1; index >= 0; index--) {
+    const entry = branch[index];
+    if (entry?.type === "compaction") return entry.id;
+  }
+  return null;
 }

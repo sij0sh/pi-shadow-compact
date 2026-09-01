@@ -1,18 +1,39 @@
-import { createHash } from "node:crypto";
 import type { ToolCall } from "@earendil-works/pi-ai";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
-import { ADOPT_PREFIX, NORMALIZED_PACKET_MAX_CHARS, PROBE_PREFIX } from "./constants.js";
-import type {
-  NormalizedEvidence,
-  NormalizedPacket,
-  SessionSnapshot,
-} from "./types.js";
+
+export const NORMALIZED_PACKET_MAX_CHARS = 240_000;
 
 const TEXT_LIMIT = 40_000;
 const ARG_LIMIT = 10_000;
 const OUTPUT_LIMIT = 24_000;
 const DIFF_LIMIT = 32_000;
 const SECRET_KEY = /(?:api[_-]?key|access[_-]?token|auth(?:orization)?|client[_-]?secret|credential|password|passwd|secret|token)/i;
+
+export interface NormalizedEvidence {
+  evidenceId: string;
+  sourceEntryId: string;
+  kind:
+    | "user"
+    | "assistant"
+    | "tool_call"
+    | "tool_result"
+    | "branch_summary"
+    | "custom_message"
+    | "bash"
+    | "previous_checkpoint";
+  text: string;
+}
+
+export interface NormalizedPacket {
+  evidence: NormalizedEvidence[];
+}
+
+export interface NormalizeInput {
+  cwd: string;
+  previousSummary?: string;
+  /** Chronological entries to summarize, including any split-turn prefix. */
+  entries: SessionEntry[];
+}
 
 interface DraftEvidence {
   sourceEntryId: string;
@@ -25,54 +46,17 @@ interface CallInfo {
   args: Record<string, unknown>;
 }
 
-export function normalizeSnapshot(
-  snapshot: SessionSnapshot,
-  maxChars = NORMALIZED_PACKET_MAX_CHARS,
-): NormalizedPacket {
+export function normalizeSnapshot(input: NormalizeInput, maxChars = NORMALIZED_PACKET_MAX_CHARS): NormalizedPacket {
   const calls = new Map<string, CallInfo>();
-  const drafts = snapshot.sourceEntries.flatMap((entry) => normalizeEntry(entry, snapshot.cwd, calls));
-  const full = numberEvidence(drafts);
-  let evidence = full;
-  const overCap = packetSize(full) > maxChars;
-  let truncated = overCap || drafts.some((draft) => draft.text.includes("...[truncated "));
-  let usedPreviousCheckpointFallback = false;
+  const drafts = input.previousSummary?.trim()
+    ? [normalizeDraft("checkpoint", "previous_checkpoint", input.previousSummary, input.cwd, TEXT_LIMIT), ...input.entries.flatMap((entry) => normalizeEntry(entry, input.cwd, calls))]
+    : input.entries.flatMap((entry) => normalizeEntry(entry, input.cwd, calls));
+  let evidence = numberEvidence(drafts);
 
-  if (overCap) {
-    const checkpoint = snapshot.previousSummary?.trim()
-      ? normalizeDraft("checkpoint", "previous_checkpoint", snapshot.previousSummary, snapshot.cwd, TEXT_LIMIT)
-      : undefined;
-    const selected: DraftEvidence[] = [];
-    let remaining = maxChars - (checkpoint ? draftSize(checkpoint, 1) : 2);
-
-    for (let index = drafts.length - 1; index >= 0; index--) {
-      const draft = drafts[index];
-      if (!draft) continue;
-      const cost = draftSize(draft, selected.length + 1);
-      if (cost > remaining) break;
-      selected.unshift(draft);
-      remaining -= cost;
-    }
-
-    if (checkpoint && draftSize(checkpoint, 1) <= maxChars) {
-      selected.unshift(checkpoint);
-      usedPreviousCheckpointFallback = true;
-    }
-    evidence = numberEvidence(selected);
-
-    while (evidence.length > 0 && packetSize(evidence) > maxChars) {
-      const removeAt = evidence[0]?.kind === "previous_checkpoint" ? 1 : 0;
-      if (removeAt >= evidence.length) break;
-      evidence.splice(removeAt, 1);
-      evidence = renumber(evidence);
-    }
+  while (evidence.length > 0 && packetSize(evidence) > maxChars) {
+    evidence = renumber(evidence.slice(1));
   }
-
-  return {
-    evidence,
-    digest: createHash("sha256").update(JSON.stringify(evidence)).digest("hex"),
-    truncated,
-    usedPreviousCheckpointFallback,
-  };
+  return { evidence };
 }
 
 function normalizeEntry(entry: SessionEntry, cwd: string, calls: Map<string, CallInfo>): DraftEvidence[] {
@@ -81,7 +65,6 @@ function normalizeEntry(entry: SessionEntry, cwd: string, calls: Map<string, Cal
   }
   if (entry.type === "custom_message") {
     const text = contentText(entry.content);
-    if (isInternalMetadata(text)) return [];
     return text ? [normalizeDraft(entry.id, "custom_message", text, cwd, TEXT_LIMIT)] : [];
   }
   if (entry.type !== "message") return [];
@@ -126,7 +109,6 @@ function normalizeEntry(entry: SessionEntry, cwd: string, calls: Map<string, Cal
   }
   if (message.role === "custom") {
     const text = contentText(message.content);
-    if (isInternalMetadata(text)) return [];
     return text ? [normalizeDraft(entry.id, "custom_message", text, cwd, TEXT_LIMIT)] : [];
   }
   if (message.role === "branchSummary") {
@@ -226,21 +208,7 @@ function renumber(evidence: NormalizedEvidence[]): NormalizedEvidence[] {
 }
 
 function packetSize(evidence: NormalizedEvidence[]): number {
-  return JSON.stringify({
-    evidence,
-    digest: "0".repeat(64),
-    truncated: false,
-    usedPreviousCheckpointFallback: false,
-  }).length;
-}
-
-function draftSize(draft: DraftEvidence, index: number): number {
-  return JSON.stringify({ evidenceId: `E${String(index).padStart(4, "0")}`, ...draft }).length + 1;
-}
-
-function isInternalMetadata(text: string): boolean {
-  const trimmed = text.trimStart();
-  return trimmed.startsWith(PROBE_PREFIX) || trimmed.startsWith(ADOPT_PREFIX);
+  return JSON.stringify({ evidence }).length;
 }
 
 function escapeRegExp(value: string): string {
