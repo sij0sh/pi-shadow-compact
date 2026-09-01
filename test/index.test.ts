@@ -247,6 +247,63 @@ describe("shadowCompact extension orchestration", () => {
     }
   });
 
+  it("keeps a newer preparation alive when a superseded summary completes", async () => {
+    const f = await fixture();
+    try {
+      f.gate();
+      await f.emit("turn_end");
+      assert.equal(f.registry.calls, 1);
+
+      // Manual compaction supersedes prepare #1 while its model call is in flight.
+      await f.emit("session_before_compact", f.compactEvent({ reason: "manual" }));
+      assert.ok(f.registry.signals[0]?.aborted);
+
+      f.gate();
+      await f.emit("turn_end");
+      assert.equal(f.registry.calls, 2);
+      assert.ok(!f.registry.signals[1]?.aborted);
+
+      // The stale completion resolves past its abort and must not touch prepare #2.
+      f.release();
+      await waitFor(() => f.registry.settled === 1);
+      await tick();
+      assert.ok(!f.registry.signals[1]?.aborted);
+      assert.equal(f.compactCalls.length, 0);
+      assert.deepEqual(f.notifications, []);
+
+      f.release();
+      await waitFor(() => f.registry.settled === 2);
+      await tick();
+      await f.emit("agent_settled");
+      assert.match(commitNonce(f), NONCE_PATTERN);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it("schedules the one-shot native fallback when a completed summary is invalid while current", async () => {
+    const f = await fixture();
+    try {
+      f.gate();
+      await f.emit("turn_end");
+      f.appendCompaction();
+      f.release();
+      await waitFor(() => f.registry.settled === 1);
+      await tick();
+      assert.equal(f.compactCalls.length, 0);
+      assert.deepEqual(f.notifications, []);
+
+      await f.emit("agent_settled");
+      assert.equal(f.compactCalls.length, 1);
+      assert.deepEqual(f.compactCalls[0], {});
+
+      await f.emit("agent_settled");
+      assert.equal(f.compactCalls.length, 1);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
   it("falls back to plain native compaction after a summary model error", async () => {
     const f = await fixture();
     try {
@@ -321,7 +378,8 @@ describe("shadowCompact extension orchestration", () => {
       await waitFor(() => stale.registry.settled === 1);
       await tick();
       await stale.emit("agent_settled");
-      assert.equal(stale.compactCalls.length, 0);
+      // The stale result schedules the documented one-shot native fallback.
+      assert.deepEqual(stale.compactCalls[0], {});
       assert.deepEqual(stale.notifications, []);
     } finally {
       await stale.cleanup();

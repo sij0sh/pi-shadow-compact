@@ -110,7 +110,8 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         ctx.sessionManager.getSessionId() === result.sessionId &&
         isValidBranchAncestry(current, result) &&
         latestCompactionId(current) === result.latestCompactionId;
-      if (!valid || !state.publish(generation, result)) state.reset();
+      // Ownership-checked: a superseded completion no-ops instead of aborting a newer prepare.
+      if (!valid || !state.publish(generation, result)) state.fail(generation);
     } catch (error) {
       if (!controller.signal.aborted) reportError(ctx, error);
       state.fail(generation);

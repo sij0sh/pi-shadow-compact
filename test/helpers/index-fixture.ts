@@ -64,7 +64,7 @@ export class FakeRegistry {
   calls = 0;
   settled = 0;
   mode: "ok" | "error" = "ok";
-  gate: Promise<void> | undefined;
+  readonly pendingGates: Promise<void>[] = [];
   readonly prompts: string[] = [];
   readonly models: Model<Api>[] = [];
   readonly signals: Array<AbortSignal | undefined> = [];
@@ -95,11 +95,7 @@ export class FakeRegistry {
     this.signals.push(options?.signal);
     this.optionsList.push(options);
     this.prompts.push(promptText(context));
-    if (this.gate) {
-      const gate = this.gate;
-      this.gate = undefined;
-      await gate;
-    }
+    if (this.pendingGates.length > 0) await this.pendingGates.shift();
     this.settled++;
     if (this.mode === "error") {
       return {
@@ -230,7 +226,7 @@ export async function fixture(globalConfig?: Record<string, unknown>): Promise<F
 
   let branch = makeBranch();
   let percent: number | undefined = 60;
-  let release: (() => void) | undefined;
+  const releases: Array<() => void> = [];
   const registry = new FakeRegistry();
   const compactCalls: CompactCall[] = [];
   const notifications: string[] = [];
@@ -268,14 +264,13 @@ export async function fixture(globalConfig?: Record<string, unknown>): Promise<F
     },
     gate() {
       let releaseGate!: () => void;
-      registry.gate = new Promise<void>((resolve) => {
+      registry.pendingGates.push(new Promise<void>((resolve) => {
         releaseGate = resolve;
-      });
-      release = releaseGate;
+      }));
+      releases.push(releaseGate);
     },
     release() {
-      release?.();
-      release = undefined;
+      releases.shift()?.();
     },
     appendCompaction() {
       branch = [...branch, compactionEntry("c1", branch.at(-1)?.id ?? "e4")];
