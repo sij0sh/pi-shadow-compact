@@ -1,45 +1,28 @@
 # pi-shadow-compact
 
-Proactive, evidence-grounded compaction for Pi.
+Silent soft-threshold compaction for Pi.
 
-The extension prepares a continuation checkpoint in the background after the live session reaches a configurable soft threshold. It reconstructs the active branch from Pi's persisted JSONL when available. It preserves useful tool evidence. It runs a private three-stage summary conversation with up to one corrective retry per stage.
-
-The live Pi session receives no tools, skills, prompt snippets, messages, or system-prompt additions from this extension.
+Pi runs normally. When context usage first reaches your soft threshold, the extension summarizes the session in a detached background request. Nothing blocks, aborts, or waits. When the summary is ready and the active run settles, the extension swaps old history for the checkpoint through one fast native compaction. Context drops to roughly system prompt + summary + recent tail.
 
 ## Behavior
 
-1. Pi becomes fully idle at or above the soft compaction threshold.
-2. The extension asks Pi for its native compaction boundary and cancels that probe before mutation.
-3. The extension reads the captured active branch from session JSONL.
-4. It normalizes only evidence before Pi's `firstKeptEntryId`.
-5. It runs private extract, audit, and compression requests through Pi's model registry.
-6. It waits after the checkpoint becomes ready.
-7. The next user or RPC prompt runs a real native compaction before Pi processes that prompt.
-8. The compaction replaces pre-boundary history with the prepared checkpoint.
-9. Pi retains the recent tail from `firstKeptEntryId` verbatim.
-
-The extension does not wait for Pi's native threshold. The real compaction normally happens slightly above the configured soft threshold.
-
-New messages can be added while preparation runs. Pi retains those messages together with the original native recent-token tail.
-
-Manual, threshold, and overflow compactions use the same checkpoint pipeline when needed. Pi's native summarizer remains the fallback when custom preparation fails.
+1. Pi works normally.
+2. The first persisted `turn_end` at or above the soft threshold starts a detached background summary.
+3. Pi continues turns, tools, and steering while the summary runs.
+4. When the summary is ready, the extension waits for a safe settle point.
+5. One nonce-tagged `ctx.compact()` applies the prepared checkpoint. No summary model call runs on that path.
+6. The next prompt starts small: summary plus Pi's retained recent tail.
 
 ## Configuration
 
-The extension reads configuration from the active project's path:
+The extension reads `<project>/.pi/shadow-compact.json` first, then `~/.pi/agent/shadow-compact.json`. The later file wins wholesale. Without files it uses the defaults below.
 
-```text
-.pi/shadow-compact.json
-```
-
-In the project where Pi will run, start from the tracked example:
+Copy the tracked example into your project and edit it. Git ignores `.pi/shadow-compact.json` so personal model choices never get committed:
 
 ```bash
-mkdir -p /path/to/project/.pi
-cp .pi/shadow-compact.example.json /path/to/project/.pi/shadow-compact.json
+mkdir -p .pi
+cp .pi/shadow-compact.example.json .pi/shadow-compact.json
 ```
-
-Git ignores the local configuration file. You do not need to publish personal model choices.
 
 ```json
 {
@@ -53,17 +36,15 @@ Git ignores the local configuration file. You do not need to publish personal mo
 
 ### Soft threshold
 
-`softCompactThresholdPercent` accepts a number from `1` through `99`.
+`softCompactThresholdPercent` accepts `1` through `99`. The default is `60`.
 
-The default is `60`.
-
-A lower value gives detached preparation more time to finish. A higher value avoids summaries for shorter sessions.
+Background summarization starts at this level. The actual compact lands slightly above it, depending on how much context Pi adds while the summary runs.
 
 ### Summarizer model
 
-When `summarizerModel.provider` and `summarizerModel.id` are blank, the extension uses the current Pi session model.
+Blank `provider` and `id` use the current Pi session model.
 
-To select a different model, set both fields to an exact provider and model ID registered in Pi:
+To pin a model, set both fields to an exact provider key and model ID. This includes models from `~/.pi/agent/models.json`:
 
 ```json
 {
@@ -75,115 +56,69 @@ To select a different model, set both fields to an exact provider and model ID r
 }
 ```
 
-Pi resolves the pair through the live model registry. This includes models from the user-level custom model registry file:
+Model IDs can contain `/` or `:`, so provider and ID use separate fields.
 
-```text
-~/.pi/agent/models.json
+Reload Pi after changing either file.
+
+## Safety and native fallback
+
+The summarizer sees a bounded, redacted transcript: thinking blocks, images, provider metadata, and common secret formats are removed. Tool evidence keeps bounded output, diffs, and exit state so discoveries survive.
+
+Every checkpoint item must cite evidence IDs from the packet. Code validates the citations and renders the Markdown. One corrective retry follows a single invalid response.
+
+Pi's built-in compaction takes over whenever the custom path is not safe:
+
+- Context jumps from below the threshold straight to overflow.
+- The prepared history exceeds the summarizer model's budget.
+- The model errors, aborts, hits its output limit, or returns invalid JSON twice.
+- The session branches or compacts while the summary runs.
+- A prepared boundary no longer matches Pi's native boundary.
+
+A failed background summary schedules one ordinary native compaction at the next settle point. It never retries in a loop and never cancels Pi's overflow recovery.
+
+## Install
+
+Requires Node.js 22.19+ and Pi 0.84.4+.
+
+From GitHub:
+
+```bash
+pi install git:github.com/sij0sh/pi-shadow-compact
 ```
 
-Use a key under `providers` as the provider ID. Use the corresponding `models[].id` as the model ID. Both values must match exactly. The model must have usable authentication.
+From npm:
 
-Model IDs can contain `/` or `:`, so provider and ID use separate fields. Do not copy a personal `models.json` into this repository because that file can contain credentials.
-
-After changing `shadow-compact.json`, run `/reload` or restart Pi. After changing `models.json`, open `/model` first. Then run `/reload` or restart Pi.
-
-Invalid configuration produces an error notification and disables soft preparation until the next reload.
-
-Untrusted projects do not load project configuration. They use the 60% threshold and current session model.
-
-## Pi compaction settings
-
-Pi still controls the retained tail and emergency threshold. Put this object in `~/.pi/agent/settings.json` or the project's `.pi/settings.json`:
-
-```json
-{
-  "compaction": {
-    "enabled": true,
-    "reserveTokens": 16384,
-    "keepRecentTokens": 20000
-  }
-}
+```bash
+pi install npm:pi-shadow-compact
 ```
 
-`keepRecentTokens` controls the verbatim recent tail.
+The extension ships as TypeScript source. Pi loads it through its own loader. No runtime dependencies.
 
-`reserveTokens` controls Pi's native late auto-compaction threshold.
+Update:
 
-## Build
+```bash
+pi update git:github.com/sij0sh/pi-shadow-compact
+```
 
-Requirements:
+Uninstall:
 
-- Node.js 22.19 or newer.
-- Pi 0.84.4 or a compatible release.
+```bash
+pi remove git:github.com/sij0sh/pi-shadow-compact
+```
+
+## Limitations
+
+Pi exposes no public API that silently rewrites live session history. The background summary is invisible, but the final durable swap uses Pi's public compaction API, so Pi may briefly show compaction status. The cached summary keeps that operation instant; it performs no model call.
+
+The soft threshold is detected at `turn_end`, the first event where final token usage exists. Usage inside a streaming response is not yet final.
+
+Secret redaction is heuristic. Keep secrets out of conversation history.
+
+## Development
 
 ```bash
 npm ci
 npm run check
 ```
 
-The build creates:
-
-```text
-dist/shadow-compact.js
-```
-
-Zod is bundled into the distributable. Pi runtime packages remain external and resolve from the Pi harness.
-
-## Install
-
-Install globally:
-
-```bash
-mkdir -p ~/.pi/agent/extensions
-cp dist/shadow-compact.js ~/.pi/agent/extensions/shadow-compact.js
-```
-
-Or install for one project:
-
-```bash
-mkdir -p .pi/extensions
-cp /path/to/pi-shadow-compact/dist/shadow-compact.js .pi/extensions/shadow-compact.js
-```
-
-Restart Pi or run `/reload`.
-
-## Summary pipeline
-
-The extension uses persisted JSONL as its primary source. It falls back to Pi's captured active branch for ephemeral sessions or a missing session file.
-
-The normalized transcript retains bounded semantic evidence from:
-
-- User and assistant text.
-- Reads and searches.
-- Shell commands and output.
-- Compiler and test failures.
-- Edits, writes, and diffs.
-- Unknown tools.
-- Custom context messages.
-- Active-path branch summaries.
-
-It removes thinking blocks, images, provider metadata, old compaction entries, and common secret formats.
-
-The private model conversation performs:
-
-1. An exhaustive evidence inventory.
-2. An omission and contradiction audit.
-3. A concise checkpoint compression.
-
-Every factual item must cite an evidence ID from the normalized packet. Code validates those references and renders the final Markdown. Evidence IDs are not included in the live model context.
-
-## Large sessions
-
-When the normalized raw branch exceeds the private input limit, the extension uses the latest prior checkpoint plus the newest pre-boundary raw evidence that fits.
-
-If no safe packet can be formed, Pi uses its native summarizer.
-
-Chunked map/reduce compaction is intentionally deferred.
-
-## Limitations
-
-Pi exposes the exact native preparation only during `session_before_compact`. The extension starts and immediately cancels a manual compaction to capture that preparation. The probe does not append a compaction entry, but some Pi interfaces may briefly display compaction status.
-
-Extension slash commands run before Pi's `input` event. They may bypass ready-summary adoption until the next normal user or RPC prompt.
-
-Secret redaction is defensive and heuristic. Do not treat it as a substitute for keeping secrets out of conversation history.
+`check` runs the type checker and the full test suite.
