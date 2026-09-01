@@ -66,13 +66,16 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       const model = resolveSummarizerModel(ctx, config);
       const maxTokens =
         config.summaryMaxTokens ?? Math.min(SUMMARY_MAX_TOKENS, model.maxTokens ?? SUMMARY_MAX_TOKENS);
+      // The override decouples the summarizer budget from models.json: Pi keeps its own
+      // context accounting while the summary request uses the deployment's real capacity.
+      const contextWindow = config.summarizerContextTokens ?? model.contextWindow;
       // Keep evidence usable when a large override is budgeted: never reserve more than
       // half the context window, so the input side always retains room to work with.
       const reservedTokens = Math.min(
         maxTokens * 2 + 8192,
-        Math.floor(model.contextWindow / 2),
+        Math.floor(contextWindow / 2),
       );
-      const budget = model.contextWindow - reservedTokens;
+      const budget = contextWindow - reservedTokens;
       const packet = normalizeSnapshot(
         {
           cwd: ctx.cwd,

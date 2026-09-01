@@ -43,6 +43,23 @@ it("honors summaryMaxTokens and thinkingLevel overrides", async () => {
   }
 });
 
+it("summarizerContextTokens overrides the packet budget independently of models.json", async () => {
+  // Default budget (~272K) keeps all fixture evidence; a tiny override keeps only the newest.
+  const f = await fixture({
+    softCompactThresholdPercent: 60,
+    summarizerModel: { provider: "", id: "" },
+    summarizerContextTokens: 1_000,
+  });
+  try {
+    await startPreparation(f);
+    const prompt = f.registry.prompts[0]!;
+    assert.match(prompt, /Now editing the file/);
+    assert.doesNotMatch(prompt, /First user message describing the overall goal/);
+  } finally {
+    await f.cleanup();
+  }
+});
+
 /** Runs turn_end at the 60% threshold and waits for the background summary to finish. */
 async function startPreparation(f: Fixture): Promise<void> {
   await f.emit("turn_end");

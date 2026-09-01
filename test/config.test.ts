@@ -158,11 +158,12 @@ describe("shadow compact config loading", () => {
     });
   });
 
-  it("accepts summaryMaxTokens and thinkingLevel overrides", async (t) => {
+  it("accepts summaryMaxTokens, summarizerContextTokens, and thinkingLevel overrides", async (t) => {
     const cwd = await temporaryCwd(t);
     await writeJson(projectConfigPath(cwd), {
       ...configBody(42, "provider", "model"),
       summaryMaxTokens: 32_768,
+      summarizerContextTokens: 1_000_000,
       thinkingLevel: "high",
     });
 
@@ -170,6 +171,7 @@ describe("shadow compact config loading", () => {
       softCompactThresholdPercent: 42,
       summarizerModel: { provider: "provider", id: "model" },
       summaryMaxTokens: 32_768,
+      summarizerContextTokens: 1_000_000,
       thinkingLevel: "high",
     });
   });
@@ -284,6 +286,11 @@ describe("shadow compact config loading", () => {
         { summaryMaxTokens: 1.5 },
         { summaryMaxTokens: "4096" },
         { summaryMaxTokens: null },
+        { summarizerContextTokens: 0 },
+        { summarizerContextTokens: -5 },
+        { summarizerContextTokens: 1.5 },
+        { summarizerContextTokens: "1000000" },
+        { summarizerContextTokens: null },
         { thinkingLevel: "bogus" },
         { thinkingLevel: 5 },
       ]) {
@@ -294,7 +301,7 @@ describe("shadow compact config loading", () => {
           await assertLoadError(
             loadConfig(context(cwd)),
             path,
-            /summaryMaxTokens must be a positive integer|thinkingLevel must be one of/,
+            /summaryMaxTokens must be a positive integer|summarizerContextTokens must be a positive integer|thinkingLevel must be one of/,
           );
         });
       }

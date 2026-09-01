@@ -26,6 +26,7 @@ export interface ShadowCompactConfig {
     id: string;
   };
   summaryMaxTokens?: number;
+  summarizerContextTokens?: number;
   thinkingLevel?: ModelThinkingLevel;
 }
 
@@ -79,6 +80,7 @@ export function parseConfig(source: string, path: string): ShadowCompactConfig {
       key !== "softCompactThresholdPercent" &&
       key !== "summarizerModel" &&
       key !== "summaryMaxTokens" &&
+      key !== "summarizerContextTokens" &&
       key !== "thinkingLevel"
     ) {
       throw new Error(`${path} has unknown key: ${key}`);
@@ -126,6 +128,18 @@ export function parseConfig(source: string, path: string): ShadowCompactConfig {
       throw new Error(`${path} summaryMaxTokens must be a positive integer`);
     }
     config.summaryMaxTokens = rawMaxTokens;
+  }
+
+  const rawContextTokens = record.summarizerContextTokens;
+  if (rawContextTokens !== undefined) {
+    if (
+      typeof rawContextTokens !== "number" ||
+      !Number.isInteger(rawContextTokens) ||
+      rawContextTokens < 1
+    ) {
+      throw new Error(`${path} summarizerContextTokens must be a positive integer`);
+    }
+    config.summarizerContextTokens = rawContextTokens;
   }
 
   const rawThinkingLevel = record.thinkingLevel;
