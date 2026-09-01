@@ -194,7 +194,32 @@ test("caps packets by dropping oldest evidence and keeping the newest", () => {
   const packet = normalizeSnapshot({ cwd, previousSummary: "Earlier verified checkpoint", entries });
   const text = packet.evidence.map((item) => item.text).join("\n");
   assert.ok(JSON.stringify({ evidence: packet.evidence }).length <= NORMALIZED_PACKET_MAX_CHARS);
+  assert.equal(packet.evidence[0]?.kind, "previous_checkpoint");
+  assert.equal(packet.evidence[0]?.text, "Earlier verified checkpoint");
   assert.match(packet.evidence.at(-1)?.text ?? "", /^message-7:/);
   assert.doesNotMatch(text, /message-0:/);
   assert.ok(packet.evidence.length < entries.length + 1);
+});
+
+test("keeps the previous_checkpoint when trimming evicts transcript evidence", () => {
+  sequence = 0;
+  const checkpoint = `prior context ${"c".repeat(39_500)}`;
+  const entries = [
+    entry({
+      type: "message",
+      message: { role: "user", content: `old:${"x".repeat(39_500)}`, timestamp: 1 },
+    }),
+    entry({
+      type: "message",
+      message: { role: "user", content: `new:${"y".repeat(39_500)}`, timestamp: 2 },
+    }),
+  ];
+
+  const packet = normalizeSnapshot({ cwd, previousSummary: checkpoint, entries }, 100_000);
+  assert.equal(packet.evidence[0]?.kind, "previous_checkpoint");
+  assert.equal(packet.evidence[0]?.evidenceId, "E0001");
+  assert.ok(packet.evidence[0]?.text.startsWith("prior context "));
+  assert.ok(packet.evidence.length < entries.length + 1, "transcript evidence was trimmed");
+  assert.match(packet.evidence.at(-1)?.text ?? "", /^new:/);
+  assert.ok(packet.evidence.every((item) => !item.text.startsWith("old:")));
 });

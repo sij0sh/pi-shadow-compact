@@ -52,9 +52,12 @@ export function normalizeSnapshot(input: NormalizeInput, maxChars = NORMALIZED_P
     ? [normalizeDraft("checkpoint", "previous_checkpoint", input.previousSummary, input.cwd, TEXT_LIMIT), ...input.entries.flatMap((entry) => normalizeEntry(entry, input.cwd, calls))]
     : input.entries.flatMap((entry) => normalizeEntry(entry, input.cwd, calls));
   let evidence = numberEvidence(drafts);
-
-  while (evidence.length > 0 && packetSize(evidence) > maxChars) {
-    evidence = renumber(evidence.slice(1));
+  // The promoted checkpoint leads the packet, so eviction must skip its slot;
+  // it is the sole carrier of pre-compaction context.
+  const protectedCount = evidence[0]?.kind === "previous_checkpoint" ? 1 : 0;
+  while (evidence.length > protectedCount && packetSize(evidence) > maxChars) {
+    evidence.splice(protectedCount, 1);
+    evidence = renumber(evidence);
   }
   return { evidence };
 }
