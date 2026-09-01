@@ -187,6 +187,7 @@ export interface Fixture {
   readonly compactCalls: CompactCall[];
   readonly notifications: string[];
   readonly branch: SessionEntry[];
+  readonly agentDir: string;
   setBranch(entries: SessionEntry[]): void;
   setPercent(percent: number | undefined): void;
   gate(): void;
@@ -253,6 +254,7 @@ export async function fixture(globalConfig?: Record<string, unknown>): Promise<F
     registry,
     compactCalls,
     notifications,
+    agentDir,
     get branch() {
       return branch;
     },

@@ -34,6 +34,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
   const state = new ShadowCompactStateController();
   let configPromise: Promise<ShadowCompactConfig> | undefined;
   let reportedError: string | undefined;
+  let configErrorReported = false;
 
   const reportError = (ctx: ExtensionContext, error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
@@ -43,10 +44,21 @@ export default function shadowCompact(pi: ExtensionAPI): void {
   };
 
   const configFor = async (ctx: ExtensionContext): Promise<ShadowCompactConfig> => {
-    configPromise ??= loadConfig(ctx).then((config) => {
-      reportedError = undefined;
-      return config;
-    });
+    configPromise ??= loadConfig(ctx).then(
+      (config) => {
+        // A failed load must not stay memoized: the next turn retries the read.
+        if (configErrorReported) {
+          configErrorReported = false;
+          ctx.ui.notify("shadow-compact: config recovered", "info");
+        }
+        reportedError = undefined;
+        return config;
+      },
+      (error: unknown) => {
+        configPromise = undefined;
+        throw error;
+      },
+    );
     return configPromise;
   };
 
@@ -127,6 +139,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     state.reset();
     configPromise = undefined;
     reportedError = undefined;
+    configErrorReported = false;
   });
 
   pi.on("turn_end", async (_event, ctx) => {
@@ -138,6 +151,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     try {
       config = await configFor(ctx);
     } catch (error) {
+      configErrorReported = true;
       reportError(ctx, error);
       return;
     }

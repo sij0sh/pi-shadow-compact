@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
   fixture,
@@ -299,6 +301,42 @@ describe("shadowCompact extension orchestration", () => {
 
       await f.emit("agent_settled");
       assert.equal(f.compactCalls.length, 1);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it("retries config loading after a failure and announces recovery", async () => {
+    const f = await fixture();
+    try {
+      const configPath = join(f.agentDir, "shadow-compact.json");
+      await writeFile(configPath, "{ not json");
+      f.setPercent(61);
+      await f.emit("turn_end");
+      await tick();
+      assert.equal(f.registry.calls, 0);
+      assert.equal(f.notifications.length, 1);
+      assert.match(f.notifications[0]!, /not valid JSON/);
+
+      // The retry stays deduped to one toast while the file stays broken.
+      await f.emit("turn_end");
+      await tick();
+      assert.equal(f.registry.calls, 0);
+      assert.equal(f.notifications.length, 1);
+
+      // A fixed file takes effect on the next turn without session_start.
+      await writeFile(
+        configPath,
+        JSON.stringify({
+          softCompactThresholdPercent: 61,
+          summarizerModel: { provider: "", id: "" },
+        }),
+      );
+      await f.emit("turn_end");
+      await waitFor(() => f.registry.settled === 1);
+      assert.equal(f.registry.calls, 1);
+      assert.equal(f.notifications.length, 2);
+      assert.equal(f.notifications[1], "shadow-compact: config recovered");
     } finally {
       await f.cleanup();
     }
