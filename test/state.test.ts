@@ -108,6 +108,20 @@ describe("ShadowCompactStateController", () => {
     assert.equal(controller.fail(0), false);
   });
 
+  it("requestNativeFallback aborts preparation and queues only once", () => {
+    const controller = new ShadowCompactStateController();
+    const preparing = prepare(controller);
+
+    assert.equal(controller.requestNativeFallback(), true);
+    assert.equal(preparing.controller.signal.aborted, true);
+    assert.deepEqual(controller.current, {
+      phase: "idle",
+      generation: preparing.generation + 1,
+      pendingNativeFallback: true,
+    });
+    assert.equal(controller.requestNativeFallback(), false);
+  });
+
   it("clearPendingNativeFallback only once from idle", () => {
     const controller = new ShadowCompactStateController();
     assert.equal(controller.clearPendingNativeFallback(), false);

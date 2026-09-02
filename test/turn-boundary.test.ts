@@ -11,9 +11,9 @@ import {
   compactionEntry,
 } from "./helpers/index-fixture.js";
 
-const READY_MESSAGE = "shadow-compact: summary ready - will swap in at the next turn boundary";
+const READY_MESSAGE = "shadow-compact: summary ready - will swap in when the agent is idle";
 const DEFERRED_MESSAGE =
-  "shadow-compact: summary still preparing - swap deferred to the next turn boundary";
+  "shadow-compact: summary still preparing - swap deferred until the agent is idle";
 
 /** Runs turn_end at the 60% threshold and waits for the background summary to finish. */
 async function startPreparation(f: ReturnType<typeof fixture> extends Promise<infer T> ? T : never): Promise<void> {
@@ -21,8 +21,8 @@ async function startPreparation(f: ReturnType<typeof fixture> extends Promise<in
   await waitFor(() => f.registry.settled >= 1);
 }
 
-describe("mid-run swap, hard hatch, and terminal empty-snapshot failure", () => {
-  it("commits a ready summary at the next turn boundary without waiting for agent_settled", async () => {
+describe("idle swap, hard hatch, and terminal empty-snapshot failure", () => {
+  it("waits for agent_settled before committing a ready summary", async () => {
     const f = await fixture();
     try {
       // Publish mid-run: gate the summary, then let it finish while the run continues.
@@ -34,7 +34,8 @@ describe("mid-run swap, hard hatch, and terminal empty-snapshot failure", () => 
       assert.deepEqual(f.notifications, [READY_MESSAGE]);
 
       await f.emit("turn_end");
-      assert.equal(f.compactCalls.length, 1, "committed at the turn boundary");
+      assert.equal(f.compactCalls.length, 0, "an active run must not be aborted");
+      await f.emit("agent_settled");
       assert.match(f.compactCalls[0]?.customInstructions ?? "", NONCE_PATTERN);
       const nonce = f.compactCalls[0]!.customInstructions!;
 
@@ -49,7 +50,7 @@ describe("mid-run swap, hard hatch, and terminal empty-snapshot failure", () => 
     }
   });
 
-  it("announces the deferral when the summary misses the settle, then commits at the next boundary", async () => {
+  it("announces the deferral when the summary misses the settle, then commits once ready and idle", async () => {
     const f = await fixture();
     try {
       f.gate();
@@ -66,27 +67,29 @@ describe("mid-run swap, hard hatch, and terminal empty-snapshot failure", () => 
       f.release();
       await waitFor(() => f.registry.settled === 1);
       await tick();
-      await f.emit("turn_end");
       assert.match(f.compactCalls[0]?.customInstructions ?? "", NONCE_PATTERN);
     } finally {
       await f.cleanup();
     }
   });
 
-  it("runs one native compaction immediately once usage passes the hard threshold", async () => {
+  it("queues one native compaction once usage passes the hard threshold", async () => {
     const f = await fixture();
     try {
       f.gate();
       await f.emit("turn_end");
       f.setPercent(80);
       await f.emit("turn_end");
-      assert.deepEqual(f.compactCalls, [{}]);
+      assert.deepEqual(f.compactCalls, []);
       assert.ok(f.registry.signals[0]?.aborted, "in-flight preparation aborted");
 
-      // No duplicate while the native compaction is in flight.
+      // No duplicate while the native compaction is queued.
       await f.emit("turn_end");
       await tick();
-      assert.equal(f.compactCalls.length, 1);
+      assert.equal(f.compactCalls.length, 0);
+
+      await f.emit("agent_settled");
+      assert.deepEqual(f.compactCalls, [{}]);
 
       // The aborted completion stays inert; the fallback is not scheduled twice.
       f.release();
@@ -105,6 +108,8 @@ describe("mid-run swap, hard hatch, and terminal empty-snapshot failure", () => 
       await startPreparation(ready);
       ready.setPercent(85);
       await ready.emit("turn_end");
+      assert.equal(ready.compactCalls.length, 0);
+      await ready.emit("agent_settled");
       assert.match(ready.compactCalls[0]?.customInstructions ?? "", NONCE_PATTERN);
       assert.equal(ready.compactCalls.length, 1);
     } finally {
@@ -130,8 +135,10 @@ describe("mid-run swap, hard hatch, and terminal empty-snapshot failure", () => 
       await writeFile(join(f.agentDir, "shadow-compact.json"), "{ not json");
       f.setPercent(80);
       await f.emit("turn_end");
-      assert.deepEqual(f.compactCalls, [{}]);
+      assert.deepEqual(f.compactCalls, []);
       assert.equal(f.registry.calls, 0);
+      await f.emit("agent_settled");
+      assert.deepEqual(f.compactCalls, [{}]);
     } finally {
       await f.cleanup();
     }
@@ -142,6 +149,8 @@ describe("mid-run swap, hard hatch, and terminal empty-snapshot failure", () => 
     try {
       f.setPercent(80);
       await f.emit("turn_end");
+      assert.equal(f.compactCalls.length, 0);
+      await f.emit("agent_settled");
       assert.equal(f.compactCalls.length, 1);
 
       await f.emit("session_compact", {
@@ -152,6 +161,8 @@ describe("mid-run swap, hard hatch, and terminal empty-snapshot failure", () => 
         willRetry: false,
       });
       await f.emit("turn_end");
+      assert.equal(f.compactCalls.length, 1);
+      await f.emit("agent_settled");
       assert.equal(f.compactCalls.length, 2, "hatch can fire again after the swap landed");
     } finally {
       await f.cleanup();

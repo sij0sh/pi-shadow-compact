@@ -74,6 +74,17 @@ export class ShadowCompactStateController {
     return true;
   }
 
+  requestNativeFallback(): boolean {
+    if (this.#state.phase === "idle" && this.#state.pendingNativeFallback) return false;
+    if (this.#state.phase === "preparing") this.#state.controller.abort();
+    this.#state = {
+      phase: "idle",
+      generation: this.#state.generation + 1,
+      pendingNativeFallback: true,
+    };
+    return true;
+  }
+
   clearPendingNativeFallback(): boolean {
     if (this.#state.phase !== "idle" || !this.#state.pendingNativeFallback) return false;
     this.#state = { phase: "idle", generation: this.#state.generation, pendingNativeFallback: false };

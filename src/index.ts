@@ -22,9 +22,9 @@ import {
 import { randomUUID } from "node:crypto";
 
 const COMMIT_NONCE_PREFIX = "[shadow-compact:commit:";
-const READY_MESSAGE = "shadow-compact: summary ready - will swap in at the next turn boundary";
+const READY_MESSAGE = "shadow-compact: summary ready - will swap in when the agent is idle";
 const DEFERRED_MESSAGE =
-  "shadow-compact: summary still preparing - swap deferred to the next turn boundary";
+  "shadow-compact: summary still preparing - swap deferred until the agent is idle";
 
 function isCommitNonce(value: unknown): value is string {
   return typeof value === "string" && value.startsWith(COMMIT_NONCE_PREFIX) && value.endsWith("]");
@@ -45,8 +45,8 @@ export default function shadowCompact(pi: ExtensionAPI): void {
   let nativeFallbackInFlight = false;
 
   const runNativeFallback = (ctx: ExtensionContext): boolean => {
-    // Pi rejects overlapping compactions, so only one native pass may be outstanding.
-    if (nativeFallbackInFlight) return false;
+    // Manual compaction aborts an active agent run, so only start it while Pi is idle.
+    if (nativeFallbackInFlight || !ctx.isIdle()) return false;
     nativeFallbackInFlight = true;
     ctx.compact({});
     return true;
@@ -54,6 +54,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
 
   // Shared commit path: a ready, still-current result swaps in via the nonce compaction.
   const commitReadySummary = (ctx: ExtensionContext): void => {
+    if (!ctx.isIdle()) return;
     const current = state.current;
     if (current.phase !== "ready") return;
     if (!resultIsCurrent(ctx, current.result)) {
@@ -68,7 +69,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       onError: () => {
         // The cached result failed; let Pi's native summarizer run once instead.
         state.reset();
-        ctx.compact({});
+        if (!runNativeFallback(ctx)) state.requestNativeFallback();
       },
     });
   };
@@ -170,6 +171,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         return;
       }
       ctx.ui.notify(READY_MESSAGE, "info");
+      commitReadySummary(ctx);
     } catch (error) {
       if (!controller.signal.aborted) reportError(ctx, error);
       state.fail(generation);
@@ -193,10 +195,9 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     const percent = ctx.getContextUsage()?.percent;
     if (percent === null || percent === undefined) return;
 
-    // turn_end is the safe mid-run insertion point: a ready summary swaps here
-    // instead of waiting for the run to settle.
-    commitReadySummary(ctx);
-    if (state.current.phase === "committing") return;
+    // ctx.compact() is a manual compaction and aborts an active agent run. This
+    // event only prepares work; agent_settled performs the durable swap.
+    if (state.current.phase === "ready" || state.current.phase === "committing") return;
 
     const config = await configFor(ctx).catch((error: unknown) => {
       configErrorReported = true;
@@ -206,12 +207,10 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     const hardThreshold =
       config?.hardCompactThresholdPercent ?? DEFAULT_HARD_COMPACT_THRESHOLD_PERCENT;
     if (percent >= hardThreshold) {
-      // Deadline hatch: past this point do not wait for the detached summary.
-      if (state.current.phase === "preparing") state.reset();
-      state.clearPendingNativeFallback();
-      if (runNativeFallback(ctx)) {
+      // Deadline hatch: cancel detached work and compact at the next safe idle point.
+      if (state.requestNativeFallback()) {
         ctx.ui.notify(
-          `shadow-compact: ${Math.round(percent)}% context - running native compaction now`,
+          `shadow-compact: ${Math.round(percent)}% context - native compaction queued until idle`,
           "info",
         );
       }
@@ -229,13 +228,14 @@ export default function shadowCompact(pi: ExtensionAPI): void {
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
+    if (!ctx.isIdle()) return;
     if (state.clearPendingNativeFallback()) {
-      ctx.compact({});
+      if (!runNativeFallback(ctx)) state.requestNativeFallback();
       return;
     }
 
     if (state.current.phase === "preparing") {
-      // The summary missed the settle; the next turn boundary swaps it in.
+      // The summary missed this idle point. Its completion commits once Pi stays idle.
       ctx.ui.notify(DEFERRED_MESSAGE, "info");
       return;
     }

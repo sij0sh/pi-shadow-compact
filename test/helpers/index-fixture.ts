@@ -227,6 +227,7 @@ export async function fixture(globalConfig?: Record<string, unknown>): Promise<F
 
   let branch = makeBranch();
   let percent: number | undefined = 60;
+  let idle = false;
   const releases: Array<() => void> = [];
   const registry = new FakeRegistry();
   const compactCalls: CompactCall[] = [];
@@ -237,9 +238,11 @@ export async function fixture(globalConfig?: Record<string, unknown>): Promise<F
     model: registry.summaryModel,
     modelRegistry: registry,
     isProjectTrusted: () => true,
+    isIdle: () => idle,
     getContextUsage: () =>
       percent === undefined ? undefined : { tokens: percent * 10, contextWindow: 1000, percent },
     compact: (options?: CompactCall) => {
+      assert.equal(idle, true, "ctx.compact must only run while the agent is idle");
       compactCalls.push(options);
     },
     sessionManager: {
@@ -278,6 +281,8 @@ export async function fixture(globalConfig?: Record<string, unknown>): Promise<F
       branch = [...branch, compactionEntry("c1", branch.at(-1)?.id ?? "e4")];
     },
     async emit(name, event = { type: name }) {
+      if (name === "turn_end") idle = false;
+      if (name === "agent_settled") idle = true;
       let result: unknown;
       for (const handler of handlers.get(name) ?? []) result = await handler(event, ctx);
       return result;

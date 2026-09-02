@@ -13,9 +13,9 @@ import {
   type Fixture,
 } from "./helpers/index-fixture.js";
 
-const READY_MESSAGE = "shadow-compact: summary ready - will swap in at the next turn boundary";
+const READY_MESSAGE = "shadow-compact: summary ready - will swap in when the agent is idle";
 const DEFERRED_MESSAGE =
-  "shadow-compact: summary still preparing - swap deferred to the next turn boundary";
+  "shadow-compact: summary still preparing - swap deferred until the agent is idle";
 
 
 it("uses the default summary token cap and no reasoning without overrides", async () => {
