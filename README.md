@@ -89,11 +89,12 @@ everything that came before it.
 ## Behavior
 
 1. Pi works normally.
-2. The first persisted `turn_end` at or above the soft threshold starts a detached background summary.
-3. Pi continues turns, tools, and steering while the summary runs.
-4. The first `turn_end` after the summary is ready applies the prepared checkpoint. Long continuous runs no longer defer the swap to the run's settle point.
-5. One nonce-tagged `ctx.compact()` applies the prepared checkpoint. No summary model call runs on that path.
-6. The next prompt starts small: summary plus Pi's retained recent tail.
+2. Crossing the soft threshold starts one background summary. The run never stops or waits for it.
+3. When the summary is ready, the next request silently uses it: summary first, then Pi's retained recent tail. No compact runs yet.
+4. When the agent next goes idle, one nonce-tagged `ctx.compact()` persists the summary as the durable checkpoint. No summary model call runs on that path.
+5. The session continues on the small context.
+
+The mid-run request swap touches only the message list Pi sends to the model, so an active agent run is never aborted. The durable write waits for idle because Pi's compaction API ends any active run.
 
 Status toasts announce each step: summary ready, a summary that misses a settle point, and hard-threshold native compaction.
 
@@ -129,9 +130,7 @@ Background summarization starts at this level. The actual compact lands slightly
 
 `hardCompactThresholdPercent` accepts `1` through `99`, must be greater than the soft threshold, and defaults to `80`.
 
-At this level the extension stops waiting for the detached summary: it aborts any summary still in flight and runs one ordinary native compaction immediately. Use it as a deadline when sessions grow fast or the summarizer model is slow.
-
-Committing a summary at a mid-run `turn_end` uses Pi's manual compaction path, which ends the active run at that point, exactly like running `/compact` yourself. The completed turn is never lost; only the run's continuation stops.
+At this level the extension stops waiting for the detached summary: it aborts any summary still in flight and queues one ordinary native compaction. The queue runs once the agent is idle, so the active run is never interrupted. Use it as a deadline when sessions grow fast or the summarizer model is slow.
 
 ### Summarizer model
 
