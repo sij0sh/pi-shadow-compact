@@ -2,16 +2,18 @@
 
 Silent soft-threshold compaction for Pi.
 
-Pi runs normally. When context usage first reaches your soft threshold, the extension summarizes the session in a detached background request. Nothing blocks, aborts, or waits. When the summary is ready and the active run settles, the extension swaps old history for the checkpoint through one fast native compaction. Context drops to roughly system prompt + summary + recent tail.
+Pi runs normally. When context usage first reaches your soft threshold, the extension summarizes the session in a detached background request. Nothing blocks, aborts, or waits. As soon as the summary is ready, the next `turn_end` swaps old history for the checkpoint through one fast native compaction, even mid-run. Context drops to roughly system prompt + summary + recent tail.
 
 ## Behavior
 
 1. Pi works normally.
 2. The first persisted `turn_end` at or above the soft threshold starts a detached background summary.
 3. Pi continues turns, tools, and steering while the summary runs.
-4. When the summary is ready, the extension waits for a safe settle point.
+4. The first `turn_end` after the summary is ready applies the prepared checkpoint. Long continuous runs no longer defer the swap to the run's settle point.
 5. One nonce-tagged `ctx.compact()` applies the prepared checkpoint. No summary model call runs on that path.
 6. The next prompt starts small: summary plus Pi's retained recent tail.
+
+Status toasts announce each step: summary ready, a summary that misses a settle point, and hard-threshold native compaction.
 
 ## Configuration
 
@@ -27,6 +29,7 @@ cp .pi/shadow-compact.example.json .pi/shadow-compact.json
 ```json
 {
   "softCompactThresholdPercent": 60,
+  "hardCompactThresholdPercent": 80,
   "summarizerModel": {
     "provider": "",
     "id": ""
@@ -39,6 +42,14 @@ cp .pi/shadow-compact.example.json .pi/shadow-compact.json
 `softCompactThresholdPercent` accepts `1` through `99`. The default is `60`.
 
 Background summarization starts at this level. The actual compact lands slightly above it, depending on how much context Pi adds while the summary runs.
+
+### Hard threshold
+
+`hardCompactThresholdPercent` accepts `1` through `99`, must be greater than the soft threshold, and defaults to `80`.
+
+At this level the extension stops waiting for the detached summary: it aborts any summary still in flight and runs one ordinary native compaction immediately. Use it as a deadline when sessions grow fast or the summarizer model is slow.
+
+Committing a summary at a mid-run `turn_end` uses Pi's manual compaction path, which ends the active run at that point, exactly like running `/compact` yourself. The completed turn is never lost; only the run's continuation stops.
 
 ### Summarizer model
 
@@ -87,6 +98,7 @@ Pi's built-in compaction takes over whenever the custom path is not safe:
 - The model errors, aborts, hits its output limit, or returns invalid JSON twice.
 - The session branches or compacts while the summary runs.
 - A prepared boundary no longer matches Pi's native boundary.
+- There is nothing to summarize yet, so the trigger re-arms instead of latching.
 
 A failed background summary schedules one ordinary native compaction at the next settle point. It never retries in a loop and never cancels Pi's overflow recovery.
 
