@@ -13,6 +13,10 @@ import {
   type Fixture,
 } from "./helpers/index-fixture.js";
 
+const READY_MESSAGE = "shadow-compact: summary ready - will swap in at the next turn boundary";
+const DEFERRED_MESSAGE =
+  "shadow-compact: summary still preparing - swap deferred to the next turn boundary";
+
 
 it("uses the default summary token cap and no reasoning without overrides", async () => {
   const f = await fixture();
@@ -170,7 +174,8 @@ describe("shadowCompact extension orchestration", () => {
       f.setBranch([e1!, e2!, e3!, userEntry("e5", "e3", `Divergent continuation: ${"more ".repeat(30)}`)]);
       await f.emit("agent_settled");
       assert.equal(f.compactCalls.length, 0);
-      assert.deepEqual(f.notifications, []);
+      // The discard itself stays silent; the one toast is the ready announcement.
+      assert.deepEqual(f.notifications, [READY_MESSAGE]);
     } finally {
       await f.cleanup();
     }
@@ -335,8 +340,12 @@ describe("shadowCompact extension orchestration", () => {
       await f.emit("turn_end");
       await waitFor(() => f.registry.settled === 1);
       assert.equal(f.registry.calls, 1);
-      assert.equal(f.notifications.length, 2);
-      assert.equal(f.notifications[1], "shadow-compact: config recovered");
+      // Config error toast, recovery toast, then the ready announcement.
+      assert.deepEqual(f.notifications, [
+        `shadow-compact: ${join(f.agentDir, "shadow-compact.json")} is not valid JSON`,
+        "shadow-compact: config recovered",
+        READY_MESSAGE,
+      ]);
     } finally {
       await f.cleanup();
     }
@@ -423,4 +432,5 @@ describe("shadowCompact extension orchestration", () => {
       await stale.cleanup();
     }
   });
+
 });

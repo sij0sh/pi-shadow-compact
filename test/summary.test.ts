@@ -94,6 +94,7 @@ const packet: NormalizedPacket = {
 
 const config = {
   softCompactThresholdPercent: 60,
+  hardCompactThresholdPercent: 80,
   summarizerModel: { provider: "configured", id: "summary" },
 };
 const blankModelConfig = { ...config, summarizerModel: { provider: "", id: "" } };

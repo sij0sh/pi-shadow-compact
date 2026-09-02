@@ -6,7 +6,11 @@ import {
   type SessionBeforeCompactEvent,
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
-import { loadConfig, type ShadowCompactConfig } from "./config.js";
+import {
+  DEFAULT_HARD_COMPACT_THRESHOLD_PERCENT,
+  loadConfig,
+  type ShadowCompactConfig,
+} from "./config.js";
 import { normalizeSnapshot } from "./normalize.js";
 import { prepareSnapshot } from "./prepare.js";
 import { ShadowCompactStateController, type PreparedResult } from "./state.js";
@@ -18,6 +22,9 @@ import {
 import { randomUUID } from "node:crypto";
 
 const COMMIT_NONCE_PREFIX = "[shadow-compact:commit:";
+const READY_MESSAGE = "shadow-compact: summary ready - will swap in at the next turn boundary";
+const DEFERRED_MESSAGE =
+  "shadow-compact: summary still preparing - swap deferred to the next turn boundary";
 
 function isCommitNonce(value: unknown): value is string {
   return typeof value === "string" && value.startsWith(COMMIT_NONCE_PREFIX) && value.endsWith("]");
@@ -35,6 +42,36 @@ export default function shadowCompact(pi: ExtensionAPI): void {
   let configPromise: Promise<ShadowCompactConfig> | undefined;
   let reportedError: string | undefined;
   let configErrorReported = false;
+  let nativeFallbackInFlight = false;
+
+  const runNativeFallback = (ctx: ExtensionContext): boolean => {
+    // Pi rejects overlapping compactions, so only one native pass may be outstanding.
+    if (nativeFallbackInFlight) return false;
+    nativeFallbackInFlight = true;
+    ctx.compact({});
+    return true;
+  };
+
+  // Shared commit path: a ready, still-current result swaps in via the nonce compaction.
+  const commitReadySummary = (ctx: ExtensionContext): void => {
+    const current = state.current;
+    if (current.phase !== "ready") return;
+    if (!resultIsCurrent(ctx, current.result)) {
+      state.reset();
+      return;
+    }
+    const commit = state.beginCommit(`${COMMIT_NONCE_PREFIX}${randomUUID()}]`);
+    if (!commit) return;
+    ctx.compact({
+      customInstructions: commit.nonce,
+      onComplete: () => state.reset(),
+      onError: () => {
+        // The cached result failed; let Pi's native summarizer run once instead.
+        state.reset();
+        ctx.compact({});
+      },
+    });
+  };
 
   const reportError = (ctx: ExtensionContext, error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
@@ -69,12 +106,17 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     controller: AbortController,
   ): Promise<void> => {
     const generation = state.current.generation;
-    const keepRecentTokens = SettingsManager.create(ctx.cwd, getAgentDir())
-      .getCompactionSettings().keepRecentTokens;
-    const snapshot = prepareSnapshot(branch, keepRecentTokens);
-    if (!snapshot) return;
-
     try {
+      const keepRecentTokens = SettingsManager.create(ctx.cwd, getAgentDir())
+        .getCompactionSettings().keepRecentTokens;
+      const snapshot = prepareSnapshot(branch, keepRecentTokens);
+      // "Nothing to summarize" is terminal: fail() releases the claimed phase so a
+      // later turn can retry instead of latching the extension in preparing forever.
+      if (!snapshot) {
+        state.fail(generation);
+        return;
+      }
+
       const model = resolveSummarizerModel(ctx, config);
       const maxTokens =
         config.summaryMaxTokens ?? Math.min(SUMMARY_MAX_TOKENS, model.maxTokens ?? SUMMARY_MAX_TOKENS);
@@ -123,7 +165,11 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         isValidBranchAncestry(current, result) &&
         latestCompactionId(current) === result.latestCompactionId;
       // Ownership-checked: a superseded completion no-ops instead of aborting a newer prepare.
-      if (!valid || !state.publish(generation, result)) state.fail(generation);
+      if (!valid || !state.publish(generation, result)) {
+        state.fail(generation);
+        return;
+      }
+      ctx.ui.notify(READY_MESSAGE, "info");
     } catch (error) {
       if (!controller.signal.aborted) reportError(ctx, error);
       state.fail(generation);
@@ -140,22 +186,40 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     configPromise = undefined;
     reportedError = undefined;
     configErrorReported = false;
+    nativeFallbackInFlight = false;
   });
 
   pi.on("turn_end", async (_event, ctx) => {
-    if (state.current.phase !== "idle") return;
     const percent = ctx.getContextUsage()?.percent;
     if (percent === null || percent === undefined) return;
 
-    let config: ShadowCompactConfig;
-    try {
-      config = await configFor(ctx);
-    } catch (error) {
+    // turn_end is the safe mid-run insertion point: a ready summary swaps here
+    // instead of waiting for the run to settle.
+    commitReadySummary(ctx);
+    if (state.current.phase === "committing") return;
+
+    const config = await configFor(ctx).catch((error: unknown) => {
       configErrorReported = true;
       reportError(ctx, error);
+      return undefined;
+    });
+    const hardThreshold =
+      config?.hardCompactThresholdPercent ?? DEFAULT_HARD_COMPACT_THRESHOLD_PERCENT;
+    if (percent >= hardThreshold) {
+      // Deadline hatch: past this point do not wait for the detached summary.
+      if (state.current.phase === "preparing") state.reset();
+      state.clearPendingNativeFallback();
+      if (runNativeFallback(ctx)) {
+        ctx.ui.notify(
+          `shadow-compact: ${Math.round(percent)}% context - running native compaction now`,
+          "info",
+        );
+      }
       return;
     }
-    if (percent < config.softCompactThresholdPercent || state.current.phase !== "idle") return;
+    if (!config || percent < config.softCompactThresholdPercent || state.current.phase !== "idle") {
+      return;
+    }
 
     const prepared = state.startPreparing();
     if (!prepared) return;
@@ -170,24 +234,12 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       return;
     }
 
-    const current = state.current;
-    if (current.phase !== "ready") return;
-    if (!resultIsCurrent(ctx, current.result)) {
-      state.reset();
+    if (state.current.phase === "preparing") {
+      // The summary missed the settle; the next turn boundary swaps it in.
+      ctx.ui.notify(DEFERRED_MESSAGE, "info");
       return;
     }
-
-    const commit = state.beginCommit(`${COMMIT_NONCE_PREFIX}${randomUUID()}]`);
-    if (!commit) return;
-    ctx.compact({
-      customInstructions: commit.nonce,
-      onComplete: () => state.reset(),
-      onError: () => {
-        // The cached result failed; let Pi's native summarizer run once instead.
-        state.reset();
-        ctx.compact({});
-      },
-    });
+    commitReadySummary(ctx);
   });
 
   pi.on("session_before_compact", (event: SessionBeforeCompactEvent, ctx) => {
@@ -230,13 +282,21 @@ export default function shadowCompact(pi: ExtensionAPI): void {
   });
 
   pi.on("session_compact", (event) => {
+    nativeFallbackInFlight = false;
     if (event.fromExtension) state.reset();
   });
   pi.on("session_compact_failed", (event) => {
+    nativeFallbackInFlight = false;
     if (event.fromExtension) state.reset();
   });
-  pi.on("session_tree", () => state.reset());
-  pi.on("session_shutdown", () => state.reset());
+  pi.on("session_tree", () => {
+    nativeFallbackInFlight = false;
+    state.reset();
+  });
+  pi.on("session_shutdown", () => {
+    nativeFallbackInFlight = false;
+    state.reset();
+  });
 }
 
 function latestCompactionId(branch: SessionEntry[]): string | null {
