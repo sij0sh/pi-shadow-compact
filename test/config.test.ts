@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, it, type TestContext } from "node:test";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
+  DEFAULT_HARD_COMPACT_THRESHOLD_PERCENT,
   DEFAULT_SOFT_COMPACT_THRESHOLD_PERCENT,
   defaultConfig,
   loadConfig,
@@ -105,6 +106,7 @@ describe("shadow compact config loading", () => {
 
     assert.deepEqual(await loadConfig(context(cwd)), {
       softCompactThresholdPercent: 80,
+      hardCompactThresholdPercent: DEFAULT_HARD_COMPACT_THRESHOLD_PERCENT,
       summarizerModel: { provider: "global-provider", id: "global-model" },
     });
   });
@@ -116,6 +118,7 @@ describe("shadow compact config loading", () => {
 
     assert.deepEqual(await loadConfig(context(cwd)), {
       softCompactThresholdPercent: 42,
+      hardCompactThresholdPercent: DEFAULT_HARD_COMPACT_THRESHOLD_PERCENT,
       summarizerModel: { provider: "project-provider", id: "project-model" },
     });
   });
@@ -127,6 +130,7 @@ describe("shadow compact config loading", () => {
 
     assert.deepEqual(await loadConfig(context(cwd)), {
       softCompactThresholdPercent: 42,
+      hardCompactThresholdPercent: DEFAULT_HARD_COMPACT_THRESHOLD_PERCENT,
       summarizerModel: { provider: "", id: "" },
     });
   });
@@ -138,6 +142,7 @@ describe("shadow compact config loading", () => {
 
     assert.deepEqual(await loadConfig(context(cwd, false)), {
       softCompactThresholdPercent: 80,
+      hardCompactThresholdPercent: DEFAULT_HARD_COMPACT_THRESHOLD_PERCENT,
       summarizerModel: { provider: "global-provider", id: "global-model" },
     });
   });
@@ -148,12 +153,14 @@ describe("shadow compact config loading", () => {
     await writeJson(projectConfigPath(cwd), configBody(42.5, " provider ", " model "));
     assert.deepEqual(await loadConfig(context(cwd)), {
       softCompactThresholdPercent: 42.5,
+      hardCompactThresholdPercent: DEFAULT_HARD_COMPACT_THRESHOLD_PERCENT,
       summarizerModel: { provider: "provider", id: "model" },
     });
 
     await writeJson(projectConfigPath(cwd), configBody(42.5));
     assert.deepEqual(await loadConfig(context(cwd)), {
       softCompactThresholdPercent: 42.5,
+      hardCompactThresholdPercent: DEFAULT_HARD_COMPACT_THRESHOLD_PERCENT,
       summarizerModel: { provider: "", id: "" },
     });
   });
@@ -169,11 +176,40 @@ describe("shadow compact config loading", () => {
 
     assert.deepEqual(await loadConfig(context(cwd)), {
       softCompactThresholdPercent: 42,
+      hardCompactThresholdPercent: DEFAULT_HARD_COMPACT_THRESHOLD_PERCENT,
       summarizerModel: { provider: "provider", id: "model" },
       summaryMaxTokens: 32_768,
       summarizerContextTokens: 1_000_000,
       thinkingLevel: "high",
     });
+  });
+
+  it("accepts a hardCompactThresholdPercent override", async (t) => {
+    const cwd = await temporaryCwd(t);
+    await writeJson(projectConfigPath(cwd), {
+      ...configBody(60),
+      hardCompactThresholdPercent: 90,
+    });
+
+    assert.deepEqual(await loadConfig(context(cwd)), {
+      softCompactThresholdPercent: 60,
+      hardCompactThresholdPercent: 90,
+      summarizerModel: { provider: "", id: "" },
+    });
+  });
+
+  it("rejects a hardCompactThresholdPercent at or below the soft threshold", async (t) => {
+    const cwd = await temporaryCwd(t);
+    await writeJson(projectConfigPath(cwd), {
+      ...configBody(60),
+      hardCompactThresholdPercent: 60,
+    });
+
+    await assertLoadError(
+      loadConfig(context(cwd)),
+      projectConfigPath(cwd),
+      /hardCompactThresholdPercent must be greater than softCompactThresholdPercent/,
+    );
   });
 
   for (const location of ["global", "project"] as const) {
@@ -293,6 +329,10 @@ describe("shadow compact config loading", () => {
         { summarizerContextTokens: null },
         { thinkingLevel: "bogus" },
         { thinkingLevel: 5 },
+        { hardCompactThresholdPercent: 0 },
+        { hardCompactThresholdPercent: 100 },
+        { hardCompactThresholdPercent: "80" },
+        { hardCompactThresholdPercent: null },
       ]) {
         it(`invalid ${JSON.stringify(invalid)} throws with the file path`, async (t) => {
           const cwd = await temporaryCwd(t);
@@ -301,7 +341,7 @@ describe("shadow compact config loading", () => {
           await assertLoadError(
             loadConfig(context(cwd)),
             path,
-            /summaryMaxTokens must be a positive integer|summarizerContextTokens must be a positive integer|thinkingLevel must be one of/,
+            /summaryMaxTokens must be a positive integer|summarizerContextTokens must be a positive integer|thinkingLevel must be one of|hardCompactThresholdPercent must be/,
           );
         });
       }

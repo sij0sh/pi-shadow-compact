@@ -1,5 +1,6 @@
 {
   "softCompactThresholdPercent": 60,
+  "hardCompactThresholdPercent": 80,
   "summarizerModel": {
     "provider": "",
     "id": ""

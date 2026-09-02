@@ -8,6 +8,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 export const DEFAULT_SOFT_COMPACT_THRESHOLD_PERCENT = 60;
+export const DEFAULT_HARD_COMPACT_THRESHOLD_PERCENT = 80;
 
 export const THINKING_LEVELS = [
   "off",
@@ -21,6 +22,7 @@ export const THINKING_LEVELS = [
 
 export interface ShadowCompactConfig {
   softCompactThresholdPercent: number;
+  hardCompactThresholdPercent: number;
   summarizerModel: {
     provider: string;
     id: string;
@@ -33,6 +35,7 @@ export interface ShadowCompactConfig {
 export function defaultConfig(): ShadowCompactConfig {
   return {
     softCompactThresholdPercent: DEFAULT_SOFT_COMPACT_THRESHOLD_PERCENT,
+    hardCompactThresholdPercent: DEFAULT_HARD_COMPACT_THRESHOLD_PERCENT,
     summarizerModel: { provider: "", id: "" },
   };
 }
@@ -78,6 +81,7 @@ export function parseConfig(source: string, path: string): ShadowCompactConfig {
   for (const key of Object.keys(record)) {
     if (
       key !== "softCompactThresholdPercent" &&
+      key !== "hardCompactThresholdPercent" &&
       key !== "summarizerModel" &&
       key !== "summaryMaxTokens" &&
       key !== "summarizerContextTokens" &&
@@ -119,8 +123,25 @@ export function parseConfig(source: string, path: string): ShadowCompactConfig {
 
   const config: ShadowCompactConfig = {
     softCompactThresholdPercent: rawThreshold,
+    hardCompactThresholdPercent: DEFAULT_HARD_COMPACT_THRESHOLD_PERCENT,
     summarizerModel: { provider, id },
   };
+
+  const rawHardThreshold = record.hardCompactThresholdPercent;
+  if (rawHardThreshold !== undefined) {
+    if (typeof rawHardThreshold !== "number" || !Number.isFinite(rawHardThreshold)) {
+      throw new Error(`${path} hardCompactThresholdPercent must be a number`);
+    }
+    if (rawHardThreshold < 1 || rawHardThreshold > 99) {
+      throw new Error(`${path} hardCompactThresholdPercent must be between 1 and 99`);
+    }
+    if (rawHardThreshold <= config.softCompactThresholdPercent) {
+      throw new Error(
+        `${path} hardCompactThresholdPercent must be greater than softCompactThresholdPercent`,
+      );
+    }
+    config.hardCompactThresholdPercent = rawHardThreshold;
+  }
 
   const rawMaxTokens = record.summaryMaxTokens;
   if (rawMaxTokens !== undefined) {
