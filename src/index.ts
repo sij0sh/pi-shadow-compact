@@ -1,6 +1,7 @@
 import {
   getAgentDir,
   SettingsManager,
+  type ContextEvent,
   type ExtensionAPI,
   type ExtensionContext,
   type SessionBeforeCompactEvent,
@@ -13,6 +14,7 @@ import {
 } from "./config.js";
 import { normalizeSnapshot } from "./normalize.js";
 import { prepareSnapshot } from "./prepare.js";
+import { contextSwapDropCount } from "./swap.js";
 import { ShadowCompactStateController, type PreparedResult } from "./state.js";
 import {
   SUMMARY_MAX_TOKENS,
@@ -22,7 +24,7 @@ import {
 import { randomUUID } from "node:crypto";
 
 const COMMIT_NONCE_PREFIX = "[shadow-compact:commit:";
-const READY_MESSAGE = "shadow-compact: summary ready - will swap in when the agent is idle";
+const READY_MESSAGE = "shadow-compact: summary ready - swaps in at the next turn";
 const DEFERRED_MESSAGE =
   "shadow-compact: summary still preparing - swap deferred until the agent is idle";
 
@@ -160,6 +162,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
           readFiles: snapshot.readFiles,
           modifiedFiles: snapshot.modifiedFiles,
         },
+        contextTokensBefore: ctx.getContextUsage()?.tokens ?? 0,
       };
       const valid =
         ctx.sessionManager.getSessionId() === result.sessionId &&
@@ -183,6 +186,31 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     isValidBranchAncestry(ctx.sessionManager.getBranch(), result) &&
     latestCompactionId(ctx.sessionManager.getBranch()) === result.latestCompactionId;
 
+  // Mid-run swap: a ready, current summary replaces the stale prefix in the next
+  // request. This touches only the request's message list, so the agent run never
+  // aborts. The durable CompactionEntry lands later through the nonce compaction.
+  const swapSummaryIntoContext = (ctx: ExtensionContext, event: ContextEvent) => {
+    const current = state.current;
+    if (current.phase !== "ready") return undefined;
+    if (!resultIsCurrent(ctx, current.result)) return undefined;
+    const drop = contextSwapDropCount(
+      ctx.sessionManager.getBranch(),
+      current.result.firstKeptEntryId,
+      current.result.latestCompactionId,
+    );
+    if (drop === undefined || drop > event.messages.length) return undefined;
+    const kept = event.messages.slice(drop);
+    if (kept.length === 0) return undefined;
+    const summaryMessage = {
+      role: "compactionSummary" as const,
+      summary: current.result.summary,
+      tokensBefore: current.result.contextTokensBefore ?? 0,
+      timestamp: Date.now(),
+    };
+    const messages: ContextEvent["messages"] = [summaryMessage, ...kept];
+    return { messages };
+  };
+
   pi.on("session_start", () => {
     state.reset();
     configPromise = undefined;
@@ -195,8 +223,9 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     const percent = ctx.getContextUsage()?.percent;
     if (percent === null || percent === undefined) return;
 
-    // ctx.compact() is a manual compaction and aborts an active agent run. This
-    // event only prepares work; agent_settled performs the durable swap.
+    // ctx.compact() is a manual compaction and aborts an active agent run, so
+    // this event only prepares. The context event swaps mid-run; agent_settled
+    // and the ready completion persist the durable compaction while idle.
     if (state.current.phase === "ready" || state.current.phase === "committing") return;
 
     const config = await configFor(ctx).catch((error: unknown) => {
@@ -241,6 +270,8 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     }
     commitReadySummary(ctx);
   });
+
+  pi.on("context", (event, ctx) => swapSummaryIntoContext(ctx, event));
 
   pi.on("session_before_compact", (event: SessionBeforeCompactEvent, ctx) => {
     if (isCommitNonce(event.customInstructions)) {

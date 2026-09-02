@@ -13,7 +13,7 @@ import {
   type Fixture,
 } from "./helpers/index-fixture.js";
 
-const READY_MESSAGE = "shadow-compact: summary ready - will swap in when the agent is idle";
+const READY_MESSAGE = "shadow-compact: summary ready - swaps in at the next turn";
 const DEFERRED_MESSAGE =
   "shadow-compact: summary still preparing - swap deferred until the agent is idle";
 
@@ -188,6 +188,10 @@ describe("shadowCompact extension orchestration", () => {
       f.appendCompaction();
       await f.emit("agent_settled");
       assert.equal(f.compactCalls.length, 0);
+
+      // A stale result never swaps into the request context either.
+      const swapped = await f.emit("context", { messages: f.contextMessages() });
+      assert.equal(swapped, undefined);
     } finally {
       await f.cleanup();
     }

@@ -193,6 +193,7 @@ export interface Fixture {
   gate(): void;
   release(): void;
   appendCompaction(): void;
+  contextMessages(): unknown[];
   emit(name: string, event?: unknown): Promise<any>;
   compactEvent(options?: {
     reason?: SessionBeforeCompactEvent["reason"];
@@ -279,6 +280,20 @@ export async function fixture(globalConfig?: Record<string, unknown>): Promise<F
     },
     appendCompaction() {
       branch = [...branch, compactionEntry("c1", branch.at(-1)?.id ?? "e4")];
+    },
+    contextMessages(): unknown[] {
+      return branch.flatMap((entry) => {
+        if (entry.type === "message") return [entry.message];
+        if (entry.type === "compaction") {
+          return [{
+            role: "compactionSummary" as const,
+            summary: entry.summary,
+            tokensBefore: entry.tokensBefore,
+            timestamp: 0,
+          }];
+        }
+        return [];
+      });
     },
     async emit(name, event = { type: name }) {
       if (name === "turn_end") idle = false;

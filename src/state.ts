@@ -13,6 +13,8 @@ export interface PreparedResult {
   summary: string;
   usage: Usage;
   details: FileDetails;
+  /** Context size observed at publish; metadata for the mid-run swap message. */
+  contextTokensBefore?: number;
 }
 
 interface Base {

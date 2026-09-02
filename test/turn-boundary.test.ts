@@ -11,7 +11,7 @@ import {
   compactionEntry,
 } from "./helpers/index-fixture.js";
 
-const READY_MESSAGE = "shadow-compact: summary ready - will swap in when the agent is idle";
+const READY_MESSAGE = "shadow-compact: summary ready - swaps in at the next turn";
 const DEFERRED_MESSAGE =
   "shadow-compact: summary still preparing - swap deferred until the agent is idle";
 
@@ -22,7 +22,7 @@ async function startPreparation(f: ReturnType<typeof fixture> extends Promise<in
 }
 
 describe("idle swap, hard hatch, and terminal empty-snapshot failure", () => {
-  it("waits for agent_settled before committing a ready summary", async () => {
+  it("swaps a ready summary into the next turn without aborting the run", async () => {
     const f = await fixture();
     try {
       // Publish mid-run: gate the summary, then let it finish while the run continues.
@@ -35,16 +35,36 @@ describe("idle swap, hard hatch, and terminal empty-snapshot failure", () => {
 
       await f.emit("turn_end");
       assert.equal(f.compactCalls.length, 0, "an active run must not be aborted");
+
+      // The next request sees the summary plus the kept tail; no compaction ran.
+      const outcome = (await f.emit("context", { messages: f.contextMessages() })) as {
+        messages: Array<Record<string, unknown>>;
+      };
+      assert.equal(outcome?.messages.length, 2);
+      assert.equal(outcome.messages[0]?.role, "compactionSummary");
+      assert.match(outcome.messages[0]?.summary as string, /Prepared continuation checkpoint/);
+      assert.deepEqual(outcome.messages[1], (f.branch[3] as { message?: unknown }).message);
+
+      // The durable compaction lands once the run settles.
       await f.emit("agent_settled");
       assert.match(f.compactCalls[0]?.customInstructions ?? "", NONCE_PATTERN);
       const nonce = f.compactCalls[0]!.customInstructions!;
 
       // The nonce commit is served from cache; onComplete re-arms for later turns.
-      const outcome = await f.emit("session_before_compact", f.compactEvent({ customInstructions: nonce }));
-      assert.ok(outcome?.compaction);
-      f.compactCalls[0]!.onComplete?.(outcome.compaction);
-      await f.emit("agent_settled");
-      assert.equal(f.compactCalls.length, 1);
+      const cached = await f.emit("session_before_compact", f.compactEvent({ customInstructions: nonce }));
+      assert.ok(cached?.compaction);
+      f.compactCalls[0]!.onComplete?.(cached.compaction);
+
+      // Once the entry lands, the swap stands down; Pi rebuilds the same view.
+      await f.emit("session_compact", {
+        type: "session_compact",
+        compactionEntry: compactionEntry("c1", "e4"),
+        fromExtension: true,
+        reason: "manual",
+        willRetry: false,
+      });
+      const after = await f.emit("context", { messages: f.contextMessages() });
+      assert.equal(after, undefined);
     } finally {
       await f.cleanup();
     }
@@ -111,7 +131,7 @@ describe("idle swap, hard hatch, and terminal empty-snapshot failure", () => {
       assert.equal(ready.compactCalls.length, 0);
       await ready.emit("agent_settled");
       assert.match(ready.compactCalls[0]?.customInstructions ?? "", NONCE_PATTERN);
-      assert.equal(ready.compactCalls.length, 1);
+      assert.equal(ready.compactCalls.length, 1, "ready summary wins over the hatch at settle");
     } finally {
       await ready.cleanup();
     }
