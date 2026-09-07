@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
+import { resolveKeepRecentTokens } from "../src/config.js";
 import { fileDetails, prepareSnapshot } from "../src/prepare.js";
 
 let sequence = 0;
@@ -166,4 +167,21 @@ test("returns undefined when there is nothing to summarize", () => {
   const first = userEntry("first");
   const second = userEntry("second");
   assert.equal(prepareSnapshot([first, second], 1_000_000), undefined);
+});
+
+test("a roast-scale branch is empty under Pi's 20k keep but summarizable under a 2% luna tail", () => {
+  sequence = 0;
+  // ~150 user turns at ~100 tokens each: ~15k tokens, the roast trajectory
+  // scale at the first 5% soft trigger on luna's 272k window (~13.6k).
+  const branch = Array.from({ length: 150 }, (_, index) =>
+    userEntry(`turn ${index} detail ${"x".repeat(400)}`),
+  );
+  assert.equal(prepareSnapshot(branch, 20_000), undefined);
+
+  // 2% of 272k: Shadow's own retained-tail budget for the same trigger.
+  const tail = resolveKeepRecentTokens(20_000, 2, 272_000);
+  assert.equal(tail, 5440);
+  const snapshot = prepareSnapshot(branch, tail);
+  assert.ok(snapshot);
+  assert.ok(snapshot.sourceEntries.length > 0, "the first trigger now has evidence to summarize");
 });

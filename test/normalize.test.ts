@@ -201,6 +201,47 @@ test("caps packets by dropping oldest evidence and keeping the newest", () => {
   assert.ok(packet.evidence.length < entries.length + 1);
 });
 
+test("reports zero-eviction telemetry when the packet fits the budget", () => {
+  sequence = 0;
+  const entries = [
+    entry({ type: "message", message: { role: "user", content: "first", timestamp: 1 } }),
+    entry({ type: "message", message: { role: "user", content: "second", timestamp: 2 } }),
+  ];
+
+  const packet = normalizeSnapshot({ cwd, entries });
+  assert.equal(packet.rawEvidenceCount, 2);
+  assert.equal(packet.normalizedEvidenceCount, 2);
+  assert.equal(packet.normalizedEvidenceCount, packet.evidence.length);
+  assert.equal(packet.evictedEvidenceCount, 0);
+  assert.equal(packet.packetTruncated, false);
+  assert.equal(packet.oldestRetainedSourceEntryId, entries[0]?.id);
+  assert.equal(packet.newestRetainedSourceEntryId, entries[1]?.id);
+});
+
+test("reports eviction telemetry when the budget drops oldest evidence", () => {
+  sequence = 0;
+  const entries = Array.from({ length: 8 }, (_, index) =>
+    entry({
+      type: "message",
+      message: { role: "user", content: `message-${index}:${String(index).repeat(39_000)}`, timestamp: index },
+    }),
+  );
+
+  const packet = normalizeSnapshot({ cwd, previousSummary: "Earlier verified checkpoint", entries });
+  assert.equal(packet.rawEvidenceCount, entries.length + 1);
+  assert.equal(packet.normalizedEvidenceCount, packet.evidence.length);
+  assert.equal(packet.rawEvidenceCount - packet.normalizedEvidenceCount, packet.evictedEvidenceCount);
+  assert.ok(packet.evictedEvidenceCount > 0, "oversized packet evicts oldest evidence");
+  assert.equal(packet.packetTruncated, true);
+  // The pinned checkpoint survives while the oldest transcript entries go.
+  assert.equal(packet.evidence[0]?.kind, "previous_checkpoint");
+  assert.notEqual(packet.oldestRetainedSourceEntryId, entries[0]?.id);
+  assert.equal(packet.newestRetainedSourceEntryId, entries.at(-1)?.id);
+  const retained = new Set(packet.evidence.map((item) => item.sourceEntryId));
+  assert.ok(retained.has(packet.oldestRetainedSourceEntryId ?? ""));
+  assert.ok(retained.has(packet.newestRetainedSourceEntryId ?? ""));
+});
+
 test("keeps the previous_checkpoint when trimming evicts transcript evidence", () => {
   sequence = 0;
   const checkpoint = `prior context ${"c".repeat(39_500)}`;

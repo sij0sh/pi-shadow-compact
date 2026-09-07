@@ -10,6 +10,54 @@ import {
 export const DEFAULT_SOFT_COMPACT_THRESHOLD_PERCENT = 60;
 export const DEFAULT_HARD_COMPACT_THRESHOLD_PERCENT = 80;
 
+export const SOFT_THRESHOLD_ENV_VAR = "SHADOW_COMPACT_SOFT_THRESHOLD_PERCENT";
+export const HARD_THRESHOLD_ENV_VAR = "SHADOW_COMPACT_HARD_THRESHOLD_PERCENT";
+export const ROLLING_ENV_VAR = "SHADOW_COMPACT_ROLLING";
+export const TARGET_TAIL_ENV_VAR = "SHADOW_COMPACT_TARGET_TAIL_PERCENT";
+export const MODE_ENV_VAR = "SHADOW_COMPACT_MODE";
+
+/**
+ * Rolling refresh lets an already-published checkpoint be replaced while it
+ * serves. Set to "0"/"false"/"no"/"off" for legacy single-shot behavior (one
+ * useful mid-run summary per session), which is the control condition for
+ * Control-vs-Single-vs-Rolling experiments.
+ */
+export function isRollingEnabled(): boolean {
+  const raw = process.env[ROLLING_ENV_VAR];
+  if (raw === undefined) return true;
+  const value = raw.trim().toLowerCase();
+  if (value === "") return true;
+  return value !== "0" && value !== "false" && value !== "no" && value !== "off";
+}
+
+/**
+ * Observe-only instrumented control: turn_end emits turn_usage telemetry and
+ * everything else (summaries, swaps, compactions, cache reads) stays disabled.
+ * Gives context-AUC a control baseline without perturbing the working set.
+ */
+export function isObserveMode(): boolean {
+  const raw = process.env[MODE_ENV_VAR];
+  if (raw === undefined) return false;
+  return raw.trim().toLowerCase() === "observe";
+}
+
+/**
+ * Derives Shadow's retained-tail budget from the experimental tail knob.
+ *
+ * Keeps approximately targetTailPercent of the session model's context window
+ * as verbatim recent history after the checkpoint boundary. Capped at Pi's
+ * keepRecentTokens so an absent, tiny-window, or oversized target leaves
+ * production behavior unchanged.
+ */
+export function resolveKeepRecentTokens(
+  piKeepRecentTokens: number,
+  targetTailPercent: number | undefined,
+  contextWindow: number | undefined,
+): number {
+  if (targetTailPercent === undefined || contextWindow === undefined) return piKeepRecentTokens;
+  return Math.min(piKeepRecentTokens, Math.floor((contextWindow * targetTailPercent) / 100));
+}
+
 export const THINKING_LEVELS = [
   "off",
   "minimal",
@@ -23,6 +71,8 @@ export const THINKING_LEVELS = [
 export interface ShadowCompactConfig {
   softCompactThresholdPercent: number;
   hardCompactThresholdPercent: number;
+  /** Experimental harness knob (env-only): retained-tail budget as context-window percent. */
+  targetTailPercent?: number;
   summarizerModel: {
     provider: string;
     id: string;
@@ -55,7 +105,46 @@ export async function loadConfig(ctx: ExtensionContext): Promise<ShadowCompactCo
       config = parseConfig(projectSource, projectPath);
     }
   }
-  return config;
+  return applyEnvOverrides(config);
+}
+
+function parseEnvThreshold(name: string): number | undefined {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return undefined;
+  const value = Number(raw.trim());
+  if (!Number.isFinite(value)) {
+    throw new Error(`${name} must be a number between 1 and 99, got ${JSON.stringify(raw)}`);
+  }
+  if (value < 1 || value > 99) {
+    throw new Error(`${name} must be between 1 and 99, got ${JSON.stringify(raw)}`);
+  }
+  return value;
+}
+
+export function applyEnvOverrides(config: ShadowCompactConfig): ShadowCompactConfig {
+  const soft = parseEnvThreshold(SOFT_THRESHOLD_ENV_VAR);
+  const hard = parseEnvThreshold(HARD_THRESHOLD_ENV_VAR);
+  const targetTail = parseEnvThreshold(TARGET_TAIL_ENV_VAR);
+  const merged: ShadowCompactConfig = {
+    ...config,
+    ...(soft !== undefined ? { softCompactThresholdPercent: soft } : {}),
+    ...(hard !== undefined ? { hardCompactThresholdPercent: hard } : {}),
+    ...(targetTail !== undefined ? { targetTailPercent: targetTail } : {}),
+  };
+  // File-only pairs keep their existing validation: an explicit file hard threshold
+  // must exceed soft, while an implicit default hard may equal it. The merged
+  // check below applies only when env moves at least one threshold, so file
+  // behavior stays byte-identical and env misuse still fails fast.
+  if (
+    (soft !== undefined || hard !== undefined) &&
+    merged.hardCompactThresholdPercent <= merged.softCompactThresholdPercent
+  ) {
+    throw new Error(
+      `${HARD_THRESHOLD_ENV_VAR} must be greater than the soft threshold ` +
+        `(${merged.softCompactThresholdPercent}), got ${merged.hardCompactThresholdPercent}`,
+    );
+  }
+  return merged;
 }
 
 async function readOptional(path: string): Promise<string | undefined> {

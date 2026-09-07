@@ -6,6 +6,8 @@ export interface FileDetails {
 }
 
 export interface PreparedResult {
+  /** Stable identity across persist/restore so an idle settle persists once. */
+  checkpointId: string;
   sessionId: string;
   leafId: string;
   latestCompactionId: string | null;
@@ -17,101 +19,239 @@ export interface PreparedResult {
   contextTokensBefore?: number;
 }
 
-interface Base {
-  readonly generation: number;
+export interface PreparingInfo {
+  generation: number;
+  controller: AbortController;
 }
 
-export interface IdleState extends Base {
-  readonly phase: "idle";
-  readonly pendingNativeFallback: boolean;
-}
-
-export interface PreparingState extends Base {
-  readonly phase: "preparing";
-  readonly controller: AbortController;
-}
-
-export interface ReadyState extends Base {
-  readonly phase: "ready";
-  readonly result: PreparedResult;
-}
-
-export interface CommittingState extends Base {
-  readonly phase: "committing";
-  readonly result: PreparedResult;
-  readonly nonce: string;
-}
-
-export type ShadowCompactState = IdleState | PreparingState | ReadyState | CommittingState;
-
-/** Owns generation, cancellation, and one-shot commit state for one extension. */
+/**
+ * Rolling working-set maintenance state.
+ *
+ * The checkpoint currently being served (`published`) is separate from the
+ * checkpoint currently being built (`preparing`): a published summary keeps
+ * swapping into requests while its replacement prepares, then the replacement
+ * takes over. Durability is a persisted CustomEntry projection, not a native
+ * compaction, so there is no commit phase: `published` keeps serving across
+ * idle settles, and `persistedCheckpointId` records which checkpoint already
+ * landed in the session file.
+ *
+ * `refreshArmed` gates new preparations so a refresh cannot spin while the
+ * working set stays above the soft threshold. A trigger disarms it; only an
+ * observed swap followed by below-soft context re-arms it (crossing
+ * hysteresis). A preparation that fails while a checkpoint keeps serving
+ * keeps the gate shut (a failure must not manufacture a threshold crossing);
+ * an empty snapshot suppresses until the working set grows meaningfully;
+ * any other failure with nothing serving falls back to one native compaction
+ * and re-arms.
+ *
+ * `generation` identifies one preparation attempt: it increments on every
+ * `startPreparing()` (as well as on invalidation paths), so the trace joins
+ * prepare/publish/swap/rearm per attempt.
+ */
 export class ShadowCompactStateController {
-  #state: ShadowCompactState = { phase: "idle", generation: 0, pendingNativeFallback: false };
+  #generation = 0;
+  #published: PreparedResult | undefined = undefined;
+  #publishedSwapped = false;
+  #preparing: PreparingInfo | undefined = undefined;
+  #persistedCheckpointId: string | undefined = undefined;
+  #pendingNativeFallback = false;
+  #refreshArmed = true;
+  #emptySuppressedAtTokens: number | undefined = undefined;
 
-  get current(): ShadowCompactState {
-    return this.#state;
+  get generation(): number {
+    return this.#generation;
   }
 
-  startPreparing(): PreparingState | undefined {
-    if (this.#state.phase !== "idle") return undefined;
-    const state: PreparingState = {
-      phase: "preparing",
-      generation: this.#state.generation,
+  get published(): PreparedResult | undefined {
+    return this.#published;
+  }
+
+  /** Whether the serving checkpoint has swapped into at least one request. */
+  get publishedSwapped(): boolean {
+    return this.#publishedSwapped;
+  }
+
+  get preparing(): PreparingInfo | undefined {
+    return this.#preparing;
+  }
+
+  /** The checkpoint already persisted as a CustomEntry, if any. */
+  get persistedCheckpointId(): string | undefined {
+    return this.#persistedCheckpointId;
+  }
+
+  get pendingNativeFallback(): boolean {
+    return this.#pendingNativeFallback;
+  }
+
+  get refreshArmed(): boolean {
+    return this.#refreshArmed;
+  }
+
+  /** Context size when an empty snapshot suppressed preparation, if suppressed. */
+  get emptySuppressedAtTokens(): number | undefined {
+    return this.#emptySuppressedAtTokens;
+  }
+
+  /** Derived phase for logs and tests. Preparing wins, then serving. */
+  get phase(): "idle" | "preparing" | "ready" | "ready-preparing" {
+    if (this.#preparing && this.#published) return "ready-preparing";
+    if (this.#preparing) return "preparing";
+    if (this.#published) return "ready";
+    return "idle";
+  }
+
+  /**
+   * Starts a preparation. Succeeds while a published checkpoint keeps serving;
+   * fails only while another preparation is already in flight.
+   * Disarms the refresh gate: the next trigger needs an observed swap + shrink.
+   * Bumps the generation so every attempt has a unique trace identity (a slow
+   * superseded completion can never alias a newer preparation).
+   */
+  startPreparing(): PreparingInfo | undefined {
+    if (this.#preparing) return undefined;
+    this.#generation += 1;
+    const preparing: PreparingInfo = {
+      generation: this.#generation,
       controller: new AbortController(),
     };
-    this.#state = state;
-    return state;
+    this.#preparing = preparing;
+    this.#refreshArmed = false;
+    this.#emptySuppressedAtTokens = undefined;
+    return preparing;
   }
 
+  /** Publishes a completed preparation, replacing the checkpoint being served. */
   publish(generation: number, result: PreparedResult): boolean {
-    if (this.#state.phase !== "preparing" || this.#state.generation !== generation) return false;
-    if (this.#state.controller.signal.aborted) return false;
-    this.#state = { phase: "ready", generation, result };
+    if (!this.#preparing || this.#preparing.generation !== generation) return false;
+    if (this.#preparing.controller.signal.aborted) return false;
+    this.#preparing = undefined;
+    this.#published = result;
+    this.#publishedSwapped = false;
+    this.#emptySuppressedAtTokens = undefined;
     return true;
   }
 
+  /**
+   * Restores a validated persisted checkpoint into service (session_start).
+   * Behaves like a fresh publish that already landed: the gate stays disarmed
+   * until an observed swap + shrink, and no re-persist is needed.
+   */
+  restorePublished(result: PreparedResult): void {
+    this.#published = result;
+    this.#publishedSwapped = false;
+    this.#refreshArmed = false;
+    this.#emptySuppressedAtTokens = undefined;
+    this.#persistedCheckpointId = result.checkpointId;
+  }
+
+  /** Records that the serving checkpoint landed as a CustomEntry. */
+  markPersisted(checkpointId: string): void {
+    this.#persistedCheckpointId = checkpointId;
+  }
+
   fail(generation: number): boolean {
-    if (this.#state.phase !== "preparing" || this.#state.generation !== generation) return false;
-    this.#state = { phase: "idle", generation, pendingNativeFallback: true };
+    if (!this.#preparing || this.#preparing.generation !== generation) return false;
+    this.#preparing = undefined;
+    if (this.#published) {
+      // Keep the serving checkpoint and keep the refresh gate disarmed: a
+      // failed replacement must not manufacture a threshold crossing (it would
+      // otherwise retry — burning a real summarizer call — on every turn while
+      // context stays above soft). Only an observed swap + shrink re-arms.
+      this.#refreshArmed = false;
+    } else {
+      this.#pendingNativeFallback = true;
+      this.#refreshArmed = true;
+    }
+    return true;
+  }
+
+  /**
+   * Drops a preparation that found nothing disposable to summarize (empty
+   * snapshot at the soft boundary). This is not a summarizer failure, so it
+   * queues no native fallback; it suppresses until the working set grows
+   * meaningfully (see rearmAfterGrowth) or the hard hatch fires.
+   */
+  skipPreparation(generation: number, currentTokens?: number): boolean {
+    if (!this.#preparing || this.#preparing.generation !== generation) return false;
+    this.#preparing = undefined;
+    this.#refreshArmed = false;
+    this.#emptySuppressedAtTokens = currentTokens;
+    return true;
+  }
+
+  /**
+   * Re-arms after an empty-snapshot suppression once the working set grew by
+   * max(1000, tailBudget * 0.25) tokens. Without a recorded suppression size
+   * this never fires, preserving the swap+shrink-only re-arm.
+   */
+  rearmAfterGrowth(currentTokens: number, tailBudgetTokens: number): boolean {
+    if (this.#emptySuppressedAtTokens === undefined) return false;
+    if (this.#refreshArmed) {
+      this.#emptySuppressedAtTokens = undefined;
+      return false;
+    }
+    const threshold =
+      this.#emptySuppressedAtTokens + Math.max(1000, tailBudgetTokens * 0.25);
+    if (currentTokens < threshold) return false;
+    this.#emptySuppressedAtTokens = undefined;
+    this.#refreshArmed = true;
+    return true;
+  }
+
+  /** Records that the serving checkpoint swapped into a request. True on the first swap. */
+  markSwapped(): boolean {
+    if (!this.#published || this.#publishedSwapped) return false;
+    this.#publishedSwapped = true;
+    return true;
+  }
+
+  /** Re-arms the refresh gate after an observed swap + shrink. True when it flips. */
+  rearm(): boolean {
+    if (this.#refreshArmed) return false;
+    this.#refreshArmed = true;
+    this.#emptySuppressedAtTokens = undefined;
     return true;
   }
 
   requestNativeFallback(): boolean {
-    if (this.#state.phase === "idle" && this.#state.pendingNativeFallback) return false;
-    if (this.#state.phase === "preparing") this.#state.controller.abort();
-    this.#state = {
-      phase: "idle",
-      generation: this.#state.generation + 1,
-      pendingNativeFallback: true,
-    };
+    if (this.#pendingNativeFallback) return false;
+    this.#preparing?.controller.abort();
+    this.#preparing = undefined;
+    this.#generation += 1;
+    this.#pendingNativeFallback = true;
     return true;
   }
 
   clearPendingNativeFallback(): boolean {
-    if (this.#state.phase !== "idle" || !this.#state.pendingNativeFallback) return false;
-    this.#state = { phase: "idle", generation: this.#state.generation, pendingNativeFallback: false };
+    if (!this.#pendingNativeFallback || this.#preparing) return false;
+    this.#pendingNativeFallback = false;
     return true;
   }
 
-  beginCommit(nonce: string): CommittingState | undefined {
-    if (this.#state.phase !== "ready") return undefined;
-    const state: CommittingState = {
-      phase: "committing",
-      generation: this.#state.generation,
-      result: this.#state.result,
-      nonce,
-    };
-    this.#state = state;
-    return state;
+  /**
+   * Drops a stale serving checkpoint. Re-arms so the next crossing retries
+   * fresh instead of latching on a checkpoint that can never land.
+   */
+  discardPublished(): boolean {
+    if (!this.#published) return false;
+    this.#published = undefined;
+    this.#publishedSwapped = false;
+    this.#refreshArmed = true;
+    this.#emptySuppressedAtTokens = undefined;
+    return true;
   }
 
-  /** Terminal for commit success, failure, and invalidation alike. */
+  /** Terminal for invalidation paths alike: native compaction, manual reset, reload. */
   reset(): void {
-    if (this.#state.phase === "preparing") this.#state.controller.abort();
-    this.#state = {
-      phase: "idle",
-      generation: this.#state.generation + 1,
-      pendingNativeFallback: false,
-    };
+    this.#preparing?.controller.abort();
+    this.#preparing = undefined;
+    this.#published = undefined;
+    this.#publishedSwapped = false;
+    this.#persistedCheckpointId = undefined;
+    this.#generation += 1;
+    this.#pendingNativeFallback = false;
+    this.#refreshArmed = true;
+    this.#emptySuppressedAtTokens = undefined;
   }
 }

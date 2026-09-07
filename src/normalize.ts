@@ -26,6 +26,22 @@ export interface NormalizedEvidence {
 
 export interface NormalizedPacket {
   evidence: NormalizedEvidence[];
+  /**
+   * Long-session eviction telemetry (fix: instrument the 240k-char budget
+   * instead of changing it). rawEvidenceCount is the evidence-item count
+   * before budget eviction; normalizedEvidenceCount is the retained count
+   * (always evidence.length); evictedEvidenceCount is the difference, and
+   * packetTruncated is whether any oldest-first eviction occurred. The
+   * retained source-entry id range tells whether the summarizer is still
+   * seeing the full raw history (evictedEvidenceCount = 0) or has started
+   * losing the oldest evidence to the budget.
+   */
+  rawEvidenceCount: number;
+  normalizedEvidenceCount: number;
+  evictedEvidenceCount: number;
+  packetTruncated: boolean;
+  oldestRetainedSourceEntryId: string | null;
+  newestRetainedSourceEntryId: string | null;
 }
 
 export interface NormalizeInput {
@@ -52,6 +68,7 @@ export function normalizeSnapshot(input: NormalizeInput, maxChars = NORMALIZED_P
     ? [normalizeDraft("checkpoint", "previous_checkpoint", input.previousSummary, input.cwd, TEXT_LIMIT), ...input.entries.flatMap((entry) => normalizeEntry(entry, input.cwd, calls))]
     : input.entries.flatMap((entry) => normalizeEntry(entry, input.cwd, calls));
   let evidence = numberEvidence(drafts);
+  const rawEvidenceCount = evidence.length;
   // The promoted checkpoint leads the packet, so eviction must skip its slot;
   // it is the sole carrier of pre-compaction context.
   const protectedCount = evidence[0]?.kind === "previous_checkpoint" ? 1 : 0;
@@ -59,7 +76,20 @@ export function normalizeSnapshot(input: NormalizeInput, maxChars = NORMALIZED_P
     evidence.splice(protectedCount, 1);
     evidence = renumber(evidence);
   }
-  return { evidence };
+  const evictedEvidenceCount = rawEvidenceCount - evidence.length;
+  // The retained-id range covers transcript evidence only: the pinned
+  // previous_checkpoint slot carries the pseudo-id "checkpoint", which is
+  // not a raw-history entry and would mask the eviction boundary.
+  const transcript = evidence.filter((item) => item.kind !== "previous_checkpoint");
+  return {
+    evidence,
+    rawEvidenceCount,
+    normalizedEvidenceCount: evidence.length,
+    evictedEvidenceCount,
+    packetTruncated: evictedEvidenceCount > 0,
+    oldestRetainedSourceEntryId: transcript[0]?.sourceEntryId ?? null,
+    newestRetainedSourceEntryId: transcript[transcript.length - 1]?.sourceEntryId ?? null,
+  };
 }
 
 function normalizeEntry(entry: SessionEntry, cwd: string, calls: Map<string, CallInfo>): DraftEvidence[] {

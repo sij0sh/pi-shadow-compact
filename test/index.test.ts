@@ -6,12 +6,12 @@ import {
   fixture,
   waitFor,
   tick,
-  NONCE_PATTERN,
   USAGE,
   userEntry,
   compactionEntry,
   type Fixture,
 } from "./helpers/index-fixture.js";
+import { CHECKPOINT_CUSTOM_TYPE } from "../src/persist.js";
 
 const READY_MESSAGE = "shadow-compact: summary ready - swaps in at the next turn";
 const DEFERRED_MESSAGE =
@@ -72,12 +72,6 @@ async function startPreparation(f: Fixture): Promise<void> {
   await waitFor(() => f.registry.settled >= 1);
 }
 
-function commitNonce(f: Fixture): string {
-  const commit = f.compactCalls.at(-1);
-  assert.match(commit?.customInstructions ?? "", NONCE_PATTERN);
-  return commit!.customInstructions!;
-}
-
 describe("shadowCompact extension orchestration", () => {
   it("does nothing on turn_end below the threshold or without usage data", async () => {
     const f = await fixture();
@@ -106,7 +100,8 @@ describe("shadowCompact extension orchestration", () => {
       f.release();
       await waitFor(() => f.registry.settled === 1);
       await f.emit("agent_settled");
-      assert.match(commitNonce(f), NONCE_PATTERN);
+      assert.equal(f.compactCalls.length, 0);
+      assert.equal(f.appendedEntries.length, 1);
       assert.equal(f.registry.models[0], f.registry.summaryModel);
     } finally {
       await f.cleanup();
@@ -124,26 +119,33 @@ describe("shadowCompact extension orchestration", () => {
       f.release();
       await waitFor(() => f.registry.settled === 1);
       await f.emit("agent_settled");
-      assert.equal(f.compactCalls.length, 1);
+      assert.equal(f.compactCalls.length, 0);
+      assert.equal(f.appendedEntries.length, 1);
     } finally {
       await f.cleanup();
     }
   });
 
-  it("commits a ready result with a nonce, serves the matching before_compact from cache, and resets onComplete", async () => {
+  it("persists a ready result as extension state and serves the matching before_compact from cache", async () => {
     const f = await fixture();
     try {
       await startPreparation(f);
       await f.emit("agent_settled");
-      const commit = f.compactCalls[0];
-      assert.ok(commit);
-      const nonce = commitNonce(f);
-      assert.equal(typeof commit?.onComplete, "function");
-      assert.equal(typeof commit?.onError, "function");
+      assert.equal(f.compactCalls.length, 0, "the soft path never compacts");
+      assert.equal(f.appendedEntries.length, 1);
+      const persisted = f.appendedEntries[0];
+      assert.equal(persisted?.customType, CHECKPOINT_CUSTOM_TYPE);
+
+      // A nonce-style custom instruction is no longer a commit handshake.
+      const nonceOutcome = await f.emit(
+        "session_before_compact",
+        f.compactEvent({ customInstructions: "[shadow-compact:commit:dead]", firstKeptEntryId: "e3" }),
+      );
+      assert.equal(nonceOutcome, undefined);
 
       const outcome = await f.emit(
         "session_before_compact",
-        f.compactEvent({ customInstructions: nonce, firstKeptEntryId: "e3" }),
+        f.compactEvent({ reason: "threshold", firstKeptEntryId: "e4" }),
       );
       assert.equal(f.registry.settled, 1);
       assert.ok(outcome?.compaction);
@@ -156,11 +158,11 @@ describe("shadowCompact extension orchestration", () => {
         modifiedFiles: ["src/edited.ts"],
       });
 
-      commit.onComplete?.(outcome.compaction);
+      // The checkpoint keeps serving after it lands: settle again, persist once.
       await f.emit("agent_settled");
-      assert.equal(f.compactCalls.length, 1);
-      await f.emit("turn_end");
-      await waitFor(() => f.registry.calls === 2);
+      assert.equal(f.compactCalls.length, 0);
+      assert.equal(f.appendedEntries.length, 1);
+      assert.ok(await f.emit("context", { messages: f.contextMessages() }));
     } finally {
       await f.cleanup();
     }
@@ -174,6 +176,7 @@ describe("shadowCompact extension orchestration", () => {
       f.setBranch([e1!, e2!, e3!, userEntry("e5", "e3", `Divergent continuation: ${"more ".repeat(30)}`)]);
       await f.emit("agent_settled");
       assert.equal(f.compactCalls.length, 0);
+      assert.equal(f.appendedEntries.length, 0);
       // The discard itself stays silent; the one toast is the ready announcement.
       assert.deepEqual(f.notifications, [READY_MESSAGE]);
     } finally {
@@ -188,6 +191,7 @@ describe("shadowCompact extension orchestration", () => {
       f.appendCompaction();
       await f.emit("agent_settled");
       assert.equal(f.compactCalls.length, 0);
+      assert.equal(f.appendedEntries.length, 0);
 
       // A stale result never swaps into the request context either.
       const swapped = await f.emit("context", { messages: f.contextMessages() });
@@ -286,7 +290,8 @@ describe("shadowCompact extension orchestration", () => {
       await waitFor(() => f.registry.settled === 2);
       await tick();
       await f.emit("agent_settled");
-      assert.match(commitNonce(f), NONCE_PATTERN);
+      assert.equal(f.compactCalls.length, 0);
+      assert.equal(f.appendedEntries.length, 1);
     } finally {
       await f.cleanup();
     }
@@ -366,25 +371,13 @@ describe("shadowCompact extension orchestration", () => {
       assert.equal(f.registry.calls, 1);
       assert.deepEqual(f.notifications, ["shadow-compact: Summary model stopped with error"]);
       assert.equal(f.compactCalls.length, 0);
+      // A queued fallback owns the next idle point: no new preparation on top of it.
+      await f.emit("turn_end");
+      await tick();
+      assert.equal(f.registry.calls, 1);
       await f.emit("agent_settled");
       assert.equal(f.compactCalls.length, 1);
       assert.deepEqual(f.compactCalls[0], {});
-    } finally {
-      await f.cleanup();
-    }
-  });
-
-  it("falls back to one plain native compaction when the commit fails", async () => {
-    const f = await fixture();
-    try {
-      await startPreparation(f);
-      await f.emit("agent_settled");
-      const commit = f.compactCalls[0];
-      commit?.onError?.(new Error("compaction failed"));
-      assert.equal(f.compactCalls.length, 2);
-      assert.deepEqual(f.compactCalls[1], {});
-      await f.emit("agent_settled");
-      assert.equal(f.compactCalls.length, 2);
     } finally {
       await f.cleanup();
     }
@@ -405,6 +398,7 @@ describe("shadowCompact extension orchestration", () => {
       await reset.emit("session_compact", compactedEvent(true));
       await reset.emit("agent_settled");
       assert.equal(reset.compactCalls.length, 0);
+      assert.equal(reset.appendedEntries.length, 0);
     } finally {
       await reset.cleanup();
     }
@@ -414,7 +408,10 @@ describe("shadowCompact extension orchestration", () => {
       await startPreparation(kept);
       await kept.emit("session_compact", compactedEvent(false));
       await kept.emit("agent_settled");
-      assert.match(kept.compactCalls[0]?.customInstructions ?? "", NONCE_PATTERN);
+      // A foreign compaction the branch never shows leaves the checkpoint
+      // current, so the idle settle persists it without compacting.
+      assert.equal(kept.compactCalls.length, 0);
+      assert.equal(kept.appendedEntries.length, 1);
     } finally {
       await kept.cleanup();
     }

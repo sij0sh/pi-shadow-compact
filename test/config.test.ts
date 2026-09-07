@@ -7,13 +7,23 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   DEFAULT_HARD_COMPACT_THRESHOLD_PERCENT,
   DEFAULT_SOFT_COMPACT_THRESHOLD_PERCENT,
+  HARD_THRESHOLD_ENV_VAR,
+  MODE_ENV_VAR,
+  SOFT_THRESHOLD_ENV_VAR,
+  TARGET_TAIL_ENV_VAR,
   defaultConfig,
+  isObserveMode,
   loadConfig,
+  resolveKeepRecentTokens,
 } from "../src/config.js";
 
 const CONFIG_FILE = "shadow-compact.json";
 
 let savedAgentDirEnv: string | undefined;
+let savedSoftEnv: string | undefined;
+let savedHardEnv: string | undefined;
+let savedTailEnv: string | undefined;
+let savedModeEnv: string | undefined;
 let agentDir = "";
 
 function context(cwd: string, trusted = true): ExtensionContext {
@@ -76,6 +86,14 @@ async function assertLoadError(
 
 beforeEach(async () => {
   savedAgentDirEnv = process.env.PI_CODING_AGENT_DIR;
+  savedSoftEnv = process.env[SOFT_THRESHOLD_ENV_VAR];
+  savedHardEnv = process.env[HARD_THRESHOLD_ENV_VAR];
+  savedTailEnv = process.env[TARGET_TAIL_ENV_VAR];
+  savedModeEnv = process.env[MODE_ENV_VAR];
+  delete process.env[SOFT_THRESHOLD_ENV_VAR];
+  delete process.env[HARD_THRESHOLD_ENV_VAR];
+  delete process.env[TARGET_TAIL_ENV_VAR];
+  delete process.env[MODE_ENV_VAR];
   agentDir = await mkdtemp(join(tmpdir(), "pi-shadow-compact-agent-"));
   process.env.PI_CODING_AGENT_DIR = agentDir;
 });
@@ -85,6 +103,26 @@ afterEach(async () => {
     delete process.env.PI_CODING_AGENT_DIR;
   } else {
     process.env.PI_CODING_AGENT_DIR = savedAgentDirEnv;
+  }
+  if (savedSoftEnv === undefined) {
+    delete process.env[SOFT_THRESHOLD_ENV_VAR];
+  } else {
+    process.env[SOFT_THRESHOLD_ENV_VAR] = savedSoftEnv;
+  }
+  if (savedHardEnv === undefined) {
+    delete process.env[HARD_THRESHOLD_ENV_VAR];
+  } else {
+    process.env[HARD_THRESHOLD_ENV_VAR] = savedHardEnv;
+  }
+  if (savedTailEnv === undefined) {
+    delete process.env[TARGET_TAIL_ENV_VAR];
+  } else {
+    process.env[TARGET_TAIL_ENV_VAR] = savedTailEnv;
+  }
+  if (savedModeEnv === undefined) {
+    delete process.env[MODE_ENV_VAR];
+  } else {
+    process.env[MODE_ENV_VAR] = savedModeEnv;
   }
   await rm(agentDir, { recursive: true, force: true });
 });
@@ -348,4 +386,162 @@ describe("shadow compact config loading", () => {
 
     });
   }
+
+  describe("threshold environment overrides", () => {
+    it("env thresholds override file config", async (t) => {
+      const cwd = await temporaryCwd(t);
+      await writeJson(projectConfigPath(cwd), {
+        ...configBody(60),
+        hardCompactThresholdPercent: 80,
+      });
+      process.env[SOFT_THRESHOLD_ENV_VAR] = "5";
+      process.env[HARD_THRESHOLD_ENV_VAR] = "15";
+
+      assert.deepEqual(await loadConfig(context(cwd)), {
+        softCompactThresholdPercent: 5,
+        hardCompactThresholdPercent: 15,
+        summarizerModel: { provider: "", id: "" },
+      });
+    });
+
+    it("a single env threshold merges with file config", async (t) => {
+      const cwd = await temporaryCwd(t);
+      await writeJson(projectConfigPath(cwd), {
+        ...configBody(60),
+        hardCompactThresholdPercent: 80,
+      });
+      process.env[SOFT_THRESHOLD_ENV_VAR] = "10";
+
+      const config = await loadConfig(context(cwd));
+      assert.equal(config.softCompactThresholdPercent, 10);
+      assert.equal(config.hardCompactThresholdPercent, 80);
+    });
+
+    it("empty env values are ignored", async (t) => {
+      const cwd = await temporaryCwd(t);
+      process.env[SOFT_THRESHOLD_ENV_VAR] = "  ";
+      process.env[HARD_THRESHOLD_ENV_VAR] = "";
+
+      const config = await loadConfig(context(cwd));
+      assert.equal(config.softCompactThresholdPercent, DEFAULT_SOFT_COMPACT_THRESHOLD_PERCENT);
+      assert.equal(config.hardCompactThresholdPercent, DEFAULT_HARD_COMPACT_THRESHOLD_PERCENT);
+    });
+
+    for (const value of ["lots", "NaN", "0", "100", "-3"]) {
+      it(`invalid soft env ${JSON.stringify(value)} throws naming the variable`, async (t) => {
+        const cwd = await temporaryCwd(t);
+        process.env[SOFT_THRESHOLD_ENV_VAR] = value;
+
+        await assert.rejects(
+          loadConfig(context(cwd)),
+          (error: unknown) => {
+            assert.ok(error instanceof Error);
+            assert.match(error.message, new RegExp(SOFT_THRESHOLD_ENV_VAR));
+            return true;
+          },
+        );
+      });
+    }
+
+    it("env hard at or below the soft threshold throws", async (t) => {
+      const cwd = await temporaryCwd(t);
+      process.env[SOFT_THRESHOLD_ENV_VAR] = "15";
+      process.env[HARD_THRESHOLD_ENV_VAR] = "15";
+
+      await assert.rejects(
+        loadConfig(context(cwd)),
+        (error: unknown) => {
+          assert.ok(error instanceof Error);
+          assert.match(error.message, new RegExp(HARD_THRESHOLD_ENV_VAR));
+          return true;
+        },
+      );
+    });
+
+    it("env soft above the file hard threshold throws", async (t) => {
+      const cwd = await temporaryCwd(t);
+      await writeJson(projectConfigPath(cwd), {
+        ...configBody(60),
+        hardCompactThresholdPercent: 80,
+      });
+      process.env[SOFT_THRESHOLD_ENV_VAR] = "85";
+
+      await assert.rejects(loadConfig(context(cwd)), /must be greater than the soft threshold/);
+    });
+  });
+
+  describe("target tail environment override", () => {
+    it("is absent by default, leaving Pi behavior unchanged", async (t) => {
+      const cwd = await temporaryCwd(t);
+
+      assert.equal((await loadConfig(context(cwd))).targetTailPercent, undefined);
+    });
+
+    it("sets the experimental tail knob without touching thresholds", async (t) => {
+      const cwd = await temporaryCwd(t);
+      process.env[TARGET_TAIL_ENV_VAR] = "2";
+
+      const config = await loadConfig(context(cwd));
+      assert.equal(config.targetTailPercent, 2);
+      assert.equal(config.softCompactThresholdPercent, DEFAULT_SOFT_COMPACT_THRESHOLD_PERCENT);
+      assert.equal(config.hardCompactThresholdPercent, DEFAULT_HARD_COMPACT_THRESHOLD_PERCENT);
+    });
+
+    it("empty values are ignored", async (t) => {
+      const cwd = await temporaryCwd(t);
+      process.env[TARGET_TAIL_ENV_VAR] = "  ";
+
+      assert.equal((await loadConfig(context(cwd))).targetTailPercent, undefined);
+    });
+
+    for (const value of ["lots", "NaN", "0", "100", "-3"]) {
+      it(`invalid target tail ${JSON.stringify(value)} throws naming the variable`, async (t) => {
+        const cwd = await temporaryCwd(t);
+        process.env[TARGET_TAIL_ENV_VAR] = value;
+
+        await assert.rejects(
+          loadConfig(context(cwd)),
+          (error: unknown) => {
+            assert.ok(error instanceof Error);
+            assert.match(error.message, new RegExp(TARGET_TAIL_ENV_VAR));
+            return true;
+          },
+        );
+      });
+    }
+  });
+});
+
+describe("resolveKeepRecentTokens", () => {
+  it("returns Pi's budget when the knob is unset or the window is unknown", () => {
+    assert.equal(resolveKeepRecentTokens(20_000, undefined, 272_000), 20_000);
+    assert.equal(resolveKeepRecentTokens(20_000, 2, undefined), 20_000);
+  });
+
+  it("derives the tail from the context window on luna (272k x 2% = 5440)", () => {
+    assert.equal(resolveKeepRecentTokens(20_000, 2, 272_000), 5440);
+  });
+
+  it("caps an oversized target at Pi's budget so production behavior is unchanged", () => {
+    assert.equal(resolveKeepRecentTokens(20_000, 99, 272_000), 20_000);
+    assert.equal(resolveKeepRecentTokens(30, 90, 1000), 30);
+  });
+
+  it("uses the smaller tail on small windows", () => {
+    assert.equal(resolveKeepRecentTokens(30, 2, 1000), 20);
+  });
+});
+
+describe("isObserveMode", () => {
+  it("is off by default and on only for observe", () => {
+    assert.equal(isObserveMode(), false);
+    process.env[MODE_ENV_VAR] = "observe";
+    assert.equal(isObserveMode(), true);
+    process.env[MODE_ENV_VAR] = "OBSERVE";
+    assert.equal(isObserveMode(), true);
+    process.env[MODE_ENV_VAR] = "active";
+    assert.equal(isObserveMode(), false);
+    process.env[MODE_ENV_VAR] = "";
+    assert.equal(isObserveMode(), false);
+  });
 });

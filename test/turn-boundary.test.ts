@@ -6,7 +6,6 @@ import {
   fixture,
   waitFor,
   tick,
-  NONCE_PATTERN,
   userEntry,
   compactionEntry,
 } from "./helpers/index-fixture.js";
@@ -45,32 +44,38 @@ describe("idle swap, hard hatch, and terminal empty-snapshot failure", () => {
       assert.match(outcome.messages[0]?.summary as string, /Prepared continuation checkpoint/);
       assert.deepEqual(outcome.messages[1], (f.branch[3] as { message?: unknown }).message);
 
-      // The durable compaction lands once the run settles.
+      // The durable checkpoint lands once the run settles — no compaction.
       await f.emit("agent_settled");
-      assert.match(f.compactCalls[0]?.customInstructions ?? "", NONCE_PATTERN);
-      const nonce = f.compactCalls[0]!.customInstructions!;
+      assert.equal(f.compactCalls.length, 0);
+      assert.equal(f.appendedEntries.length, 1);
 
-      // The nonce commit is served from cache; onComplete re-arms for later turns.
-      const cached = await f.emit("session_before_compact", f.compactEvent({ customInstructions: nonce }));
-      assert.ok(cached?.compaction);
-      f.compactCalls[0]!.onComplete?.(cached.compaction);
+      // The checkpoint keeps serving after it lands (no stand-down state).
+      const stillServing = (await f.emit("context", { messages: f.contextMessages() })) as {
+        messages: Array<Record<string, unknown>>;
+      };
+      assert.equal(stillServing?.messages[0]?.role, "compactionSummary");
 
-      // Once the entry lands, the swap stands down; Pi rebuilds the same view.
+      // Once a native compaction really lands, the projection is invalid: the
+      // swap stands down and nothing new is persisted.
+      f.appendCompaction();
       await f.emit("session_compact", {
         type: "session_compact",
         compactionEntry: compactionEntry("c1", "e4"),
-        fromExtension: true,
-        reason: "manual",
+        fromExtension: false,
+        reason: "threshold",
         willRetry: false,
       });
       const after = await f.emit("context", { messages: f.contextMessages() });
       assert.equal(after, undefined);
+      await f.emit("agent_settled");
+      assert.equal(f.compactCalls.length, 0);
+      assert.equal(f.appendedEntries.length, 1);
     } finally {
       await f.cleanup();
     }
   });
 
-  it("announces the deferral when the summary misses the settle, then commits once ready and idle", async () => {
+  it("announces the deferral when the summary misses the settle, then persists once ready and idle", async () => {
     const f = await fixture();
     try {
       f.gate();
@@ -87,7 +92,8 @@ describe("idle swap, hard hatch, and terminal empty-snapshot failure", () => {
       f.release();
       await waitFor(() => f.registry.settled === 1);
       await tick();
-      assert.match(f.compactCalls[0]?.customInstructions ?? "", NONCE_PATTERN);
+      assert.equal(f.compactCalls.length, 0);
+      assert.equal(f.appendedEntries.length, 1);
     } finally {
       await f.cleanup();
     }
@@ -122,16 +128,22 @@ describe("idle swap, hard hatch, and terminal empty-snapshot failure", () => {
     }
   });
 
-  it("prefers a ready summary over the hard-threshold hatch and stays below it at 79%", async () => {
+  it("fires the hard hatch even while a published checkpoint keeps serving, and stays below it at 79%", async () => {
     const ready = await fixture();
     try {
       await startPreparation(ready);
       ready.setPercent(85);
       await ready.emit("turn_end");
       assert.equal(ready.compactCalls.length, 0);
+      // The stale-but-valid checkpoint keeps serving meanwhile.
+      assert.ok(await ready.emit("context", { messages: ready.contextMessages() }));
       await ready.emit("agent_settled");
-      assert.match(ready.compactCalls[0]?.customInstructions ?? "", NONCE_PATTERN);
-      assert.equal(ready.compactCalls.length, 1, "ready summary wins over the hatch at settle");
+      assert.equal(ready.compactCalls.length, 1);
+      assert.deepEqual(
+        ready.compactCalls[0],
+        {},
+        "hard means the served working set is already too large despite the checkpoint",
+      );
     } finally {
       await ready.cleanup();
     }
@@ -189,7 +201,7 @@ describe("idle swap, hard hatch, and terminal empty-snapshot failure", () => {
     }
   });
 
-  it("fails terminally when there is nothing to summarize and re-arms on later turns", async () => {
+  it("suppresses empty-snapshot preparations without native fallback while the hard hatch stays live", async () => {
     const f = await fixture();
     try {
       // Branch below keepRecentTokens (30): the summarizable range is empty.
@@ -200,19 +212,22 @@ describe("idle swap, hard hatch, and terminal empty-snapshot failure", () => {
       assert.equal(f.registry.calls, 0);
       assert.deepEqual(f.notifications, []);
 
-      // Terminal, not latched: the documented one-shot native fallback fires.
+      // Suppressed, not terminal: no native fallback at settle.
+      await f.emit("agent_settled");
+      assert.equal(f.compactCalls.length, 0);
+
+      // Growth alone does not re-arm: only an observed swap + shrink does.
+      f.setBranch([userEntry("e1", null, "hi"), userEntry("e2", "e1", "x".repeat(4000))]);
+      await f.emit("turn_end");
+      await tick();
+      assert.equal(f.registry.calls, 0, "empty-snapshot suppression holds without a re-arm");
+
+      // The hard threshold remains the emergency path.
+      f.setPercent(80);
+      await f.emit("turn_end");
       await f.emit("agent_settled");
       assert.equal(f.compactCalls.length, 1);
       assert.deepEqual(f.compactCalls[0], {});
-
-      // Once the branch grows past the keep boundary, a fresh prepare succeeds.
-      f.setBranch([userEntry("e1", null, "hi"), userEntry("e2", "e1", "x".repeat(4000))]);
-      await f.emit("turn_end");
-      await waitFor(() => f.registry.calls === 1);
-      await f.emit("agent_settled");
-      const nonce = f.compactCalls[1]?.customInstructions ?? "";
-      assert.match(nonce, NONCE_PATTERN);
-      assert.equal(f.compactCalls.length, 2);
     } finally {
       await f.cleanup();
     }

@@ -17,6 +17,7 @@ import type {
   SessionBeforeCompactEvent,
   SessionEntry,
 } from "@earendil-works/pi-coding-agent";
+import { CHECKPOINT_CUSTOM_TYPE } from "../../src/persist.js";
 import shadowCompact from "../../src/index.js";
 
 
@@ -33,7 +34,6 @@ export const USAGE: Usage = {
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
 const TIMESTAMP = "2026-01-01T00:00:00.000Z";
-export const NONCE_PATTERN = /^\[shadow-compact:commit:[0-9a-f-]{36}\]$/;
 
 function checkpointJson(evidenceId: string): string {
   return JSON.stringify({
@@ -182,17 +182,47 @@ function makeBranch(): SessionEntry[] {
   return [e1, e2, e3, e4];
 }
 
+export interface AppendedEntry {
+  customType: string;
+  data: unknown;
+}
+
+/** Session state shared across extension restarts: the branch is the session file. */
+interface SharedSession {
+  branch: SessionEntry[];
+  appended: AppendedEntry[];
+  customSeq: number;
+  agentDir: string;
+  cwd: string;
+  previousAgentDir: string | undefined;
+  cleaned: boolean;
+  failNextAppend: boolean;
+}
+
 export interface Fixture {
   readonly registry: FakeRegistry;
   readonly compactCalls: CompactCall[];
   readonly notifications: string[];
+  readonly appendedEntries: AppendedEntry[];
   readonly branch: SessionEntry[];
   readonly agentDir: string;
   setBranch(entries: SessionEntry[]): void;
   setPercent(percent: number | undefined): void;
+  /** Invalidates the captured ctx the way Pi does after session replacement. */
+  setStale(): void;
   gate(): void;
   release(): void;
   appendCompaction(): void;
+  /** Appends a raw custom entry to the shared branch (bypasses pi.appendEntry). */
+  appendCustom(data: unknown, customType?: string): void;
+  /** Makes the next pi.appendEntry throw (teardown-race simulation). */
+  failNextAppend(): void;
+  /**
+   * Simulates a process/extension restart: the old ctx goes stale and a fresh
+   * extension instance is installed on the same shared session. Emit
+   * session_start on the result to replay a reload.
+   */
+  restart(): Fixture;
   contextMessages(): unknown[];
   emit(name: string, event?: unknown): Promise<any>;
   compactEvent(options?: {
@@ -216,57 +246,126 @@ export async function fixture(globalConfig?: Record<string, unknown>): Promise<F
   process.env.PI_CODING_AGENT_DIR = agentDir;
   const cwd = await mkdtemp(join(tmpdir(), "shadow-cwd-"));
 
+  const shared: SharedSession = {
+    branch: makeBranch(),
+    appended: [],
+    customSeq: 0,
+    agentDir,
+    cwd,
+    previousAgentDir,
+    cleaned: false,
+    failNextAppend: false,
+  };
+  return installInstance(shared);
+}
+
+function installInstance(shared: SharedSession): Fixture {
   const handlers = new Map<string, Handler[]>();
+  const appendCustomEntry = (customType: string, data?: unknown): void => {
+    if (shared.failNextAppend) {
+      shared.failNextAppend = false;
+      throw new Error("synthetic append failure");
+    }
+    shared.customSeq += 1;
+    const entry = {
+      type: "custom",
+      id: `custom-${shared.customSeq}`,
+      parentId: shared.branch.at(-1)?.id ?? null,
+      timestamp: TIMESTAMP,
+      customType,
+      data,
+    } as unknown as SessionEntry;
+    shared.branch = [...shared.branch, entry];
+    shared.appended.push({ customType, data });
+  };
   const pi = {
     on(name: string, handler: Handler) {
       const list = handlers.get(name) ?? [];
       list.push(handler);
       handlers.set(name, list);
     },
+    appendEntry: appendCustomEntry,
   } as unknown as ExtensionAPI;
   shadowCompact(pi);
 
-  let branch = makeBranch();
   let percent: number | undefined = 60;
   let idle = false;
+  let stale = false;
   const releases: Array<() => void> = [];
   const registry = new FakeRegistry();
   const compactCalls: CompactCall[] = [];
   const notifications: string[] = [];
 
+  const throwIfStale = (): void => {
+    if (stale) {
+      throw new Error(
+        "This extension ctx is stale after session replacement or reload. " +
+          "Do not use a captured ctx after the session was replaced.",
+      );
+    }
+  };
+
   const ctx = {
-    cwd,
+    cwd: shared.cwd,
     model: registry.summaryModel,
     modelRegistry: registry,
     isProjectTrusted: () => true,
-    isIdle: () => idle,
-    getContextUsage: () =>
-      percent === undefined ? undefined : { tokens: percent * 10, contextWindow: 1000, percent },
+    isIdle: () => {
+      throwIfStale();
+      return idle;
+    },
+    getContextUsage: () => {
+      throwIfStale();
+      return percent === undefined
+        ? undefined
+        : { tokens: percent * 10, contextWindow: 1000, percent };
+    },
     compact: (options?: CompactCall) => {
+      throwIfStale();
       assert.equal(idle, true, "ctx.compact must only run while the agent is idle");
       compactCalls.push(options);
     },
     sessionManager: {
-      getSessionId: () => "session-1",
-      getLeafId: () => branch.at(-1)?.id,
-      getBranch: () => branch,
+      getSessionId: () => {
+        throwIfStale();
+        return "session-1";
+      },
+      getLeafId: () => {
+        throwIfStale();
+        return shared.branch.at(-1)?.id;
+      },
+      getBranch: () => {
+        throwIfStale();
+        return shared.branch;
+      },
     },
-    ui: { notify: (message: string) => notifications.push(message) },
+    ui: {
+      notify: (message: string) => {
+        throwIfStale();
+        notifications.push(message);
+      },
+    },
   } as unknown as ExtensionContext;
 
   return {
     registry,
     compactCalls,
     notifications,
-    agentDir,
+    agentDir: shared.agentDir,
+    get appendedEntries() {
+      return shared.appended;
+    },
     get branch() {
-      return branch;
+      return shared.branch;
     },
     setBranch(entries) {
-      branch = entries;
+      shared.branch = entries;
     },
     setPercent(next) {
       percent = next;
+    },
+    setStale() {
+      stale = true;
     },
     gate() {
       let releaseGate!: () => void;
@@ -279,10 +378,20 @@ export async function fixture(globalConfig?: Record<string, unknown>): Promise<F
       releases.shift()?.();
     },
     appendCompaction() {
-      branch = [...branch, compactionEntry("c1", branch.at(-1)?.id ?? "e4")];
+      shared.branch = [...shared.branch, compactionEntry("c1", shared.branch.at(-1)?.id ?? "e4")];
+    },
+    appendCustom(data, customType = CHECKPOINT_CUSTOM_TYPE) {
+      appendCustomEntry(customType, data);
+    },
+    failNextAppend() {
+      shared.failNextAppend = true;
+    },
+    restart() {
+      stale = true;
+      return installInstance(shared);
     },
     contextMessages(): unknown[] {
-      return branch.flatMap((entry) => {
+      return shared.branch.flatMap((entry) => {
         if (entry.type === "message") return [entry.message];
         if (entry.type === "compaction") {
           return [{
@@ -305,7 +414,7 @@ export async function fixture(globalConfig?: Record<string, unknown>): Promise<F
     compactEvent(options = {}) {
       return {
         type: "session_before_compact",
-        branchEntries: branch,
+        branchEntries: shared.branch,
         preparation: {
           firstKeptEntryId: options.firstKeptEntryId ?? "e4",
           messagesToSummarize: [],
@@ -322,10 +431,12 @@ export async function fixture(globalConfig?: Record<string, unknown>): Promise<F
       };
     },
     async cleanup() {
-      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-      await rm(agentDir, { recursive: true, force: true });
-      await rm(cwd, { recursive: true, force: true });
+      if (shared.cleaned) return;
+      shared.cleaned = true;
+      if (shared.previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = shared.previousAgentDir;
+      await rm(shared.agentDir, { recursive: true, force: true });
+      await rm(shared.cwd, { recursive: true, force: true });
     },
   };
 }

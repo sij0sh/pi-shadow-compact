@@ -91,10 +91,13 @@ everything that came before it.
 1. Pi works normally.
 2. Crossing the soft threshold starts one background summary. The run never stops or waits for it.
 3. When the summary is ready, the next request silently uses it: summary first, then Pi's retained recent tail. No compact runs yet.
-4. When the agent next goes idle, one nonce-tagged `ctx.compact()` persists the summary as the durable checkpoint. No summary model call runs on that path.
+4. When the agent next goes idle, the checkpoint is appended to the session as extension state (a `CustomEntry`, invisible to the model). Raw history stays untouched; the serving checkpoint keeps swapping. No summary model call runs on that path.
 5. The session continues on the small context.
+6. Rolling refresh: the published checkpoint keeps serving while its replacement prepares. Once the swapped working set grows back across the soft threshold, a new preparation starts and its result replaces the old checkpoint. Each idle settle persists whichever checkpoint is latest.
 
-The mid-run request swap touches only the message list Pi sends to the model, so an active agent run is never aborted. The durable write waits for idle because Pi's compaction API ends any active run.
+The refresh gate has hysteresis: a trigger disarms it, and only an observed swap followed by below-soft context re-arms it. If a refresh cycle leaves context above soft, the next crossing is logged and suppressed instead of spinning. An empty snapshot suppresses until the working set grows meaningfully. A failed replacement keeps the serving checkpoint; a failure with nothing serving schedules one native compaction.
+
+The mid-run request swap touches only the message list Pi sends to the model, so an active agent run is never aborted. The durable write waits for idle so it never races the run, and it never calls `ctx.compact()`: native compaction is the emergency path only (hard threshold or unsafe summarization). On `session_start` the extension restores the latest still-valid persisted checkpoint, so the first request after a reload already gets the summary plus the recent tail.
 
 Status toasts announce each step: summary ready, a summary that misses a settle point, and hard-threshold native compaction.
 
@@ -130,7 +133,37 @@ Background summarization starts at this level. The actual compact lands slightly
 
 `hardCompactThresholdPercent` accepts `1` through `99`, must be greater than the soft threshold, and defaults to `80`.
 
-At this level the extension stops waiting for the detached summary: it aborts any summary still in flight and queues one ordinary native compaction. The queue runs once the agent is idle, so the active run is never interrupted. Use it as a deadline when sessions grow fast or the summarizer model is slow.
+At this level the extension stops waiting for the detached summary: it aborts any summary still in flight and queues one ordinary native compaction. The queue runs once the agent is idle, so the active run is never interrupted. A published checkpoint keeps serving meanwhile, but it does not disable the hatch: reaching hard means the served working set is already too large despite it. Use it as a deadline when sessions grow fast or the summarizer model is slow.
+
+### Environment overrides
+
+`SHADOW_COMPACT_SOFT_THRESHOLD_PERCENT` and
+`SHADOW_COMPACT_HARD_THRESHOLD_PERCENT` override the file thresholds when set
+to a number from `1` to `99`. Empty or unset values are ignored. The merged
+pair must still satisfy hard greater than soft; a violation reports an error
+instead of compacting. Overrides are intended for ephemeral use such as
+benchmark harnesses, where per-run configuration cannot be written to the
+project or global config files.
+
+`SHADOW_COMPACT_ROLLING` disables rolling refresh when set to `0`, `false`,
+`no`, or `off` (default is rolling on): an already-published checkpoint is
+never refreshed within the run — exactly one checkpoint per session. This is
+the single-shot control condition for Control-vs-Single-vs-Rolling
+experiments.
+
+`SHADOW_COMPACT_TARGET_TAIL_PERCENT` is an experimental harness knob (not a
+file setting): when set to a number from `1` to `99`, Shadow keeps roughly
+that share of the session model's context window as verbatim recent history
+after the checkpoint boundary, capped at Pi's `keepRecentTokens` so an
+absent or oversized target leaves behavior unchanged. Without it the soft
+trigger and the cut boundary are incoherent on small trajectories: the
+trigger can fire while the whole branch still fits inside Pi's keep window,
+leaving nothing to summarize. Empty or unset values are ignored.
+
+`SHADOW_COMPACT_MODE=observe` is an observe-only instrumented control:
+`turn_end` still emits the `turn_usage` telemetry series, and everything
+else (summaries, swaps, compactions, cache reads) stays disabled. It gives
+context-AUC a control baseline without perturbing the working set.
 
 ### Summarizer model
 
@@ -179,7 +212,7 @@ Pi's built-in compaction takes over whenever the custom path is not safe:
 - The model errors, aborts, hits its output limit, or returns invalid JSON twice.
 - The session branches or compacts while the summary runs.
 - A prepared boundary no longer matches Pi's native boundary.
-- There is nothing to summarize yet, so the trigger re-arms instead of latching.
+- There is nothing to summarize yet, so preparation suppresses until the working set grows instead of latching.
 
 A failed background summary schedules one ordinary native compaction at the next settle point. It never retries in a loop and never cancels Pi's overflow recovery.
 
@@ -215,11 +248,32 @@ pi remove git:github.com/sij0sh/pi-shadow-compact
 
 ## Limitations
 
-Pi exposes no public API that silently rewrites live session history. The background summary is invisible, but the final durable swap uses Pi's public compaction API, so Pi may briefly show compaction status. The cached summary keeps that operation instant; it performs no model call.
+Pi exposes no public API that silently rewrites live session history. The background summary is invisible, and the durable checkpoint is a plain session append (`pi.appendEntry`), so the soft path never shows compaction status and never disturbs the extension runtime. Only the hard-hatch native fallback uses Pi's compaction API.
 
 The soft threshold is detected at `turn_end`, the first event where final token usage exists. Usage inside a streaming response is not yet final.
 
 Secret redaction is heuristic. Keep secrets out of conversation history.
+
+## Observability
+
+The extension keeps an extension-local lifecycle trace that never enters
+session history, so measuring never perturbs the working set:
+
+- `SHADOW_COMPACT_TRACE`: appends JSON lines to a file (local runs).
+- `SHADOW_COMPACT_TRACE_STDERR`: when set to anything but `""`, `"0"`, or
+  `"false"`, the same lines go to stderr prefixed with
+  `shadow-compact-trace `. The roast harness captures agent stderr per trial,
+  which makes the mid-run swap observable in benchmark artifacts.
+
+Events: `turn_usage`, `threshold_crossed`, `prepare_started`,
+`prepare_completed` (with summarizer input/output/cache usage, model, wall
+time, and packet size), `prepare_failed`, `checkpoint_published`,
+`swap_applied` (first-swap flag, messages before/after/dropped, pre-swap
+context), `checkpoint_rearmed`, `checkpoint_persisted`, `checkpoint_restored`,
+`checkpoint_restore_rejected` (with the staleness reason), and
+`native_fallback`. Joining `swap_applied` with the next `turn_usage` gives
+per-checkpoint swap reduction (`1 - postSwap / preSwap`); summing
+`turn_usage` context tokens gives area under the trajectory.
 
 ## Development
 

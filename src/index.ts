@@ -9,10 +9,20 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import {
   DEFAULT_HARD_COMPACT_THRESHOLD_PERCENT,
+  isObserveMode,
+  isRollingEnabled,
   loadConfig,
+  resolveKeepRecentTokens,
   type ShadowCompactConfig,
 } from "./config.js";
 import { normalizeSnapshot } from "./normalize.js";
+import {
+  CHECKPOINT_CUSTOM_TYPE,
+  findLatestRestorableCheckpoint,
+  latestCompactionId,
+  toPreparedResult,
+  type PersistedShadowCheckpoint,
+} from "./persist.js";
 import { prepareSnapshot } from "./prepare.js";
 import { contextSwapDropCount } from "./swap.js";
 import { ShadowCompactStateController, type PreparedResult } from "./state.js";
@@ -21,16 +31,12 @@ import {
   resolveSummarizerModel,
   runSummaryAgent,
 } from "./summary.js";
+import { traceEvent } from "./trace.js";
 import { randomUUID } from "node:crypto";
 
-const COMMIT_NONCE_PREFIX = "[shadow-compact:commit:";
 const READY_MESSAGE = "shadow-compact: summary ready - swaps in at the next turn";
 const DEFERRED_MESSAGE =
   "shadow-compact: summary still preparing - swap deferred until the agent is idle";
-
-function isCommitNonce(value: unknown): value is string {
-  return typeof value === "string" && value.startsWith(COMMIT_NONCE_PREFIX) && value.endsWith("]");
-}
 
 function isValidBranchAncestry(branch: SessionEntry[], result: PreparedResult): boolean {
   return (
@@ -39,12 +45,32 @@ function isValidBranchAncestry(branch: SessionEntry[], result: PreparedResult): 
   );
 }
 
+/**
+ * Pi invalidates a captured ctx after session replacement or reload, and every
+ * use of it then throws. Background completions (a summary finishing, a
+ * commit settling) routinely outlive their session, so they must probe before
+ * touching ctx — an escaped throw here is an unhandled rejection that takes
+ * down the whole agent process.
+ */
+function isContextStale(ctx: ExtensionContext): boolean {
+  try {
+    ctx.isIdle();
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("is stale after session replacement")) {
+      return true;
+    }
+    throw error;
+  }
+  return false;
+}
+
 export default function shadowCompact(pi: ExtensionAPI): void {
   const state = new ShadowCompactStateController();
   let configPromise: Promise<ShadowCompactConfig> | undefined;
   let reportedError: string | undefined;
   let configErrorReported = false;
   let nativeFallbackInFlight = false;
+  let turnCount = 0;
 
   const runNativeFallback = (ctx: ExtensionContext): boolean => {
     // Manual compaction aborts an active agent run, so only start it while Pi is idle.
@@ -54,26 +80,109 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     return true;
   };
 
-  // Shared commit path: a ready, still-current result swaps in via the nonce compaction.
-  const commitReadySummary = (ctx: ExtensionContext): void => {
+  // Shared durability path: a published, still-current checkpoint is appended
+  // as extension state (a CustomEntry, invisible to the model) once the agent
+  // is idle. Raw history stays on the branch; the serving checkpoint keeps
+  // swapping while and after it lands. There is no callback that must survive
+  // a session replacement, and no native compaction on the soft path.
+  const persistReadyCheckpoint = (ctx: ExtensionContext): void => {
     if (!ctx.isIdle()) return;
-    const current = state.current;
-    if (current.phase !== "ready") return;
-    if (!resultIsCurrent(ctx, current.result)) {
-      state.reset();
+    const result = state.published;
+    if (!result) return;
+    if (!resultIsCurrent(ctx, result)) {
+      // A native compaction landed under the checkpoint (or the branch moved
+      // on): drop the projection and re-arm so the next crossing prepares
+      // fresh. Validation on restore rejects the persisted twin the same way.
+      state.discardPublished();
       return;
     }
-    const commit = state.beginCommit(`${COMMIT_NONCE_PREFIX}${randomUUID()}]`);
-    if (!commit) return;
-    ctx.compact({
-      customInstructions: commit.nonce,
-      onComplete: () => state.reset(),
-      onError: () => {
-        // The cached result failed; let Pi's native summarizer run once instead.
-        state.reset();
-        if (!runNativeFallback(ctx)) state.requestNativeFallback();
-      },
+    if (result.checkpointId === state.persistedCheckpointId) return;
+    const checkpoint: PersistedShadowCheckpoint = {
+      version: 1,
+      checkpointId: result.checkpointId,
+      sessionId: result.sessionId,
+      summary: result.summary,
+      firstKeptEntryId: result.firstKeptEntryId,
+      leafId: result.leafId,
+      latestCompactionId: result.latestCompactionId,
+      contextTokensBefore: result.contextTokensBefore ?? 0,
+      usage: result.usage,
+      details: result.details,
+      createdAt: Date.now(),
+    };
+    try {
+      pi.appendEntry(CHECKPOINT_CUSTOM_TYPE, checkpoint);
+    } catch (error) {
+      // An append can fail when the idle point races teardown. The checkpoint
+      // keeps serving and the next settle retries; nothing crashes the agent.
+      traceEvent("checkpoint_persisted", {
+        turn: turnCount,
+        generation: state.generation,
+        action: "failed",
+        checkpointId: result.checkpointId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return;
+    }
+    state.markPersisted(result.checkpointId);
+    traceEvent("checkpoint_persisted", {
+      turn: turnCount,
+      generation: state.generation,
+      checkpointId: result.checkpointId,
+      firstKeptEntryId: result.firstKeptEntryId,
+      leafId: result.leafId,
+      summaryChars: result.summary.length,
+      contextTokensBefore: result.contextTokensBefore ?? null,
     });
+  };
+
+  // Restores the latest valid persisted checkpoint into service. Runs on every
+  // session_start (initial load, reload, resume): raw history is the evidence,
+  // the checkpoint is the replaceable projection over it.
+  const restorePersistedCheckpoint = (ctx: ExtensionContext): void => {
+    if (isObserveMode()) return;
+    let branch: SessionEntry[];
+    let sessionId: string;
+    try {
+      branch = ctx.sessionManager.getBranch();
+      sessionId = ctx.sessionManager.getSessionId();
+    } catch {
+      // No readable session to restore from; start cold.
+      return;
+    }
+    const { found, skippedStale } = findLatestRestorableCheckpoint(branch, sessionId);
+    for (const skipped of skippedStale) {
+      traceEvent("checkpoint_restore_rejected", {
+        checkpointId: skipped.checkpointId,
+        reason: skipped.reason,
+        latestCompactionId: latestCompactionId(branch),
+      });
+    }
+    if (!found) return;
+    state.restorePublished(toPreparedResult(found.checkpoint));
+    traceEvent("checkpoint_restored", {
+      checkpointId: found.checkpoint.checkpointId,
+      firstKeptEntryId: found.checkpoint.firstKeptEntryId,
+      leafId: found.checkpoint.leafId,
+      summaryChars: found.checkpoint.summary.length,
+    });
+  };
+
+  // Idle-point actions shared by agent_settled and post-settle preparation outcomes.
+  const settle = (ctx: ExtensionContext, deferredNotice: boolean): void => {
+    if (!ctx.isIdle()) return;
+    if (state.preparing) {
+      // A replacement is still being built. Its completion persists once Pi
+      // stays idle; persisting the older checkpoint now would be immediately
+      // superseded, so wait for the replacement.
+      if (deferredNotice) ctx.ui.notify(DEFERRED_MESSAGE, "info");
+      return;
+    }
+    if (state.clearPendingNativeFallback()) {
+      if (!runNativeFallback(ctx)) state.requestNativeFallback();
+      return;
+    }
+    persistReadyCheckpoint(ctx);
   };
 
   const reportError = (ctx: ExtensionContext, error: unknown) => {
@@ -107,16 +216,67 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     config: ShadowCompactConfig,
     branch: SessionEntry[],
     controller: AbortController,
+    generation: number,
   ): Promise<void> => {
-    const generation = state.current.generation;
+    const startedWallMs = Date.now();
+    // Releases a preparation whose session died underneath it (replacement or
+    // reload while the summary ran). True means the ctx is dead: callers must
+    // return without settle/notify/compact, which would all throw on it.
+    // fail() mirrors the abort path and self-heals (a later session_start or
+    // settle consumes or clears whatever it queues).
+    const bailIfStale = (): boolean => {
+      if (!isContextStale(ctx)) return false;
+      if (state.fail(generation)) {
+        traceEvent("prepare_failed", {
+          turn: turnCount,
+          generation,
+          reason: "stale-context",
+        });
+      }
+      return true;
+    };
+    const failPrepare = (reason: string, extra: Record<string, unknown> = {}): void => {
+      if (state.fail(generation)) {
+        traceEvent("prepare_failed", {
+          turn: turnCount,
+          generation,
+          reason,
+          ...extra,
+        });
+      }
+      // A preparation can finish after the settle point it missed; act now if idle.
+      settle(ctx, false);
+    };
     try {
-      const keepRecentTokens = SettingsManager.create(ctx.cwd, getAgentDir())
+      // Shadow owns its cut boundary: the experimental tail knob keeps roughly
+      // that share of the context window as verbatim history, capped at Pi's
+      // keepRecentTokens so unset/oversized targets change nothing.
+      const contextUsage = ctx.getContextUsage();
+      const tokensAtStart = contextUsage?.tokens ?? undefined;
+      const piKeepRecentTokens = SettingsManager.create(ctx.cwd, getAgentDir())
         .getCompactionSettings().keepRecentTokens;
+      const keepRecentTokens = resolveKeepRecentTokens(
+        piKeepRecentTokens,
+        config.targetTailPercent,
+        contextUsage?.contextWindow,
+      );
       const snapshot = prepareSnapshot(branch, keepRecentTokens);
-      // "Nothing to summarize" is terminal: fail() releases the claimed phase so a
-      // later turn can retry instead of latching the extension in preparing forever.
+      // "Nothing to summarize" at the soft boundary is not a failure: there is
+      // not yet enough disposable history under this cut policy. Suppress
+      // without queuing a native fallback instead of churning every turn; the
+      // recorded size re-arms once the working set grows meaningfully.
       if (!snapshot) {
-        state.fail(generation);
+        if (state.skipPreparation(generation, tokensAtStart)) {
+          traceEvent("prepare_failed", {
+            turn: turnCount,
+            generation,
+            reason: "empty-snapshot",
+            action: "suppressed-until-growth",
+            branchEntries: branch.length,
+          });
+        }
+        // A preparation can finish after the settle point it missed; act now if idle.
+        settle(ctx, false);
         return;
       }
 
@@ -142,6 +302,8 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         budget,
       );
       if (packet.evidence.length === 0) throw new Error("No evidence is available to summarize");
+      const packetChars = JSON.stringify(packet).length;
+      const sourceEntries = snapshot.sourceEntries.length + snapshot.turnPrefixEntries.length;
 
       const outcome = await runSummaryAgent(ctx, packet, config, {
         signal: controller.signal,
@@ -149,9 +311,12 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         maxTokens,
         ...(config.thinkingLevel ? { thinkingLevel: config.thinkingLevel } : {}),
       });
+      if (bailIfStale()) return;
+      const summaryWallMs = Date.now() - startedWallMs;
 
       const current = ctx.sessionManager.getBranch();
       const result: PreparedResult = {
+        checkpointId: randomUUID(),
         sessionId: ctx.sessionManager.getSessionId(),
         leafId: ctx.sessionManager.getLeafId() ?? (current[current.length - 1]?.id ?? ""),
         latestCompactionId: snapshot.latestCompactionId,
@@ -164,20 +329,62 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         },
         contextTokensBefore: ctx.getContextUsage()?.tokens ?? 0,
       };
+      traceEvent("prepare_completed", {
+        turn: turnCount,
+        generation,
+        summaryChars: outcome.summary.length,
+        summaryInput: outcome.usage.input,
+        summaryOutput: outcome.usage.output,
+        summaryCacheRead: outcome.usage.cacheRead,
+        summaryCacheWrite: outcome.usage.cacheWrite,
+        summaryModel: `${model.provider}/${model.id}`,
+        summaryWallMs,
+        packetChars,
+        sourceEntries,
+        packetRawEvidence: packet.rawEvidenceCount,
+        packetEvidence: packet.normalizedEvidenceCount,
+        packetEvicted: packet.evictedEvidenceCount,
+        packetTruncated: packet.packetTruncated,
+        packetOldestRetained: packet.oldestRetainedSourceEntryId,
+        packetNewestRetained: packet.newestRetainedSourceEntryId,
+        firstKeptEntryId: snapshot.firstKeptEntryId,
+        leafId: result.leafId,
+      });
       const valid =
         ctx.sessionManager.getSessionId() === result.sessionId &&
         isValidBranchAncestry(current, result) &&
         latestCompactionId(current) === result.latestCompactionId;
       // Ownership-checked: a superseded completion no-ops instead of aborting a newer prepare.
+      const replaced = Boolean(state.published);
       if (!valid || !state.publish(generation, result)) {
-        state.fail(generation);
+        failPrepare(valid ? "superseded" : "stale-branch", { firstKeptEntryId: result.firstKeptEntryId });
         return;
       }
+      traceEvent("checkpoint_published", {
+        turn: turnCount,
+        generation,
+        firstKeptEntryId: result.firstKeptEntryId,
+        leafId: result.leafId,
+        summaryChars: result.summary.length,
+        contextTokensBefore: result.contextTokensBefore ?? null,
+        replaced,
+      });
       ctx.ui.notify(READY_MESSAGE, "info");
-      commitReadySummary(ctx);
+      persistReadyCheckpoint(ctx);
     } catch (error) {
+      // The summary itself may throw the stale error (or anything after it
+      // may run on a dead session): never notify/settle on a dead ctx.
+      if (bailIfStale()) return;
       if (!controller.signal.aborted) reportError(ctx, error);
+      else {
+        traceEvent("prepare_failed", {
+          turn: turnCount,
+          generation,
+          reason: "aborted",
+        });
+      }
       state.fail(generation);
+      settle(ctx, false);
     }
   };
 
@@ -186,47 +393,77 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     isValidBranchAncestry(ctx.sessionManager.getBranch(), result) &&
     latestCompactionId(ctx.sessionManager.getBranch()) === result.latestCompactionId;
 
-  // Mid-run swap: a ready, current summary replaces the stale prefix in the next
-  // request. This touches only the request's message list, so the agent run never
-  // aborts. The durable CompactionEntry lands later through the nonce compaction.
+  // Mid-run swap: a published, current summary replaces the stale prefix in the
+  // next request. This touches only the request's message list, so the agent run
+  // never aborts. Durability lands separately as a CustomEntry at idle; the
+  // serving checkpoint keeps swapping before and after it lands, and while its
+  // replacement prepares; publishing the replacement swaps future requests to it.
   const swapSummaryIntoContext = (ctx: ExtensionContext, event: ContextEvent) => {
-    const current = state.current;
-    if (current.phase !== "ready") return undefined;
-    if (!resultIsCurrent(ctx, current.result)) return undefined;
+    const result = state.published;
+    if (!result) return undefined;
+    if (!resultIsCurrent(ctx, result)) return undefined;
     const drop = contextSwapDropCount(
       ctx.sessionManager.getBranch(),
-      current.result.firstKeptEntryId,
-      current.result.latestCompactionId,
+      result.firstKeptEntryId,
+      result.latestCompactionId,
     );
     if (drop === undefined || drop > event.messages.length) return undefined;
     const kept = event.messages.slice(drop);
     if (kept.length === 0) return undefined;
+    const firstSwap = state.markSwapped();
+    const usage = ctx.getContextUsage();
+    traceEvent("swap_applied", {
+      turn: turnCount,
+      generation: state.generation,
+      firstSwap,
+      messagesBefore: event.messages.length,
+      messagesAfter: kept.length + 1,
+      messagesDropped: drop,
+      contextTokensBefore: result.contextTokensBefore ?? null,
+      contextTokensAtSwap: usage?.tokens ?? null,
+      contextPercentAtSwap: usage?.percent ?? null,
+      firstKeptEntryId: result.firstKeptEntryId,
+      leafId: result.leafId,
+    });
     const summaryMessage = {
       role: "compactionSummary" as const,
-      summary: current.result.summary,
-      tokensBefore: current.result.contextTokensBefore ?? 0,
+      summary: result.summary,
+      tokensBefore: result.contextTokensBefore ?? 0,
       timestamp: Date.now(),
     };
     const messages: ContextEvent["messages"] = [summaryMessage, ...kept];
     return { messages };
   };
 
-  pi.on("session_start", () => {
+  pi.on("session_start", (_event, ctx) => {
     state.reset();
     configPromise = undefined;
     reportedError = undefined;
     configErrorReported = false;
     nativeFallbackInFlight = false;
+    turnCount = 0;
+    restorePersistedCheckpoint(ctx);
   });
 
   pi.on("turn_end", async (_event, ctx) => {
-    const percent = ctx.getContextUsage()?.percent;
+    turnCount += 1;
+    const usage = ctx.getContextUsage();
+    const percent = usage?.percent;
+    traceEvent("turn_usage", {
+      turn: turnCount,
+      generation: state.generation,
+      phase: state.phase,
+      contextTokens: usage?.tokens ?? null,
+      contextPercent: percent ?? null,
+      published: Boolean(state.published),
+      publishedSwapped: state.publishedSwapped,
+      preparing: Boolean(state.preparing),
+      refreshArmed: state.refreshArmed,
+    });
+    // Observe-only instrumented control: the turn_usage series above is the
+    // whole point; summaries, swaps, and compactions stay disabled.
+    if (isObserveMode()) return;
     if (percent === null || percent === undefined) return;
-
-    // ctx.compact() is a manual compaction and aborts an active agent run, so
-    // this event only prepares. The context event swaps mid-run; agent_settled
-    // and the ready completion persist the durable compaction while idle.
-    if (state.current.phase === "ready" || state.current.phase === "committing") return;
 
     const config = await configFor(ctx).catch((error: unknown) => {
       configErrorReported = true;
@@ -235,9 +472,48 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     });
     const hardThreshold =
       config?.hardCompactThresholdPercent ?? DEFAULT_HARD_COMPACT_THRESHOLD_PERCENT;
+    const softThreshold = config?.softCompactThresholdPercent;
+
+    // ctx.compact() is a manual compaction and aborts an active agent run, so
+    // this event only prepares. The context event swaps mid-run; agent_settled
+    // and the ready completion persist the CustomEntry checkpoint while idle.
+    // Single-shot mode keeps one checkpoint per run: while anything is
+    // published, no refresh starts (rolling replaces it instead).
+    if (!isRollingEnabled() && state.published) return;
+
+    if (
+      isRollingEnabled() &&
+      softThreshold !== undefined &&
+      percent < softThreshold &&
+      state.published &&
+      state.publishedSwapped
+    ) {
+      // The served checkpoint demonstrably shrank the working set: the swap
+      // fired and context is back below soft. Re-arm for the next crossing.
+      if (state.rearm()) {
+        traceEvent("checkpoint_rearmed", {
+          turn: turnCount,
+          generation: state.generation,
+          contextTokens: usage?.tokens ?? null,
+          contextPercent: percent,
+          firstKeptEntryId: state.published.firstKeptEntryId,
+        });
+      }
+    }
+
     if (percent >= hardThreshold) {
-      // Deadline hatch: cancel detached work and compact at the next safe idle point.
+      // Deadline hatch: abort any replacement preparation and compact at the
+      // next safe idle point. A published checkpoint keeps serving meanwhile —
+      // a stale but valid checkpoint must not disable the emergency path when
+      // the served working set is already too large despite it.
       if (state.requestNativeFallback()) {
+        traceEvent("native_fallback", {
+          turn: turnCount,
+          generation: state.generation,
+          reason: "hard-threshold",
+          contextTokens: usage?.tokens ?? null,
+          contextPercent: percent,
+        });
         ctx.ui.notify(
           `shadow-compact: ${Math.round(percent)}% context - native compaction queued until idle`,
           "info",
@@ -245,70 +521,118 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       }
       return;
     }
-    if (!config || percent < config.softCompactThresholdPercent || state.current.phase !== "idle") {
+
+    if (state.preparing) return;
+
+    // A queued native fallback owns the next idle point: never start another
+    // background preparation on top of it.
+    if (state.pendingNativeFallback) return;
+
+    // An empty-snapshot suppression retries once the working set grew
+    // meaningfully past the suppression point — not on every turn, and never
+    // while a preparation is in flight (startPreparing clears it anyway).
+    // Evaluated below soft too: the gate only matters at the next crossing.
+    if (
+      config &&
+      !state.refreshArmed &&
+      state.emptySuppressedAtTokens !== undefined &&
+      typeof usage?.tokens === "number" &&
+      usage?.contextWindow != null
+    ) {
+      const suppressedTailBudget = resolveKeepRecentTokens(
+        SettingsManager.create(ctx.cwd, getAgentDir()).getCompactionSettings().keepRecentTokens,
+        config.targetTailPercent,
+        usage.contextWindow ?? undefined,
+      );
+      if (state.rearmAfterGrowth(usage.tokens, suppressedTailBudget)) {
+        traceEvent("checkpoint_rearmed", {
+          turn: turnCount,
+          generation: state.generation,
+          reason: "growth-after-empty",
+          contextTokens: usage.tokens,
+          contextPercent: percent,
+        });
+      }
+    }
+
+    if (!config || softThreshold === undefined || percent < softThreshold) {
+      return;
+    }
+
+    if (!state.refreshArmed) {
+      // Still above soft after a refresh cycle without an observed swap + shrink:
+      // the checkpoint/tail policy is not achieving the target. Log, don't spin.
+      traceEvent("threshold_crossed", {
+        turn: turnCount,
+        generation: state.generation,
+        action: "suppressed",
+        contextTokens: usage?.tokens ?? null,
+        contextPercent: percent,
+        softThreshold,
+      });
       return;
     }
 
     const prepared = state.startPreparing();
     if (!prepared) return;
     const branch = ctx.sessionManager.getBranch();
+    traceEvent("threshold_crossed", {
+      turn: turnCount,
+      generation: prepared.generation,
+      action: "started",
+      contextTokens: usage?.tokens ?? null,
+      contextPercent: percent,
+      softThreshold,
+    });
+    traceEvent("prepare_started", {
+      turn: turnCount,
+      generation: prepared.generation,
+      contextTokens: usage?.tokens ?? null,
+      contextPercent: percent,
+      softThreshold,
+      branchEntries: branch.length,
+      leafId: ctx.sessionManager.getLeafId() ?? null,
+    });
     // Fire and forget: the live agent run continues immediately.
-    void prepare(ctx, config, branch, prepared.controller);
+    void prepare(ctx, config, branch, prepared.controller, prepared.generation);
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
-    if (!ctx.isIdle()) return;
-    if (state.clearPendingNativeFallback()) {
-      if (!runNativeFallback(ctx)) state.requestNativeFallback();
-      return;
-    }
-
-    if (state.current.phase === "preparing") {
-      // The summary missed this idle point. Its completion commits once Pi stays idle.
-      ctx.ui.notify(DEFERRED_MESSAGE, "info");
-      return;
-    }
-    commitReadySummary(ctx);
+    if (isObserveMode()) return;
+    settle(ctx, true);
   });
 
-  pi.on("context", (event, ctx) => swapSummaryIntoContext(ctx, event));
+  pi.on("context", (event, ctx) => {
+    if (isObserveMode()) return undefined;
+    return swapSummaryIntoContext(ctx, event);
+  });
 
   pi.on("session_before_compact", (event: SessionBeforeCompactEvent, ctx) => {
-    if (isCommitNonce(event.customInstructions)) {
-      const current = state.current;
-      if (current.phase !== "committing" || current.nonce !== event.customInstructions) return;
-      return {
-        compaction: {
-          summary: current.result.summary,
-          firstKeptEntryId: current.result.firstKeptEntryId,
-          tokensBefore: event.preparation.tokensBefore,
-          usage: current.result.usage,
-          details: current.result.details,
-        },
-      };
-    }
-
-    const current = state.current;
+    if (isObserveMode()) return;
+    // Shadow never compacts proactively; but when Pi compacts natively anyway
+    // (hard hatch, overflow, manual with a matching boundary), reuse the
+    // already-computed checkpoint instead of invoking another summarizer.
+    const published = state.published;
     if (
       event.reason !== "manual" &&
-      current.phase === "ready" &&
-      current.result.firstKeptEntryId === event.preparation.firstKeptEntryId &&
-      resultIsCurrent(ctx, current.result)
+      published &&
+      published.firstKeptEntryId === event.preparation.firstKeptEntryId &&
+      resultIsCurrent(ctx, published)
     ) {
       return {
         compaction: {
-          summary: current.result.summary,
-          firstKeptEntryId: current.result.firstKeptEntryId,
+          summary: published.summary,
+          firstKeptEntryId: published.firstKeptEntryId,
           tokensBefore: event.preparation.tokensBefore,
-          usage: current.result.usage,
-          details: current.result.details,
+          usage: published.usage,
+          details: published.details,
         },
       };
     }
 
     // Manual compaction invalidates the cached checkpoint in any phase. A threshold
     // boundary mismatch leaves the cache intact for a later matching request.
-    if (event.reason === "manual" || current.phase === "preparing") state.reset();
+    if (event.reason === "manual" || state.preparing) state.reset();
     return;
   });
 
@@ -328,12 +652,4 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     nativeFallbackInFlight = false;
     state.reset();
   });
-}
-
-function latestCompactionId(branch: SessionEntry[]): string | null {
-  for (let index = branch.length - 1; index >= 0; index--) {
-    const entry = branch[index];
-    if (entry?.type === "compaction") return entry.id;
-  }
-  return null;
 }

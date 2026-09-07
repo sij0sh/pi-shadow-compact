@@ -90,6 +90,12 @@ const rendered = `# Continuation Checkpoint
 
 const packet: NormalizedPacket = {
   evidence: [{ evidenceId: "ev-1", sourceEntryId: "e1", kind: "user", text: "Build it" }],
+  rawEvidenceCount: 1,
+  normalizedEvidenceCount: 1,
+  evictedEvidenceCount: 0,
+  packetTruncated: false,
+  oldestRetainedSourceEntryId: "e1",
+  newestRetainedSourceEntryId: "e1",
 };
 
 const config = {
