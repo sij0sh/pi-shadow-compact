@@ -477,3 +477,110 @@ describe("persistent two-turn lifecycle with reload", () => {
     }
   });
 });
+
+describe("checkpoint self-repair (summary omission is not evidence loss)", () => {
+  const MARKER = "IMPORTANT_CONSTRAINT_X";
+  let sequence = 0;
+
+  function userMessage(text: string): SessionEntry {
+    sequence += 1;
+    return {
+      id: `self-repair-${sequence}`,
+      parentId: sequence > 1 ? `self-repair-${sequence - 1}` : null,
+      timestamp: "2026-01-01T00:00:00.000Z",
+      type: "message",
+      message: { role: "user", content: text, timestamp: sequence },
+    } as unknown as SessionEntry;
+  }
+
+  function persistedCheckpointEntry(
+    id: string,
+    summary: string,
+    firstKeptEntryId: string,
+    leafId: string,
+  ): SessionEntry {
+    const data: PersistedShadowCheckpoint = {
+      version: 1,
+      checkpointId: id,
+      sessionId: "session-1",
+      summary,
+      firstKeptEntryId,
+      leafId,
+      latestCompactionId: null,
+      contextTokensBefore: 600,
+      usage: USAGE,
+      details: { readFiles: [], modifiedFiles: [] },
+      createdAt: 1_700_000_000_000,
+    };
+    assert.equal(isPersistedShadowCheckpoint(data), true);
+    return {
+      id: `custom-${id}`,
+      parentId: leafId,
+      timestamp: "2026-01-01T00:00:00.000Z",
+      type: "custom",
+      customType: CHECKPOINT_CUSTOM_TYPE,
+      data,
+    } as unknown as SessionEntry;
+  }
+
+  it("checkpoint B recovers a constraint that checkpoint A's summary omitted", () => {
+    sequence = 0;
+    const constraint = userMessage(`${MARKER}: deploy only after the canary job goes green`);
+    const earlyBranch: SessionEntry[] = [
+      constraint,
+      userMessage(`background detail ${"x".repeat(500)}`),
+      userMessage(`more background ${"y".repeat(500)}`),
+    ];
+
+    // Checkpoint A covers the early history, but its summary deliberately
+    // omits the constraint — the omission the self-repair story must survive.
+    const snapshotA = prepareSnapshot(earlyBranch, 10);
+    assert.ok(snapshotA, "A has evidence to summarize");
+    assert.ok(
+      snapshotA.sourceEntries.some((entry) => entry.id === constraint.id),
+      "A's range includes the constraint entry",
+    );
+    const summaryA = "Continuation summary that forgets the deployment constraint.";
+    assert.doesNotMatch(summaryA, new RegExp(MARKER));
+    const persistedA = persistedCheckpointEntry(
+      "A",
+      summaryA,
+      snapshotA.firstKeptEntryId,
+      earlyBranch.at(-1)!.id,
+    );
+
+    // More history accrues after A persists; B prepares from the raw branch.
+    const later: SessionEntry[] = [
+      userMessage(`follow-up work ${"a".repeat(500)}`),
+      userMessage(`latest question ${"b".repeat(500)}`),
+    ];
+    const branchB: SessionEntry[] = [...earlyBranch, persistedA, ...later];
+    const snapshotB = prepareSnapshot(branchB, 10);
+    assert.ok(snapshotB, "B has evidence to summarize");
+
+    // Intercept B's normalized evidence packet: the persisted checkpoint is
+    // invisible to the normalizer, so recovery must come from raw history.
+    const packetB = normalizeSnapshot({
+      cwd: "/work/project",
+      previousSummary: summaryA,
+      entries: [...snapshotB.sourceEntries, ...snapshotB.turnPrefixEntries],
+    });
+    assert.ok(
+      packetB.evidence.every((item) => item.sourceEntryId !== persistedA.id),
+      "the persisted checkpoint contributes no evidence of its own",
+    );
+    const recovered = packetB.evidence.filter(
+      (item) => item.kind !== "previous_checkpoint" && item.text.includes(MARKER),
+    );
+    assert.ok(
+      recovered.length > 0,
+      "B's packet recovers the constraint from raw history despite A's omission",
+    );
+    assert.ok(
+      packetB.evidence
+        .filter((item) => item.kind === "previous_checkpoint")
+        .every((item) => !item.text.includes(MARKER)),
+      "the omission is real: no previous-checkpoint carrier mentions the constraint",
+    );
+  });
+});
