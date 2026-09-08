@@ -145,6 +145,20 @@ instead of compacting. Overrides are intended for ephemeral use such as
 benchmark harnesses, where per-run configuration cannot be written to the
 project or global config files.
 
+`SHADOW_COMPACT_SOFT_THRESHOLD_ABS` is a benchmark-only absolute soft
+trigger (env-only, never a file setting): when set to a positive integer
+token count, the soft trigger compares raw context tokens instead of
+`usage.percent`, so threshold sweeps mean the same thing on every model
+window. (Named `..._ABS`, not `..._TOKENS`, because the roast harness
+rejects literal `_TOKENS`-suffixed env values as credential-like.)
+Precedence is tokens, then
+`SHADOW_COMPACT_SOFT_THRESHOLD_PERCENT`, then the file/default percentage;
+when tokens are set but the runtime reports no token count, the percent
+threshold applies. The same comparison gates both the initial trigger and
+the rolling below-threshold re-arm so hysteresis stays consistent. Empty or
+unset values are ignored. No absolute hard-token knob exists yet: hard
+stays a percent.
+
 `SHADOW_COMPACT_ROLLING` disables rolling refresh when set to `0`, `false`,
 `no`, or `off` (default is rolling on): an already-published checkpoint is
 never refreshed within the run — exactly one checkpoint per session. This is
@@ -164,6 +178,26 @@ leaving nothing to summarize. Empty or unset values are ignored.
 `turn_end` still emits the `turn_usage` telemetry series, and everything
 else (summaries, swaps, compactions, cache reads) stays disabled. It gives
 context-AUC a control baseline without perturbing the working set.
+
+`SHADOW_COMPACT_ACTION_FIRST` selects the checkpoint representation
+(benchmark-only harness knob, default off): unset/blank/anything but `1`,
+`true`, `yes`, or `on` renders the legacy schema order with the legacy
+prompt (normal operation — the representation experiment showed no
+benefit); set to `1` only to reproduce the action-first arm (Next Actions
+/ Open Issues / Current State / Critical Context before Completed Work /
+Decisions, with the contracts-and-verification summarizer instruction) of
+Current-vs-Action-first A/Bs. The schema itself never changes. The
+effective order is recorded as `renderOrder` on the `prepare_completed`
+trace event so benchmark artifacts prove which treatment ran.
+
+`SHADOW_COMPACT_SUMMARIZER_PROVIDER` and `SHADOW_COMPACT_SUMMARIZER_ID`
+override the file summarizer model when both are set (kept separate because
+IDs can contain `/` or `:`); `SHADOW_COMPACT_SUMMARIZER_THINKING` overrides
+the thinking level. All three are benchmark-only harness knobs, empty or
+unset values are ignored, and a lone provider or ID reports an error. The
+effective thinking level is recorded as `summaryThinking` on the
+`prepare_completed` trace event so benchmark artifacts prove which
+treatment ran.
 
 ### Summarizer model
 
@@ -214,7 +248,7 @@ Pi's built-in compaction takes over whenever the custom path is not safe:
 - A prepared boundary no longer matches Pi's native boundary.
 - There is nothing to summarize yet, so preparation suppresses until the working set grows instead of latching.
 
-A failed background summary schedules one ordinary native compaction at the next settle point. It never retries in a loop and never cancels Pi's overflow recovery.
+A failed background summary schedules one ordinary native compaction at the next settle point. It never retries in a loop and never cancels Pi's overflow recovery. The hard-threshold hatch is rechecked at the idle point: if context recovered below the hard threshold while the run drained, the stale hatch is skipped (a `native_fallback` event with `action: "skipped-recovered"`) instead of compacting a healthy working set.
 
 ## Install
 
@@ -268,12 +302,17 @@ session history, so measuring never perturbs the working set:
 Events: `turn_usage`, `threshold_crossed`, `prepare_started`,
 `prepare_completed` (with summarizer input/output/cache usage, model, wall
 time, and packet size), `prepare_failed`, `checkpoint_published`,
-`swap_applied` (first-swap flag, messages before/after/dropped, pre-swap
-context), `checkpoint_rearmed`, `checkpoint_persisted`, `checkpoint_restored`,
+`swap_applied` (first-swap flag, per-checkpoint swap count, messages
+before/after/dropped, pre-swap context), `checkpoint_rearmed`,
+`checkpoint_persisted`, `checkpoint_restored`,
 `checkpoint_restore_rejected` (with the staleness reason), and
 `native_fallback`. Joining `swap_applied` with the next `turn_usage` gives
 per-checkpoint swap reduction (`1 - postSwap / preSwap`); summing
-`turn_usage` context tokens gives area under the trajectory.
+`turn_usage` context tokens gives area under the trajectory. Every
+`turn_usage` row also carries `swapCount` and, once the checkpoint serves,
+`firstSwapTurn` plus `postSwapModelTurns`, so the useful served checkpoint
+rate (served, served ≥ 1/3/5 turns, median post-swap exposure) is directly
+readable from the last row per trial.
 
 ## Development
 

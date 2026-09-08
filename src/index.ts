@@ -9,6 +9,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import {
   DEFAULT_HARD_COMPACT_THRESHOLD_PERCENT,
+  isBelowSoft,
   isObserveMode,
   isRollingEnabled,
   loadConfig,
@@ -28,6 +29,7 @@ import { contextSwapDropCount } from "./swap.js";
 import { ShadowCompactStateController, type PreparedResult } from "./state.js";
 import {
   SUMMARY_MAX_TOKENS,
+  isActionFirstEnabled,
   resolveSummarizerModel,
   runSummaryAgent,
 } from "./summary.js";
@@ -169,7 +171,11 @@ export default function shadowCompact(pi: ExtensionAPI): void {
   };
 
   // Idle-point actions shared by agent_settled and post-settle preparation outcomes.
-  const settle = (ctx: ExtensionContext, deferredNotice: boolean): void => {
+  // A failure-queued fallback always compacts: with nothing serving it is the
+  // only safe recovery. A hard-threshold-queued fallback recompacts only while
+  // the spike is still present: context may have recovered while the run
+  // drained, and a stale hatch must not compact a healthy working set.
+  const settle = (ctx: ExtensionContext, deferredNotice: boolean, hardThreshold?: number): void => {
     if (!ctx.isIdle()) return;
     if (state.preparing) {
       // A replacement is still being built. Its completion persists once Pi
@@ -178,8 +184,25 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       if (deferredNotice) ctx.ui.notify(DEFERRED_MESSAGE, "info");
       return;
     }
-    if (state.clearPendingNativeFallback()) {
-      if (!runNativeFallback(ctx)) state.requestNativeFallback();
+    const pendingReason = state.pendingFallbackReason;
+    if (pendingReason !== undefined && state.clearPendingNativeFallback()) {
+      if (pendingReason === "hard-threshold" && hardThreshold !== undefined) {
+        const idleUsage = ctx.getContextUsage();
+        const idlePercent = idleUsage?.percent;
+        if (idlePercent !== undefined && idlePercent !== null && idlePercent < hardThreshold) {
+          traceEvent("native_fallback", {
+            turn: turnCount,
+            generation: state.generation,
+            reason: "hard-threshold",
+            action: "skipped-recovered",
+            contextTokens: idleUsage?.tokens ?? null,
+            contextPercent: idlePercent,
+          });
+          persistReadyCheckpoint(ctx);
+          return;
+        }
+      }
+      if (!runNativeFallback(ctx)) state.requestNativeFallback(pendingReason);
       return;
     }
     persistReadyCheckpoint(ctx);
@@ -245,7 +268,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         });
       }
       // A preparation can finish after the settle point it missed; act now if idle.
-      settle(ctx, false);
+      settle(ctx, false, config.hardCompactThresholdPercent);
     };
     try {
       // Shadow owns its cut boundary: the experimental tail knob keeps roughly
@@ -276,7 +299,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
           });
         }
         // A preparation can finish after the settle point it missed; act now if idle.
-        settle(ctx, false);
+        settle(ctx, false, config.hardCompactThresholdPercent);
         return;
       }
 
@@ -338,6 +361,8 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         summaryCacheRead: outcome.usage.cacheRead,
         summaryCacheWrite: outcome.usage.cacheWrite,
         summaryModel: `${model.provider}/${model.id}`,
+        summaryThinking: config.thinkingLevel ?? null,
+        renderOrder: isActionFirstEnabled() ? "action-first" : "legacy",
         summaryWallMs,
         packetChars,
         sourceEntries,
@@ -384,7 +409,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         });
       }
       state.fail(generation);
-      settle(ctx, false);
+      settle(ctx, false, config.hardCompactThresholdPercent);
     }
   };
 
@@ -410,12 +435,13 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     if (drop === undefined || drop > event.messages.length) return undefined;
     const kept = event.messages.slice(drop);
     if (kept.length === 0) return undefined;
-    const firstSwap = state.markSwapped();
+    const firstSwap = state.markSwapped(turnCount);
     const usage = ctx.getContextUsage();
     traceEvent("swap_applied", {
       turn: turnCount,
       generation: state.generation,
       firstSwap,
+      swapCount: state.swapCount,
       messagesBefore: event.messages.length,
       messagesAfter: kept.length + 1,
       messagesDropped: drop,
@@ -449,6 +475,10 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     turnCount += 1;
     const usage = ctx.getContextUsage();
     const percent = usage?.percent;
+    // swapCount / firstSwapTurn / postSwapModelTurns make the useful served
+    // checkpoint rate directly readable per trial: the last turn_usage row
+    // says whether the checkpoint served at all and with how much exposure.
+    const firstSwapTurn = state.firstSwapTurn;
     traceEvent("turn_usage", {
       turn: turnCount,
       generation: state.generation,
@@ -457,13 +487,19 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       contextPercent: percent ?? null,
       published: Boolean(state.published),
       publishedSwapped: state.publishedSwapped,
+      swapCount: state.swapCount,
+      ...(firstSwapTurn !== undefined
+        ? { firstSwapTurn, postSwapModelTurns: turnCount - firstSwapTurn }
+        : {}),
       preparing: Boolean(state.preparing),
       refreshArmed: state.refreshArmed,
     });
     // Observe-only instrumented control: the turn_usage series above is the
     // whole point; summaries, swaps, and compactions stay disabled.
     if (isObserveMode()) return;
-    if (percent === null || percent === undefined) return;
+    // Without any size signal there is nothing to compare against the soft
+    // trigger (percent or absolute tokens).
+    if ((percent === null || percent === undefined) && typeof usage?.tokens !== "number") return;
 
     const config = await configFor(ctx).catch((error: unknown) => {
       configErrorReported = true;
@@ -473,6 +509,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     const hardThreshold =
       config?.hardCompactThresholdPercent ?? DEFAULT_HARD_COMPACT_THRESHOLD_PERCENT;
     const softThreshold = config?.softCompactThresholdPercent;
+    const softThresholdTokens = config?.softCompactThresholdTokens;
 
     // ctx.compact() is a manual compaction and aborts an active agent run, so
     // this event only prepares. The context event swaps mid-run; agent_settled
@@ -483,8 +520,8 @@ export default function shadowCompact(pi: ExtensionAPI): void {
 
     if (
       isRollingEnabled() &&
-      softThreshold !== undefined &&
-      percent < softThreshold &&
+      config &&
+      isBelowSoft({ tokens: usage?.tokens, percent }, config) &&
       state.published &&
       state.publishedSwapped
     ) {
@@ -501,12 +538,15 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       }
     }
 
-    if (percent >= hardThreshold) {
+    // No absolute hard-token knob yet (fix.md): the deadline hatch stays
+    // percent-only and is skipped when the runtime reports no percent.
+    if (percent !== null && percent !== undefined && percent >= hardThreshold) {
       // Deadline hatch: abort any replacement preparation and compact at the
       // next safe idle point. A published checkpoint keeps serving meanwhile —
       // a stale but valid checkpoint must not disable the emergency path when
-      // the served working set is already too large despite it.
-      if (state.requestNativeFallback()) {
+      // the served working set is already too large despite it. Queued as a
+      // hard-threshold fallback so the idle point rechecks the spike first.
+      if (state.requestNativeFallback("hard-threshold")) {
         traceEvent("native_fallback", {
           turn: turnCount,
           generation: state.generation,
@@ -555,7 +595,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       }
     }
 
-    if (!config || softThreshold === undefined || percent < softThreshold) {
+    if (!config || isBelowSoft({ tokens: usage?.tokens, percent }, config)) {
       return;
     }
 
@@ -569,6 +609,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         contextTokens: usage?.tokens ?? null,
         contextPercent: percent,
         softThreshold,
+        softThresholdTokens: softThresholdTokens ?? null,
       });
       return;
     }
@@ -583,6 +624,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       contextTokens: usage?.tokens ?? null,
       contextPercent: percent,
       softThreshold,
+      softThresholdTokens: softThresholdTokens ?? null,
     });
     traceEvent("prepare_started", {
       turn: turnCount,
@@ -590,6 +632,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       contextTokens: usage?.tokens ?? null,
       contextPercent: percent,
       softThreshold,
+      softThresholdTokens: softThresholdTokens ?? null,
       branchEntries: branch.length,
       leafId: ctx.sessionManager.getLeafId() ?? null,
     });
@@ -599,7 +642,10 @@ export default function shadowCompact(pi: ExtensionAPI): void {
 
   pi.on("agent_settled", async (_event, ctx) => {
     if (isObserveMode()) return;
-    settle(ctx, true);
+    // A broken config must not block the idle path: fall back to the default
+    // hard threshold for the staleness recheck (turn_end already reports it).
+    const config = await configFor(ctx).catch(() => undefined);
+    settle(ctx, true, config?.hardCompactThresholdPercent ?? DEFAULT_HARD_COMPACT_THRESHOLD_PERCENT);
   });
 
   pi.on("context", (event, ctx) => {

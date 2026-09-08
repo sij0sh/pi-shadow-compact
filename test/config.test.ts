@@ -10,8 +10,14 @@ import {
   HARD_THRESHOLD_ENV_VAR,
   MODE_ENV_VAR,
   SOFT_THRESHOLD_ENV_VAR,
+  SOFT_THRESHOLD_ABS_ENV_VAR,
+  SUMMARIZER_ID_ENV_VAR,
+  SUMMARIZER_PROVIDER_ENV_VAR,
+  SUMMARIZER_THINKING_ENV_VAR,
   TARGET_TAIL_ENV_VAR,
   defaultConfig,
+  isAtOrAboveSoft,
+  isBelowSoft,
   isObserveMode,
   loadConfig,
   resolveKeepRecentTokens,
@@ -21,9 +27,13 @@ const CONFIG_FILE = "shadow-compact.json";
 
 let savedAgentDirEnv: string | undefined;
 let savedSoftEnv: string | undefined;
+let savedSoftTokensEnv: string | undefined;
 let savedHardEnv: string | undefined;
 let savedTailEnv: string | undefined;
 let savedModeEnv: string | undefined;
+let savedSummarizerProviderEnv: string | undefined;
+let savedSummarizerIdEnv: string | undefined;
+let savedSummarizerThinkingEnv: string | undefined;
 let agentDir = "";
 
 function context(cwd: string, trusted = true): ExtensionContext {
@@ -87,13 +97,21 @@ async function assertLoadError(
 beforeEach(async () => {
   savedAgentDirEnv = process.env.PI_CODING_AGENT_DIR;
   savedSoftEnv = process.env[SOFT_THRESHOLD_ENV_VAR];
+  savedSoftTokensEnv = process.env[SOFT_THRESHOLD_ABS_ENV_VAR];
   savedHardEnv = process.env[HARD_THRESHOLD_ENV_VAR];
   savedTailEnv = process.env[TARGET_TAIL_ENV_VAR];
   savedModeEnv = process.env[MODE_ENV_VAR];
+  savedSummarizerProviderEnv = process.env[SUMMARIZER_PROVIDER_ENV_VAR];
+  savedSummarizerIdEnv = process.env[SUMMARIZER_ID_ENV_VAR];
+  savedSummarizerThinkingEnv = process.env[SUMMARIZER_THINKING_ENV_VAR];
   delete process.env[SOFT_THRESHOLD_ENV_VAR];
+  delete process.env[SOFT_THRESHOLD_ABS_ENV_VAR];
   delete process.env[HARD_THRESHOLD_ENV_VAR];
   delete process.env[TARGET_TAIL_ENV_VAR];
   delete process.env[MODE_ENV_VAR];
+  delete process.env[SUMMARIZER_PROVIDER_ENV_VAR];
+  delete process.env[SUMMARIZER_ID_ENV_VAR];
+  delete process.env[SUMMARIZER_THINKING_ENV_VAR];
   agentDir = await mkdtemp(join(tmpdir(), "pi-shadow-compact-agent-"));
   process.env.PI_CODING_AGENT_DIR = agentDir;
 });
@@ -109,6 +127,11 @@ afterEach(async () => {
   } else {
     process.env[SOFT_THRESHOLD_ENV_VAR] = savedSoftEnv;
   }
+  if (savedSoftTokensEnv === undefined) {
+    delete process.env[SOFT_THRESHOLD_ABS_ENV_VAR];
+  } else {
+    process.env[SOFT_THRESHOLD_ABS_ENV_VAR] = savedSoftTokensEnv;
+  }
   if (savedHardEnv === undefined) {
     delete process.env[HARD_THRESHOLD_ENV_VAR];
   } else {
@@ -123,6 +146,21 @@ afterEach(async () => {
     delete process.env[MODE_ENV_VAR];
   } else {
     process.env[MODE_ENV_VAR] = savedModeEnv;
+  }
+  if (savedSummarizerProviderEnv === undefined) {
+    delete process.env[SUMMARIZER_PROVIDER_ENV_VAR];
+  } else {
+    process.env[SUMMARIZER_PROVIDER_ENV_VAR] = savedSummarizerProviderEnv;
+  }
+  if (savedSummarizerIdEnv === undefined) {
+    delete process.env[SUMMARIZER_ID_ENV_VAR];
+  } else {
+    process.env[SUMMARIZER_ID_ENV_VAR] = savedSummarizerIdEnv;
+  }
+  if (savedSummarizerThinkingEnv === undefined) {
+    delete process.env[SUMMARIZER_THINKING_ENV_VAR];
+  } else {
+    process.env[SUMMARIZER_THINKING_ENV_VAR] = savedSummarizerThinkingEnv;
   }
   await rm(agentDir, { recursive: true, force: true });
 });
@@ -467,6 +505,160 @@ describe("shadow compact config loading", () => {
       process.env[SOFT_THRESHOLD_ENV_VAR] = "85";
 
       await assert.rejects(loadConfig(context(cwd)), /must be greater than the soft threshold/);
+    });
+  });
+
+  describe("absolute soft threshold tokens override", () => {
+    it("is absent by default, leaving percent behavior unchanged", async (t) => {
+      const cwd = await temporaryCwd(t);
+
+      assert.equal((await loadConfig(context(cwd))).softCompactThresholdTokens, undefined);
+    });
+
+    it("sets the token knob without touching percent thresholds", async (t) => {
+      const cwd = await temporaryCwd(t);
+      process.env[SOFT_THRESHOLD_ABS_ENV_VAR] = "60000";
+
+      const config = await loadConfig(context(cwd));
+      assert.equal(config.softCompactThresholdTokens, 60000);
+      assert.equal(config.softCompactThresholdPercent, DEFAULT_SOFT_COMPACT_THRESHOLD_PERCENT);
+      assert.equal(config.hardCompactThresholdPercent, DEFAULT_HARD_COMPACT_THRESHOLD_PERCENT);
+    });
+
+    it("empty values are ignored", async (t) => {
+      const cwd = await temporaryCwd(t);
+      process.env[SOFT_THRESHOLD_ABS_ENV_VAR] = "  ";
+
+      assert.equal((await loadConfig(context(cwd))).softCompactThresholdTokens, undefined);
+    });
+
+    for (const value of ["lots", "NaN", "0", "-3", "1.5", "30k"]) {
+      it(`invalid token threshold ${JSON.stringify(value)} throws naming the variable`, async (t) => {
+        const cwd = await temporaryCwd(t);
+        process.env[SOFT_THRESHOLD_ABS_ENV_VAR] = value;
+
+        await assert.rejects(
+          loadConfig(context(cwd)),
+          (error: unknown) => {
+            assert.ok(error instanceof Error);
+            assert.match(error.message, new RegExp(SOFT_THRESHOLD_ABS_ENV_VAR));
+            return true;
+          },
+        );
+      });
+    }
+  });
+
+  describe("isAtOrAboveSoft / isBelowSoft", () => {
+    it("token threshold wins when set and tokens are reported", () => {
+      const config = { softCompactThresholdPercent: 5, softCompactThresholdTokens: 60000 };
+      // Tokens above, percent below: tokens win -> at/above.
+      assert.equal(isAtOrAboveSoft({ tokens: 61000, percent: 1 }, config), true);
+      assert.equal(isBelowSoft({ tokens: 61000, percent: 1 }, config), false);
+      // Tokens below, percent above: tokens win -> below.
+      assert.equal(isAtOrAboveSoft({ tokens: 59000, percent: 90 }, config), false);
+      assert.equal(isBelowSoft({ tokens: 59000, percent: 90 }, config), true);
+    });
+
+    it("falls back to percent when tokens are unset or unreported", () => {
+      assert.equal(isAtOrAboveSoft({ percent: 5 }, { softCompactThresholdPercent: 5 }), true);
+      assert.equal(isAtOrAboveSoft({ percent: 4.9 }, { softCompactThresholdPercent: 5 }), false);
+      assert.equal(
+        isAtOrAboveSoft(
+          { percent: 90 },
+          { softCompactThresholdPercent: 5, softCompactThresholdTokens: 60000 },
+        ),
+        true,
+      );
+      assert.equal(
+        isBelowSoft(
+          { percent: 1 },
+          { softCompactThresholdPercent: 5, softCompactThresholdTokens: 60000 },
+        ),
+        true,
+      );
+    });
+  });
+
+  describe("summarizer environment overrides", () => {
+    it("unset overrides leave file summarizer config untouched", async (t) => {
+      const cwd = await temporaryCwd(t);
+      await writeJson(projectConfigPath(cwd), {
+        ...configBody(60, "file-provider", "file-model"),
+        thinkingLevel: "low",
+      });
+
+      const config = await loadConfig(context(cwd));
+      assert.deepEqual(config.summarizerModel, { provider: "file-provider", id: "file-model" });
+      assert.equal(config.thinkingLevel, "low");
+    });
+
+    it("blank overrides are ignored", async (t) => {
+      const cwd = await temporaryCwd(t);
+      process.env[SUMMARIZER_PROVIDER_ENV_VAR] = "  ";
+      process.env[SUMMARIZER_ID_ENV_VAR] = "";
+      process.env[SUMMARIZER_THINKING_ENV_VAR] = " ";
+
+      const config = await loadConfig(context(cwd));
+      assert.deepEqual(config.summarizerModel, { provider: "", id: "" });
+      assert.equal("thinkingLevel" in config, false);
+    });
+
+    it("provider and id override together, including slash/colon ids", async (t) => {
+      const cwd = await temporaryCwd(t);
+      await writeJson(projectConfigPath(cwd), configBody(60, "file-provider", "file-model"));
+      process.env[SUMMARIZER_PROVIDER_ENV_VAR] = "bench-provider";
+      process.env[SUMMARIZER_ID_ENV_VAR] = "org/model:variant";
+
+      const config = await loadConfig(context(cwd));
+      assert.deepEqual(config.summarizerModel, { provider: "bench-provider", id: "org/model:variant" });
+    });
+
+    it("a lone provider without id throws naming both variables", async (t) => {
+      const cwd = await temporaryCwd(t);
+      process.env[SUMMARIZER_PROVIDER_ENV_VAR] = "bench-provider";
+
+      await assert.rejects(
+        loadConfig(context(cwd)),
+        (error: unknown) => {
+          assert.ok(error instanceof Error);
+          assert.match(error.message, new RegExp(SUMMARIZER_PROVIDER_ENV_VAR));
+          assert.match(error.message, new RegExp(SUMMARIZER_ID_ENV_VAR));
+          return true;
+        },
+      );
+    });
+
+    it("a lone id without provider throws", async (t) => {
+      const cwd = await temporaryCwd(t);
+      process.env[SUMMARIZER_ID_ENV_VAR] = "bench-model";
+
+      await assert.rejects(loadConfig(context(cwd)), /both be set or both be unset/);
+    });
+
+    it("a valid thinking level overrides the file value", async (t) => {
+      const cwd = await temporaryCwd(t);
+      await writeJson(projectConfigPath(cwd), {
+        ...configBody(60),
+        thinkingLevel: "low",
+      });
+      process.env[SUMMARIZER_THINKING_ENV_VAR] = "medium";
+
+      assert.equal((await loadConfig(context(cwd))).thinkingLevel, "medium");
+    });
+
+    it("an invalid thinking level throws naming the variable", async (t) => {
+      const cwd = await temporaryCwd(t);
+      process.env[SUMMARIZER_THINKING_ENV_VAR] = "ultra";
+
+      await assert.rejects(
+        loadConfig(context(cwd)),
+        (error: unknown) => {
+          assert.ok(error instanceof Error);
+          assert.match(error.message, new RegExp(SUMMARIZER_THINKING_ENV_VAR));
+          return true;
+        },
+      );
     });
   });
 

@@ -25,6 +25,18 @@ export interface PreparingInfo {
 }
 
 /**
+ * Why a native fallback is queued for the next idle point.
+ *
+ * - `"failure"`: the background summary failed with nothing serving, so one
+ *   ordinary native compaction is the only safe recovery. Unconditional.
+ * - `"hard-threshold"`: context spiked past the hard threshold. Conditional:
+ *   the idle point rechecks the threshold first, because the spike may have
+ *   recovered while the run drained (a stale hatch must not compact a
+ *   healthy working set).
+ */
+export type PendingFallbackReason = "failure" | "hard-threshold";
+
+/**
  * Rolling working-set maintenance state.
  *
  * The checkpoint currently being served (`published`) is separate from the
@@ -54,7 +66,9 @@ export class ShadowCompactStateController {
   #publishedSwapped = false;
   #preparing: PreparingInfo | undefined = undefined;
   #persistedCheckpointId: string | undefined = undefined;
-  #pendingNativeFallback = false;
+  #pendingNativeFallback: PendingFallbackReason | null = null;
+  #swapCount = 0;
+  #firstSwapTurn: number | undefined = undefined;
   #refreshArmed = true;
   #emptySuppressedAtTokens: number | undefined = undefined;
 
@@ -81,7 +95,22 @@ export class ShadowCompactStateController {
   }
 
   get pendingNativeFallback(): boolean {
-    return this.#pendingNativeFallback;
+    return this.#pendingNativeFallback !== null;
+  }
+
+  /** Why the queued fallback was requested, if one is queued. */
+  get pendingFallbackReason(): PendingFallbackReason | undefined {
+    return this.#pendingNativeFallback ?? undefined;
+  }
+
+  /** Requests served into request messages since the serving checkpoint published. */
+  get swapCount(): number {
+    return this.#swapCount;
+  }
+
+  /** Turn of the first served request for the serving checkpoint, if served. */
+  get firstSwapTurn(): number | undefined {
+    return this.#firstSwapTurn;
   }
 
   get refreshArmed(): boolean {
@@ -128,6 +157,8 @@ export class ShadowCompactStateController {
     this.#preparing = undefined;
     this.#published = result;
     this.#publishedSwapped = false;
+    this.#swapCount = 0;
+    this.#firstSwapTurn = undefined;
     this.#emptySuppressedAtTokens = undefined;
     return true;
   }
@@ -140,6 +171,8 @@ export class ShadowCompactStateController {
   restorePublished(result: PreparedResult): void {
     this.#published = result;
     this.#publishedSwapped = false;
+    this.#swapCount = 0;
+    this.#firstSwapTurn = undefined;
     this.#refreshArmed = false;
     this.#emptySuppressedAtTokens = undefined;
     this.#persistedCheckpointId = result.checkpointId;
@@ -160,7 +193,7 @@ export class ShadowCompactStateController {
       // context stays above soft). Only an observed swap + shrink re-arms.
       this.#refreshArmed = false;
     } else {
-      this.#pendingNativeFallback = true;
+      this.#pendingNativeFallback = "failure";
       this.#refreshArmed = true;
     }
     return true;
@@ -199,10 +232,18 @@ export class ShadowCompactStateController {
     return true;
   }
 
-  /** Records that the serving checkpoint swapped into a request. True on the first swap. */
-  markSwapped(): boolean {
-    if (!this.#published || this.#publishedSwapped) return false;
+  /**
+   * Records that the serving checkpoint swapped into a request. True on the
+   * first swap. Counts every served request and remembers the first swap's
+   * turn so idle-point telemetry can report meaningful post-swap exposure
+   * (served >= N turns) per checkpoint.
+   */
+  markSwapped(turn?: number): boolean {
+    if (!this.#published) return false;
+    this.#swapCount += 1;
+    if (this.#publishedSwapped) return false;
     this.#publishedSwapped = true;
+    if (turn !== undefined) this.#firstSwapTurn = turn;
     return true;
   }
 
@@ -214,18 +255,18 @@ export class ShadowCompactStateController {
     return true;
   }
 
-  requestNativeFallback(): boolean {
+  requestNativeFallback(reason: PendingFallbackReason = "hard-threshold"): boolean {
     if (this.#pendingNativeFallback) return false;
     this.#preparing?.controller.abort();
     this.#preparing = undefined;
     this.#generation += 1;
-    this.#pendingNativeFallback = true;
+    this.#pendingNativeFallback = reason;
     return true;
   }
 
   clearPendingNativeFallback(): boolean {
     if (!this.#pendingNativeFallback || this.#preparing) return false;
-    this.#pendingNativeFallback = false;
+    this.#pendingNativeFallback = null;
     return true;
   }
 
@@ -237,6 +278,8 @@ export class ShadowCompactStateController {
     if (!this.#published) return false;
     this.#published = undefined;
     this.#publishedSwapped = false;
+    this.#swapCount = 0;
+    this.#firstSwapTurn = undefined;
     this.#refreshArmed = true;
     this.#emptySuppressedAtTokens = undefined;
     return true;
@@ -248,9 +291,11 @@ export class ShadowCompactStateController {
     this.#preparing = undefined;
     this.#published = undefined;
     this.#publishedSwapped = false;
+    this.#swapCount = 0;
+    this.#firstSwapTurn = undefined;
     this.#persistedCheckpointId = undefined;
     this.#generation += 1;
-    this.#pendingNativeFallback = false;
+    this.#pendingNativeFallback = null;
     this.#refreshArmed = true;
     this.#emptySuppressedAtTokens = undefined;
   }

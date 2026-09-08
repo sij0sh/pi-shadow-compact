@@ -10,7 +10,11 @@ import type {
 } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
+  ACTION_FIRST_ENV_VAR,
+  RENDER_SECTIONS,
   SUMMARY_MAX_TOKENS,
+  isActionFirstEnabled,
+  resolveRenderSections,
   resolveSummarizerModel,
   runSummaryAgent,
   type CompletionInterface,
@@ -56,6 +60,39 @@ const checkpoint = {
 const valid = JSON.stringify(checkpoint);
 
 const rendered = `# Continuation Checkpoint
+
+## Objective
+- Ship the summary agent
+
+## Constraints
+- Stay evidence grounded
+
+## Next Actions
+(none)
+
+## Open Issues
+(none)
+
+## Current State
+(none)
+
+## Critical Context
+(none)
+
+## Completed Work
+- Implemented runSummaryAgent
+
+## Decisions
+(none)
+
+## Modified Files
+- src/summary.ts
+
+## Referenced Files
+(none)
+`;
+
+const renderedLegacy = `# Continuation Checkpoint
 
 ## Objective
 - Ship the summary agent
@@ -224,7 +261,7 @@ describe("runSummaryAgent", () => {
     assert.equal(call.options.maxTokens, SUMMARY_MAX_TOKENS);
     assert.equal(call.options.cacheRetention, "none");
     assert.match(call.options.sessionId ?? "", /^[0-9a-f-]{36}$/i);
-    assert.equal(result.summary, rendered);
+    assert.equal(result.summary, renderedLegacy);
     assert.doesNotMatch(result.summary, /ev-1/);
     assert.deepEqual(result.usage, usage(1));
   });
@@ -285,7 +322,7 @@ describe("runSummaryAgent", () => {
     assert.equal(result.usage.output, 10);
     assert.equal(result.usage.totalTokens, 25);
     assert.equal(result.usage.cost.total, 20);
-    assert.equal(result.summary, rendered);
+    assert.equal(result.summary, renderedLegacy);
   });
 
   it("throws when the second response is also invalid", async () => {
@@ -381,6 +418,135 @@ describe("runSummaryAgent", () => {
       firstPrompt,
       /Preserve this explicit custom focus as a priority: "Preserve the exact API contract"/,
     );
-    assert.equal(result.summary, rendered);
+    assert.equal(result.summary, renderedLegacy);
+  });
+});
+
+describe("action-first representation toggle", () => {
+  it("defaults to legacy schema order", () => {
+    const saved = process.env[ACTION_FIRST_ENV_VAR];
+    delete process.env[ACTION_FIRST_ENV_VAR];
+    try {
+      assert.equal(isActionFirstEnabled(), false);
+      assert.deepEqual([...resolveRenderSections()], [
+        "objective",
+        "constraints",
+        "completedWork",
+        "currentState",
+        "decisions",
+        "openIssues",
+        "nextActions",
+        "criticalContext",
+        "modifiedFiles",
+        "referencedFiles",
+      ]);
+    } finally {
+      if (saved === undefined) delete process.env[ACTION_FIRST_ENV_VAR];
+      else process.env[ACTION_FIRST_ENV_VAR] = saved;
+    }
+  });
+
+  for (const value of ["1", "true", "yes", "on", "TRUE", " 1 "]) {
+    it(`enables action-first for ${JSON.stringify(value)}`, () => {
+      const saved = process.env[ACTION_FIRST_ENV_VAR];
+      process.env[ACTION_FIRST_ENV_VAR] = value;
+      try {
+        assert.equal(isActionFirstEnabled(), true);
+        assert.deepEqual([...resolveRenderSections()], [...RENDER_SECTIONS]);
+        assert.deepEqual([...resolveRenderSections()], [
+          "objective",
+          "constraints",
+          "nextActions",
+          "openIssues",
+          "currentState",
+          "criticalContext",
+          "completedWork",
+          "decisions",
+          "modifiedFiles",
+          "referencedFiles",
+        ]);
+      } finally {
+        if (saved === undefined) delete process.env[ACTION_FIRST_ENV_VAR];
+        else process.env[ACTION_FIRST_ENV_VAR] = saved;
+      }
+    });
+  }
+
+  for (const value of ["0", "false", "no", "off", "FALSE", " 0 ", "", "2", "banana"]) {
+    it(`disables action-first for ${JSON.stringify(value)}`, () => {
+      const saved = process.env[ACTION_FIRST_ENV_VAR];
+      process.env[ACTION_FIRST_ENV_VAR] = value;
+      try {
+        assert.equal(isActionFirstEnabled(), false);
+        assert.deepEqual([...resolveRenderSections()], [
+          "objective",
+          "constraints",
+          "completedWork",
+          "currentState",
+          "decisions",
+          "openIssues",
+          "nextActions",
+          "criticalContext",
+          "modifiedFiles",
+          "referencedFiles",
+        ]);
+      } finally {
+        if (saved === undefined) delete process.env[ACTION_FIRST_ENV_VAR];
+        else process.env[ACTION_FIRST_ENV_VAR] = saved;
+      }
+    });
+  }
+
+  it("renders legacy schema order with the legacy prompt when disabled", async () => {
+    const saved = process.env[ACTION_FIRST_ENV_VAR];
+    process.env[ACTION_FIRST_ENV_VAR] = "0";
+    try {
+      const completion = new FakeCompletion([response(valid)]);
+      const result = await runSummaryAgent(context([], summaryModel), packet, config, {
+        completion,
+      });
+      assert.equal(result.summary, renderedLegacy);
+      const prompt = messageText(completion.calls[0]!.context.messages[0]!);
+      assert.doesNotMatch(prompt, /required observable outcome/);
+    } finally {
+      if (saved === undefined) delete process.env[ACTION_FIRST_ENV_VAR];
+      else process.env[ACTION_FIRST_ENV_VAR] = saved;
+    }
+  });
+
+  it("renders action-first order with the contracts instruction when explicitly enabled", async () => {
+    const saved = process.env[ACTION_FIRST_ENV_VAR];
+    process.env[ACTION_FIRST_ENV_VAR] = "1";
+    try {
+      const completion = new FakeCompletion([response(valid)]);
+      const result = await runSummaryAgent(context([], summaryModel), packet, config, {
+        completion,
+      });
+      assert.equal(result.summary, rendered);
+      const prompt = messageText(completion.calls[0]!.context.messages[0]!);
+      assert.match(prompt, /required observable outcome/);
+      assert.match(prompt, /must not regress/);
+      assert.match(prompt, /what verification remains necessary/);
+      assert.match(prompt, /merely because code changed/);
+      assert.match(prompt, /keep it explicitly unresolved/);
+    } finally {
+      if (saved === undefined) delete process.env[ACTION_FIRST_ENV_VAR];
+      else process.env[ACTION_FIRST_ENV_VAR] = saved;
+    }
+  });
+
+  it("omits the contracts instruction from the legacy prompt by default", async () => {
+    const saved = process.env[ACTION_FIRST_ENV_VAR];
+    delete process.env[ACTION_FIRST_ENV_VAR];
+    try {
+      const completion = new FakeCompletion([response(valid)]);
+      await runSummaryAgent(context([], summaryModel), packet, config, { completion });
+      const prompt = messageText(completion.calls[0]!.context.messages[0]!);
+      assert.doesNotMatch(prompt, /required observable outcome/);
+      assert.doesNotMatch(prompt, /keep it explicitly unresolved/);
+    } finally {
+      if (saved === undefined) delete process.env[ACTION_FIRST_ENV_VAR];
+      else process.env[ACTION_FIRST_ENV_VAR] = saved;
+    }
   });
 });

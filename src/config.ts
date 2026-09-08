@@ -12,9 +12,29 @@ export const DEFAULT_HARD_COMPACT_THRESHOLD_PERCENT = 80;
 
 export const SOFT_THRESHOLD_ENV_VAR = "SHADOW_COMPACT_SOFT_THRESHOLD_PERCENT";
 export const HARD_THRESHOLD_ENV_VAR = "SHADOW_COMPACT_HARD_THRESHOLD_PERCENT";
+/**
+ * Benchmark-only absolute soft trigger (env-only, never a file setting).
+ * When set, the soft trigger compares raw context tokens instead of
+ * `usage.percent`, so threshold sweeps mean the same thing on every model
+ * window. Percent env/file/defaults remain the fallback when this is unset
+ * or the runtime reports no token count.
+ *
+ * Named `..._ABS` (not fix.md's suggested `..._TOKENS`) because the roast
+ * harness rejects literal `_TOKENS`-suffixed env values as credential-like;
+ * per-variant literals are the only way to give twin arms different values.
+ */
+export const SOFT_THRESHOLD_ABS_ENV_VAR = "SHADOW_COMPACT_SOFT_THRESHOLD_ABS";
 export const ROLLING_ENV_VAR = "SHADOW_COMPACT_ROLLING";
 export const TARGET_TAIL_ENV_VAR = "SHADOW_COMPACT_TARGET_TAIL_PERCENT";
 export const MODE_ENV_VAR = "SHADOW_COMPACT_MODE";
+/**
+ * Benchmark-only summarizer overrides (all default-off). Provider and ID are
+ * separate vars — never one combined string — because IDs can contain `/`
+ * or `:`. File behavior is byte-identical when all three are unset/blank.
+ */
+export const SUMMARIZER_PROVIDER_ENV_VAR = "SHADOW_COMPACT_SUMMARIZER_PROVIDER";
+export const SUMMARIZER_ID_ENV_VAR = "SHADOW_COMPACT_SUMMARIZER_ID";
+export const SUMMARIZER_THINKING_ENV_VAR = "SHADOW_COMPACT_SUMMARIZER_THINKING";
 
 /**
  * Rolling refresh lets an already-published checkpoint be replaced while it
@@ -71,6 +91,8 @@ export const THINKING_LEVELS = [
 export interface ShadowCompactConfig {
   softCompactThresholdPercent: number;
   hardCompactThresholdPercent: number;
+  /** Benchmark-only absolute soft trigger in tokens (env-only, never from file). */
+  softCompactThresholdTokens?: number;
   /** Experimental harness knob (env-only): retained-tail budget as context-window percent. */
   targetTailPercent?: number;
   summarizerModel: {
@@ -121,15 +143,91 @@ function parseEnvThreshold(name: string): number | undefined {
   return value;
 }
 
+function parseEnvTokenCount(name: string): number | undefined {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return undefined;
+  const value = Number(raw.trim());
+  if (!Number.isInteger(value) || value < 1) {
+    throw new Error(`${name} must be a positive integer token count, got ${JSON.stringify(raw)}`);
+  }
+  return value;
+}
+
+function parseOptionalString(name: string): string | undefined {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return undefined;
+  return raw.trim();
+}
+
+function parseEnvThinking(name: string): ModelThinkingLevel | undefined {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return undefined;
+  const value = raw.trim();
+  if (!THINKING_LEVELS.includes(value as ModelThinkingLevel)) {
+    throw new Error(`${name} must be one of: ${THINKING_LEVELS.join(", ")}, got ${JSON.stringify(raw)}`);
+  }
+  return value as ModelThinkingLevel;
+}
+
+/**
+ * Resolved soft-trigger comparison. An absolute token threshold wins when
+ * set and the runtime reports a token count; otherwise the percent
+ * threshold applies. Single abstraction for both the initial trigger and
+ * the rolling below-threshold re-arm so hysteresis stays consistent.
+ */
+export interface SoftThresholdUsage {
+  tokens?: number | null | undefined;
+  percent?: number | null | undefined;
+}
+
+export function isAtOrAboveSoft(
+  usage: SoftThresholdUsage,
+  config: Pick<ShadowCompactConfig, "softCompactThresholdPercent" | "softCompactThresholdTokens">,
+): boolean {
+  if (
+    config.softCompactThresholdTokens !== undefined &&
+    usage.tokens !== undefined &&
+    usage.tokens !== null
+  ) {
+    return usage.tokens >= config.softCompactThresholdTokens;
+  }
+  return (
+    usage.percent !== undefined &&
+    usage.percent !== null &&
+    usage.percent >= config.softCompactThresholdPercent
+  );
+}
+
+export function isBelowSoft(
+  usage: SoftThresholdUsage,
+  config: Pick<ShadowCompactConfig, "softCompactThresholdPercent" | "softCompactThresholdTokens">,
+): boolean {
+  return !isAtOrAboveSoft(usage, config);
+}
+
 export function applyEnvOverrides(config: ShadowCompactConfig): ShadowCompactConfig {
   const soft = parseEnvThreshold(SOFT_THRESHOLD_ENV_VAR);
   const hard = parseEnvThreshold(HARD_THRESHOLD_ENV_VAR);
+  const softTokens = parseEnvTokenCount(SOFT_THRESHOLD_ABS_ENV_VAR);
   const targetTail = parseEnvThreshold(TARGET_TAIL_ENV_VAR);
+  const summarizerProvider = parseOptionalString(SUMMARIZER_PROVIDER_ENV_VAR);
+  const summarizerId = parseOptionalString(SUMMARIZER_ID_ENV_VAR);
+  if ((summarizerProvider !== undefined) !== (summarizerId !== undefined)) {
+    throw new Error(
+      `${SUMMARIZER_PROVIDER_ENV_VAR} and ${SUMMARIZER_ID_ENV_VAR} must both be set or both be unset`,
+    );
+  }
+  const summarizerThinking = parseEnvThinking(SUMMARIZER_THINKING_ENV_VAR);
   const merged: ShadowCompactConfig = {
     ...config,
     ...(soft !== undefined ? { softCompactThresholdPercent: soft } : {}),
     ...(hard !== undefined ? { hardCompactThresholdPercent: hard } : {}),
+    ...(softTokens !== undefined ? { softCompactThresholdTokens: softTokens } : {}),
     ...(targetTail !== undefined ? { targetTailPercent: targetTail } : {}),
+    ...(summarizerProvider !== undefined && summarizerId !== undefined
+      ? { summarizerModel: { provider: summarizerProvider, id: summarizerId } }
+      : {}),
+    ...(summarizerThinking !== undefined ? { thinkingLevel: summarizerThinking } : {}),
   };
   // File-only pairs keep their existing validation: an explicit file hard threshold
   // must exceed soft, while an implicit default hard may equal it. The merged

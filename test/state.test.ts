@@ -299,6 +299,67 @@ describe("ShadowCompactStateController", () => {
     assert.equal(controller.phase, "idle");
   });
 
+  it("tracks why a fallback is queued: failure is unconditional, hard-threshold is rechecked", () => {
+    const controller = new ShadowCompactStateController();
+    assert.equal(controller.pendingFallbackReason, undefined);
+
+    const failed = prepare(controller);
+    assert.equal(controller.fail(failed.generation), true);
+    assert.equal(controller.pendingNativeFallback, true);
+    assert.equal(controller.pendingFallbackReason, "failure");
+    controller.reset();
+    assert.equal(controller.pendingFallbackReason, undefined);
+
+    const preparing = prepare(controller);
+    assert.equal(controller.requestNativeFallback(), true);
+    assert.equal(preparing.controller.signal.aborted, true);
+    assert.equal(controller.pendingFallbackReason, "hard-threshold");
+    assert.equal(controller.clearPendingNativeFallback(), true);
+    assert.equal(controller.pendingFallbackReason, undefined);
+
+    // An explicit reason survives for the idle-point recheck to consume.
+    const second = prepare(controller);
+    assert.equal(controller.requestNativeFallback("failure"), true);
+    assert.equal(controller.pendingFallbackReason, "failure");
+    assert.equal(second.controller.signal.aborted, true);
+  });
+
+  it("counts served swaps per checkpoint and remembers the first swap turn", () => {
+    const controller = new ShadowCompactStateController();
+    assert.equal(controller.swapCount, 0);
+    assert.equal(controller.firstSwapTurn, undefined);
+
+    // Nothing serving: no count, no turn.
+    assert.equal(controller.markSwapped(3), false);
+    assert.equal(controller.swapCount, 0);
+    assert.equal(controller.firstSwapTurn, undefined);
+
+    const first = prepare(controller);
+    assert.equal(controller.publish(first.generation, prepared()), true);
+    assert.equal(controller.markSwapped(4), true);
+    assert.equal(controller.swapCount, 1);
+    assert.equal(controller.firstSwapTurn, 4);
+    // Later swaps keep counting but keep the first turn.
+    assert.equal(controller.markSwapped(5), false);
+    assert.equal(controller.markSwapped(6), false);
+    assert.equal(controller.swapCount, 3);
+    assert.equal(controller.firstSwapTurn, 4);
+
+    // A replacement checkpoint restarts exposure accounting.
+    const second = prepare(controller);
+    assert.ok(second);
+    assert.equal(controller.publish(second.generation, prepared()), true);
+    assert.equal(controller.swapCount, 0);
+    assert.equal(controller.firstSwapTurn, undefined);
+    assert.equal(controller.markSwapped(9), true);
+    assert.equal(controller.swapCount, 1);
+    assert.equal(controller.firstSwapTurn, 9);
+
+    assert.ok(controller.discardPublished());
+    assert.equal(controller.swapCount, 0);
+    assert.equal(controller.firstSwapTurn, undefined);
+  });
+
   it("reset aborts preparing, clears everything, bumps generation, and re-arms", () => {
     const controller = new ShadowCompactStateController();
     const preparing = prepare(controller);
