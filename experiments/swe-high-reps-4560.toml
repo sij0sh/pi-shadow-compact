@@ -1,9 +1,9 @@
 # fix.md section 3: replicate the threshold sweep under the frozen High recipe.
 #
-# Arms: Observe / 45k / 60k single-shot, repetitions = 3, so each
-# arm/task reaches ~4 usable trials with the existing High runs (swe-high-3,
-# swe-high-456). Purpose is estimating within-task cost distributions, not
-# grader significance: quality stays out of scope.
+# Arms: Observe / 45k / 60k single-shot, repetitions = 1 first (9 trials);
+# deepen reps only on the bracket that separates. Purpose is estimating
+# within-task cost distributions, not grader significance: quality stays
+# out of scope.
 #
 # 30k is deliberately absent: it is ruled out as a production candidate
 # (early plan-phase triggers, empty-snapshot churn, and the existing High
@@ -42,7 +42,7 @@ include = [
 exclude = []
 
 [execution]
-repetitions = 3
+repetitions = 1
 
 [concurrency]
 per_variant = 3
