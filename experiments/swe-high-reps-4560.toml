@@ -1,9 +1,13 @@
 # fix.md section 3: replicate the threshold sweep under the frozen High recipe.
 #
-# Arms: Observe / 30k / 45k / 60k single-shot, repetitions = 3, so each
+# Arms: Observe / 45k / 60k single-shot, repetitions = 3, so each
 # arm/task reaches ~4 usable trials with the existing High runs (swe-high-3,
 # swe-high-456). Purpose is estimating within-task cost distributions, not
 # grader significance: quality stays out of scope.
+#
+# 30k is deliberately absent: it is ruled out as a production candidate
+# (early plan-phase triggers, empty-snapshot churn, and the existing High
+# t30k trials already record its behavior). No new 30k reps are spent.
 #
 # Tasks: the three that reliably produce long High trajectories
 # (kcp 162x >=100k, vitest 192x, helm 111x on treated arms).
@@ -20,7 +24,7 @@
 #   export LITELLM_BASE_URL="https://bwf-ops-llm-js-001.services.ai.azure.com/openai"
 #   export SIM_USER_MODEL="openai/gpt-5.6-luna"
 schema_version = 2
-name = "swe-high-reps-304560"
+name = "swe-high-reps-4560"
 pi_version = "0.85.1"
 thinking = "high"
 
@@ -62,31 +66,6 @@ runtime_packages = ["typebox"]
 
 [variants.env]
 SHADOW_COMPACT_MODE = "observe"
-SHADOW_COMPACT_TRACE_STDERR = "1"
-
-[[variants]]
-id = "t30k"
-name = "High-thinking single-shot 30k"
-runtime_agent_install = true
-
-[[variants.extensions]]
-kind = "local"
-path = "/home/joshsimon/Projects/pi-extensions/pi-shadow-compact"
-entry = "src/index.ts"
-
-[[variants.extensions]]
-kind = "local"
-path = "/home/joshsimon/Projects/RoastMyHarness/extensions/ask-user"
-entry = "ask-user.ts"
-runtime_packages = ["typebox"]
-
-[variants.env]
-SHADOW_COMPACT_SOFT_THRESHOLD_ABS = "30000"
-SHADOW_COMPACT_TARGET_TAIL_PERCENT = "2"
-SHADOW_COMPACT_HARD_THRESHOLD_PERCENT = "80"
-SHADOW_COMPACT_ROLLING = "0"
-SHADOW_COMPACT_SUMMARIZER_THINKING = "high"
-SHADOW_COMPACT_ACTION_FIRST = "0"
 SHADOW_COMPACT_TRACE_STDERR = "1"
 
 [[variants]]
