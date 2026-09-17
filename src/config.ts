@@ -35,6 +35,15 @@ export const MODE_ENV_VAR = "SHADOW_COMPACT_MODE";
 export const SUMMARIZER_PROVIDER_ENV_VAR = "SHADOW_COMPACT_SUMMARIZER_PROVIDER";
 export const SUMMARIZER_ID_ENV_VAR = "SHADOW_COMPACT_SUMMARIZER_ID";
 export const SUMMARIZER_THINKING_ENV_VAR = "SHADOW_COMPACT_SUMMARIZER_THINKING";
+/**
+ * Benchmark-only verifier overrides (all default-off). Same split-var shape
+ * as the summarizer knobs: provider and ID are separate because IDs can
+ * contain `/` or `:`. When the pair is unset the verifier reuses the
+ * summarizer model; thinking falls back to `thinkingLevel` when unset.
+ */
+export const VERIFIER_PROVIDER_ENV_VAR = "SHADOW_COMPACT_VERIFIER_PROVIDER";
+export const VERIFIER_ID_ENV_VAR = "SHADOW_COMPACT_VERIFIER_ID";
+export const VERIFIER_THINKING_ENV_VAR = "SHADOW_COMPACT_VERIFIER_THINKING";
 
 /**
  * Rolling refresh lets an already-published checkpoint be replaced while it
@@ -42,11 +51,20 @@ export const SUMMARIZER_THINKING_ENV_VAR = "SHADOW_COMPACT_SUMMARIZER_THINKING";
  * useful mid-run summary per session), which is the control condition for
  * Control-vs-Single-vs-Rolling experiments.
  */
+/**
+ * Shared env-flag reader: trimmed lowercase value, or undefined when
+ * unset/blank. Callers keep their own truth tables (opt-out vs opt-in
+ * flags differ by design); only the read-and-normalize step is shared.
+ */
+export function readEnvFlag(name: string): string | undefined {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return undefined;
+  return raw.trim().toLowerCase();
+}
+
 export function isRollingEnabled(): boolean {
-  const raw = process.env[ROLLING_ENV_VAR];
-  if (raw === undefined) return true;
-  const value = raw.trim().toLowerCase();
-  if (value === "") return true;
+  const value = readEnvFlag(ROLLING_ENV_VAR);
+  if (value === undefined) return true;
   return value !== "0" && value !== "false" && value !== "no" && value !== "off";
 }
 
@@ -56,9 +74,7 @@ export function isRollingEnabled(): boolean {
  * Gives context-AUC a control baseline without perturbing the working set.
  */
 export function isObserveMode(): boolean {
-  const raw = process.env[MODE_ENV_VAR];
-  if (raw === undefined) return false;
-  return raw.trim().toLowerCase() === "observe";
+  return readEnvFlag(MODE_ENV_VAR) === "observe";
 }
 
 /**
@@ -102,6 +118,17 @@ export interface ShadowCompactConfig {
   summaryMaxTokens?: number;
   summarizerContextTokens?: number;
   thinkingLevel?: ModelThinkingLevel;
+  /**
+   * Second-pass verification model (verifier.md). Optional so existing
+   * configs keep loading unchanged: when absent or blank the verifier
+   * reuses the resolved summarizer model.
+   */
+  verificationModel?: {
+    provider: string;
+    id: string;
+  };
+  /** Verifier reasoning level; falls back to `thinkingLevel` when unset. */
+  verificationThinkingLevel?: ModelThinkingLevel;
 }
 
 export function defaultConfig(): ShadowCompactConfig {
@@ -130,43 +157,50 @@ export async function loadConfig(ctx: ExtensionContext): Promise<ShadowCompactCo
   return applyEnvOverrides(config);
 }
 
-function parseEnvThreshold(name: string): number | undefined {
+/**
+ * Trimmed raw env value, or undefined when unset/blank. All env parsers
+ * share this so empty-vs-missing handling cannot drift between knobs.
+ */
+function rawEnv(name: string): { trimmed: string; raw: string } | undefined {
   const raw = process.env[name];
   if (raw === undefined || raw.trim() === "") return undefined;
-  const value = Number(raw.trim());
+  return { trimmed: raw.trim(), raw };
+}
+
+function parseEnvThreshold(name: string): number | undefined {
+  const env = rawEnv(name);
+  if (env === undefined) return undefined;
+  const value = Number(env.trimmed);
   if (!Number.isFinite(value)) {
-    throw new Error(`${name} must be a number between 1 and 99, got ${JSON.stringify(raw)}`);
+    throw new Error(`${name} must be a number between 1 and 99, got ${JSON.stringify(env.raw)}`);
   }
   if (value < 1 || value > 99) {
-    throw new Error(`${name} must be between 1 and 99, got ${JSON.stringify(raw)}`);
+    throw new Error(`${name} must be between 1 and 99, got ${JSON.stringify(env.raw)}`);
   }
   return value;
 }
 
 function parseEnvTokenCount(name: string): number | undefined {
-  const raw = process.env[name];
-  if (raw === undefined || raw.trim() === "") return undefined;
-  const value = Number(raw.trim());
+  const env = rawEnv(name);
+  if (env === undefined) return undefined;
+  const value = Number(env.trimmed);
   if (!Number.isInteger(value) || value < 1) {
-    throw new Error(`${name} must be a positive integer token count, got ${JSON.stringify(raw)}`);
+    throw new Error(`${name} must be a positive integer token count, got ${JSON.stringify(env.raw)}`);
   }
   return value;
 }
 
 function parseOptionalString(name: string): string | undefined {
-  const raw = process.env[name];
-  if (raw === undefined || raw.trim() === "") return undefined;
-  return raw.trim();
+  return rawEnv(name)?.trimmed;
 }
 
 function parseEnvThinking(name: string): ModelThinkingLevel | undefined {
-  const raw = process.env[name];
-  if (raw === undefined || raw.trim() === "") return undefined;
-  const value = raw.trim();
-  if (!THINKING_LEVELS.includes(value as ModelThinkingLevel)) {
-    throw new Error(`${name} must be one of: ${THINKING_LEVELS.join(", ")}, got ${JSON.stringify(raw)}`);
+  const env = rawEnv(name);
+  if (env === undefined) return undefined;
+  if (!THINKING_LEVELS.includes(env.trimmed as ModelThinkingLevel)) {
+    throw new Error(`${name} must be one of: ${THINKING_LEVELS.join(", ")}, got ${JSON.stringify(env.raw)}`);
   }
-  return value as ModelThinkingLevel;
+  return env.trimmed as ModelThinkingLevel;
 }
 
 /**
@@ -205,6 +239,17 @@ export function isBelowSoft(
   return !isAtOrAboveSoft(usage, config);
 }
 
+function assertEnvPair(
+  first: string | undefined,
+  firstVar: string,
+  second: string | undefined,
+  secondVar: string,
+): void {
+  if ((first !== undefined) !== (second !== undefined)) {
+    throw new Error(`${firstVar} and ${secondVar} must both be set or both be unset`);
+  }
+}
+
 export function applyEnvOverrides(config: ShadowCompactConfig): ShadowCompactConfig {
   const soft = parseEnvThreshold(SOFT_THRESHOLD_ENV_VAR);
   const hard = parseEnvThreshold(HARD_THRESHOLD_ENV_VAR);
@@ -212,12 +257,12 @@ export function applyEnvOverrides(config: ShadowCompactConfig): ShadowCompactCon
   const targetTail = parseEnvThreshold(TARGET_TAIL_ENV_VAR);
   const summarizerProvider = parseOptionalString(SUMMARIZER_PROVIDER_ENV_VAR);
   const summarizerId = parseOptionalString(SUMMARIZER_ID_ENV_VAR);
-  if ((summarizerProvider !== undefined) !== (summarizerId !== undefined)) {
-    throw new Error(
-      `${SUMMARIZER_PROVIDER_ENV_VAR} and ${SUMMARIZER_ID_ENV_VAR} must both be set or both be unset`,
-    );
-  }
+  assertEnvPair(summarizerProvider, SUMMARIZER_PROVIDER_ENV_VAR, summarizerId, SUMMARIZER_ID_ENV_VAR);
   const summarizerThinking = parseEnvThinking(SUMMARIZER_THINKING_ENV_VAR);
+  const verifierProvider = parseOptionalString(VERIFIER_PROVIDER_ENV_VAR);
+  const verifierId = parseOptionalString(VERIFIER_ID_ENV_VAR);
+  assertEnvPair(verifierProvider, VERIFIER_PROVIDER_ENV_VAR, verifierId, VERIFIER_ID_ENV_VAR);
+  const verifierThinking = parseEnvThinking(VERIFIER_THINKING_ENV_VAR);
   const merged: ShadowCompactConfig = {
     ...config,
     ...(soft !== undefined ? { softCompactThresholdPercent: soft } : {}),
@@ -228,6 +273,10 @@ export function applyEnvOverrides(config: ShadowCompactConfig): ShadowCompactCon
       ? { summarizerModel: { provider: summarizerProvider, id: summarizerId } }
       : {}),
     ...(summarizerThinking !== undefined ? { thinkingLevel: summarizerThinking } : {}),
+    ...(verifierProvider !== undefined && verifierId !== undefined
+      ? { verificationModel: { provider: verifierProvider, id: verifierId } }
+      : {}),
+    ...(verifierThinking !== undefined ? { verificationThinkingLevel: verifierThinking } : {}),
   };
   // File-only pairs keep their existing validation: an explicit file hard threshold
   // must exceed soft, while an implicit default hard may equal it. The merged
@@ -254,6 +303,60 @@ async function readOptional(path: string): Promise<string | undefined> {
   }
 }
 
+function assertKnownKeys(
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+  path: string,
+  scope: string,
+): void {
+  for (const key of Object.keys(value)) {
+    if (!allowed.includes(key)) {
+      throw new Error(scope ? `${path} ${scope} has unknown key: ${key}` : `${path} has unknown key: ${key}`);
+    }
+  }
+}
+
+interface ModelPair {
+  provider: string;
+  id: string;
+}
+
+function parseModelPair(value: unknown, path: string, key: string): ModelPair {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${path} ${key} must be an object`);
+  }
+  const record = value as Record<string, unknown>;
+  assertKnownKeys(record, ["provider", "id"], path, key);
+  const provider = typeof record.provider === "string" ? record.provider.trim() : "";
+  const id = typeof record.id === "string" ? record.id.trim() : "";
+  if (record.provider !== undefined && typeof record.provider !== "string") {
+    throw new Error(`${path} ${key}.provider must be a string`);
+  }
+  if (record.id !== undefined && typeof record.id !== "string") {
+    throw new Error(`${path} ${key}.id must be a string`);
+  }
+  if ((provider.length > 0) !== (id.length > 0)) {
+    throw new Error(`${path} ${key}.provider and .id must both be blank or both be set`);
+  }
+  return { provider, id };
+}
+
+function parsePositiveInt(value: unknown, path: string, key: string): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+    throw new Error(`${path} ${key} must be a positive integer`);
+  }
+  return value;
+}
+
+function parseThinkingLevel(value: unknown, path: string, key: string): ModelThinkingLevel | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !THINKING_LEVELS.includes(value as ModelThinkingLevel)) {
+    throw new Error(`${path} ${key} must be one of: ${THINKING_LEVELS.join(", ")}`);
+  }
+  return value as ModelThinkingLevel;
+}
+
 export function parseConfig(source: string, path: string): ShadowCompactConfig {
   let value: unknown;
   try {
@@ -265,18 +368,21 @@ export function parseConfig(source: string, path: string): ShadowCompactConfig {
     throw new Error(`${path} must contain a JSON object`);
   }
   const record = value as Record<string, unknown>;
-  for (const key of Object.keys(record)) {
-    if (
-      key !== "softCompactThresholdPercent" &&
-      key !== "hardCompactThresholdPercent" &&
-      key !== "summarizerModel" &&
-      key !== "summaryMaxTokens" &&
-      key !== "summarizerContextTokens" &&
-      key !== "thinkingLevel"
-    ) {
-      throw new Error(`${path} has unknown key: ${key}`);
-    }
-  }
+  assertKnownKeys(
+    record,
+    [
+      "softCompactThresholdPercent",
+      "hardCompactThresholdPercent",
+      "summarizerModel",
+      "summaryMaxTokens",
+      "summarizerContextTokens",
+      "thinkingLevel",
+      "verificationModel",
+      "verificationThinkingLevel",
+    ],
+    path,
+    "",
+  );
 
   const rawThreshold = record.softCompactThresholdPercent;
   if (typeof rawThreshold !== "number" || !Number.isFinite(rawThreshold)) {
@@ -286,27 +392,7 @@ export function parseConfig(source: string, path: string): ShadowCompactConfig {
     throw new Error(`${path} softCompactThresholdPercent must be between 1 and 99`);
   }
 
-  const rawModel = record.summarizerModel;
-  if (!rawModel || typeof rawModel !== "object" || Array.isArray(rawModel)) {
-    throw new Error(`${path} summarizerModel must be an object`);
-  }
-  const model = rawModel as Record<string, unknown>;
-  for (const key of Object.keys(model)) {
-    if (key !== "provider" && key !== "id") {
-      throw new Error(`${path} summarizerModel has unknown key: ${key}`);
-    }
-  }
-  const provider = typeof model.provider === "string" ? model.provider.trim() : "";
-  const id = typeof model.id === "string" ? model.id.trim() : "";
-  if (model.provider !== undefined && typeof model.provider !== "string") {
-    throw new Error(`${path} summarizerModel.provider must be a string`);
-  }
-  if (model.id !== undefined && typeof model.id !== "string") {
-    throw new Error(`${path} summarizerModel.id must be a string`);
-  }
-  if ((provider.length > 0) !== (id.length > 0)) {
-    throw new Error(`${path} summarizerModel.provider and .id must both be blank or both be set`);
-  }
+  const { provider, id } = parseModelPair(record.summarizerModel, path, "summarizerModel");
 
   const config: ShadowCompactConfig = {
     softCompactThresholdPercent: rawThreshold,
@@ -330,35 +416,26 @@ export function parseConfig(source: string, path: string): ShadowCompactConfig {
     config.hardCompactThresholdPercent = rawHardThreshold;
   }
 
-  const rawMaxTokens = record.summaryMaxTokens;
-  if (rawMaxTokens !== undefined) {
-    if (typeof rawMaxTokens !== "number" || !Number.isInteger(rawMaxTokens) || rawMaxTokens < 1) {
-      throw new Error(`${path} summaryMaxTokens must be a positive integer`);
-    }
-    config.summaryMaxTokens = rawMaxTokens;
+  const maxTokens = parsePositiveInt(record.summaryMaxTokens, path, "summaryMaxTokens");
+  if (maxTokens !== undefined) config.summaryMaxTokens = maxTokens;
+
+  const contextTokens = parsePositiveInt(record.summarizerContextTokens, path, "summarizerContextTokens");
+  if (contextTokens !== undefined) config.summarizerContextTokens = contextTokens;
+
+  const thinkingLevel = parseThinkingLevel(record.thinkingLevel, path, "thinkingLevel");
+  if (thinkingLevel !== undefined) config.thinkingLevel = thinkingLevel;
+
+  if (record.verificationModel !== undefined) {
+    config.verificationModel = parseModelPair(record.verificationModel, path, "verificationModel");
   }
 
-  const rawContextTokens = record.summarizerContextTokens;
-  if (rawContextTokens !== undefined) {
-    if (
-      typeof rawContextTokens !== "number" ||
-      !Number.isInteger(rawContextTokens) ||
-      rawContextTokens < 1
-    ) {
-      throw new Error(`${path} summarizerContextTokens must be a positive integer`);
-    }
-    config.summarizerContextTokens = rawContextTokens;
-  }
-
-  const rawThinkingLevel = record.thinkingLevel;
-  if (rawThinkingLevel !== undefined) {
-    if (
-      typeof rawThinkingLevel !== "string" ||
-      !THINKING_LEVELS.includes(rawThinkingLevel as ModelThinkingLevel)
-    ) {
-      throw new Error(`${path} thinkingLevel must be one of: ${THINKING_LEVELS.join(", ")}`);
-    }
-    config.thinkingLevel = rawThinkingLevel as ModelThinkingLevel;
+  const verificationThinkingLevel = parseThinkingLevel(
+    record.verificationThinkingLevel,
+    path,
+    "verificationThinkingLevel",
+  );
+  if (verificationThinkingLevel !== undefined) {
+    config.verificationThinkingLevel = verificationThinkingLevel;
   }
 
   return config;

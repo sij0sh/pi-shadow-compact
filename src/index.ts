@@ -29,9 +29,12 @@ import { contextSwapDropCount } from "./swap.js";
 import { ShadowCompactStateController, type PreparedResult } from "./state.js";
 import {
   SUMMARY_MAX_TOKENS,
+  combineUsage,
   isActionFirstEnabled,
   resolveSummarizerModel,
+  resolveVerificationModel,
   runSummaryAgent,
+  runVerificationAgent,
 } from "./summary.js";
 import { traceEvent } from "./trace.js";
 import { randomUUID } from "node:crypto";
@@ -337,6 +340,24 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       if (bailIfStale()) return;
       const summaryWallMs = Date.now() - startedWallMs;
 
+      // Second-pass verification gate: the draft is audited against the same
+      // evidence packet before anything is published. A verifier failure
+      // throws into the shared catch below, which fails closed (keeps the
+      // serving checkpoint, or queues one native fallback with nothing
+      // serving) instead of publishing an untrusted checkpoint.
+      const verifierModel = resolveVerificationModel(ctx, config);
+      const verifierThinking = config.verificationThinkingLevel ?? config.thinkingLevel;
+      const verifierStartedWallMs = Date.now();
+      const verified = await runVerificationAgent(ctx, packet, outcome.checkpoint, config, {
+        signal: controller.signal,
+        model: verifierModel,
+        maxTokens,
+        ...(verifierThinking ? { thinkingLevel: verifierThinking } : {}),
+      });
+      if (bailIfStale()) return;
+      const verifierWallMs = Date.now() - verifierStartedWallMs;
+      const usage = combineUsage(outcome.usage, verified.usage);
+
       const current = ctx.sessionManager.getBranch();
       const result: PreparedResult = {
         checkpointId: randomUUID(),
@@ -344,8 +365,8 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         leafId: ctx.sessionManager.getLeafId() ?? (current[current.length - 1]?.id ?? ""),
         latestCompactionId: snapshot.latestCompactionId,
         firstKeptEntryId: snapshot.firstKeptEntryId,
-        summary: outcome.summary,
-        usage: outcome.usage,
+        summary: verified.summary,
+        usage,
         details: {
           readFiles: snapshot.readFiles,
           modifiedFiles: snapshot.modifiedFiles,
@@ -355,13 +376,20 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       traceEvent("prepare_completed", {
         turn: turnCount,
         generation,
-        summaryChars: outcome.summary.length,
+        summaryChars: verified.summary.length,
         summaryInput: outcome.usage.input,
         summaryOutput: outcome.usage.output,
         summaryCacheRead: outcome.usage.cacheRead,
         summaryCacheWrite: outcome.usage.cacheWrite,
         summaryModel: `${model.provider}/${model.id}`,
         summaryThinking: config.thinkingLevel ?? null,
+        verifierInput: verified.usage.input,
+        verifierOutput: verified.usage.output,
+        verifierCacheRead: verified.usage.cacheRead,
+        verifierCacheWrite: verified.usage.cacheWrite,
+        verifierModel: `${verifierModel.provider}/${verifierModel.id}`,
+        verifierThinking: verifierThinking ?? null,
+        verifierWallMs,
         renderOrder: isActionFirstEnabled() ? "action-first" : "legacy",
         summaryWallMs,
         packetChars,
@@ -682,14 +710,15 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     return;
   });
 
-  pi.on("session_compact", (event) => {
+  // Native compaction (or its failure) observed after the fact carries no
+  // usable checkpoint either way: clear any in-flight fallback marker, and
+  // drop the serving checkpoint only when the compaction came from us.
+  const handleNativeCompactEvent = (event: { fromExtension: boolean }): void => {
     nativeFallbackInFlight = false;
     if (event.fromExtension) state.reset();
-  });
-  pi.on("session_compact_failed", (event) => {
-    nativeFallbackInFlight = false;
-    if (event.fromExtension) state.reset();
-  });
+  };
+  pi.on("session_compact", handleNativeCompactEvent);
+  pi.on("session_compact_failed", handleNativeCompactEvent);
   pi.on("session_tree", () => {
     nativeFallbackInFlight = false;
     state.reset();

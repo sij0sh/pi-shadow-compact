@@ -35,9 +35,9 @@ export const USAGE: Usage = {
 };
 const TIMESTAMP = "2026-01-01T00:00:00.000Z";
 
-function checkpointJson(evidenceId: string): string {
+function checkpointJson(evidenceId: string, objective = "Prepared continuation checkpoint"): string {
   return JSON.stringify({
-    objective: [{ text: "Prepared continuation checkpoint", evidenceRefs: [evidenceId] }],
+    objective: [{ text: objective, evidenceRefs: [evidenceId] }],
     constraints: [],
     completedWork: [],
     currentState: [],
@@ -63,7 +63,17 @@ function promptText(context: Context): string {
 export class FakeRegistry {
   calls = 0;
   settled = 0;
-  mode: "ok" | "error" = "ok";
+  /**
+   * - "ok": every completion returns a valid checkpoint.
+   * - "error": every completion fails (the draft never completes).
+   * - "verifier-error": the draft succeeds but verifier completions fail.
+   * - "verifier-invalid": the draft succeeds but verifier completions return
+   *   invalid JSON (both the attempt and its one retry).
+   * - "verifier-rewrite": the draft succeeds and the verifier returns a
+   *   differently worded valid checkpoint, proving publication uses the
+   *   verified text.
+   */
+  mode: "ok" | "error" | "verifier-error" | "verifier-invalid" | "verifier-rewrite" = "ok";
   readonly pendingGates: Promise<void>[] = [];
   readonly prompts: string[] = [];
   readonly models: Model<Api>[] = [];
@@ -97,7 +107,10 @@ export class FakeRegistry {
     this.prompts.push(promptText(context));
     if (this.pendingGates.length > 0) await this.pendingGates.shift();
     this.settled++;
-    if (this.mode === "error") {
+    // Draft and verifier completions are distinguished by prompt content, not
+    // call index: retries and rolling refreshes interleave both kinds.
+    const isVerifierCall = (this.prompts.at(-1) ?? "").includes("Audit this draft");
+    if (this.mode === "error" || (this.mode === "verifier-error" && isVerifierCall)) {
       return {
         role: "assistant",
         content: [],
@@ -111,9 +124,25 @@ export class FakeRegistry {
     }
     const evidenceId = this.prompts.at(-1)?.match(/"evidenceId":"([^"]+)"/)?.[1];
     assert.ok(evidenceId, "summary prompt must contain normalized evidence");
+    if (this.mode === "verifier-invalid" && isVerifierCall) {
+      return {
+        role: "assistant",
+        content: [{ type: "text", text: "{not valid checkpoint json" }],
+        api: model.api,
+        provider: model.provider,
+        model: model.id,
+        usage: USAGE,
+        stopReason: "stop",
+        timestamp: Date.now(),
+      } as AssistantMessage;
+    }
+    const objective =
+      this.mode === "verifier-rewrite" && isVerifierCall
+        ? "Verified continuation checkpoint"
+        : "Prepared continuation checkpoint";
     return {
       role: "assistant",
-      content: [{ type: "text", text: checkpointJson(evidenceId) }],
+      content: [{ type: "text", text: checkpointJson(evidenceId, objective) }],
       api: model.api,
       provider: model.provider,
       model: model.id,

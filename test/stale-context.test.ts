@@ -38,7 +38,7 @@ describe("stale context after session replacement", () => {
     const f = await fixture();
     try {
       await f.emit("turn_end");
-      await waitFor(() => f.registry.settled === 1);
+      await waitFor(() => f.registry.settled === 2);
       await tick();
 
       // The idle point races teardown: the append throws, nothing crashes.

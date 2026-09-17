@@ -94,7 +94,7 @@ describe("trace lifecycle flow", () => {
       const f = await fixture();
       try {
         await f.emit("turn_end");
-        await waitFor(() => f.registry.settled >= 1);
+        await waitFor(() => f.registry.settled >= 2);
         await tick();
         await f.emit("context", { messages: f.contextMessages() });
         await f.emit("agent_settled");
@@ -132,6 +132,13 @@ describe("trace lifecycle flow", () => {
       "summaryCacheWrite",
       "summaryModel",
       "summaryThinking",
+      "verifierInput",
+      "verifierOutput",
+      "verifierCacheRead",
+      "verifierCacheWrite",
+      "verifierModel",
+      "verifierThinking",
+      "verifierWallMs",
       "summaryWallMs",
       "packetChars",
       "sourceEntries",
@@ -205,7 +212,7 @@ describe("trace lifecycle flow", () => {
       const f = await fixture();
       try {
         await f.emit("turn_end");
-        await waitFor(() => f.registry.settled >= 1);
+        await waitFor(() => f.registry.settled >= 2);
         await tick();
         await f.emit("context", { messages: f.contextMessages() });
         await f.emit("turn_end");

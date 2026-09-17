@@ -14,10 +14,10 @@ const READY_MESSAGE = "shadow-compact: summary ready - swaps in at the next turn
 const DEFERRED_MESSAGE =
   "shadow-compact: summary still preparing - swap deferred until the agent is idle";
 
-/** Runs turn_end at the 60% threshold and waits for the background summary to finish. */
+/** Runs turn_end at the 60% threshold and waits for draft + verification to finish. */
 async function startPreparation(f: ReturnType<typeof fixture> extends Promise<infer T> ? T : never): Promise<void> {
   await f.emit("turn_end");
-  await waitFor(() => f.registry.settled >= 1);
+  await waitFor(() => f.registry.settled >= 2);
 }
 
 describe("idle swap, hard hatch, and terminal empty-snapshot failure", () => {
@@ -28,7 +28,7 @@ describe("idle swap, hard hatch, and terminal empty-snapshot failure", () => {
       f.gate();
       await f.emit("turn_end");
       f.release();
-      await waitFor(() => f.registry.settled === 1);
+      await waitFor(() => f.registry.settled === 2);
       await tick();
       assert.deepEqual(f.notifications, [READY_MESSAGE]);
 
@@ -90,7 +90,7 @@ describe("idle swap, hard hatch, and terminal empty-snapshot failure", () => {
       assert.deepEqual(f.notifications, [DEFERRED_MESSAGE, DEFERRED_MESSAGE]);
 
       f.release();
-      await waitFor(() => f.registry.settled === 1);
+      await waitFor(() => f.registry.settled === 2);
       await tick();
       assert.equal(f.compactCalls.length, 0);
       assert.equal(f.appendedEntries.length, 1);
@@ -118,8 +118,9 @@ describe("idle swap, hard hatch, and terminal empty-snapshot failure", () => {
       assert.deepEqual(f.compactCalls, [{}]);
 
       // The aborted completion stays inert; the fallback is not scheduled twice.
+      // Draft and verifier settle in one drain, so the wait is >=, not exact.
       f.release();
-      await waitFor(() => f.registry.settled === 1);
+      await waitFor(() => f.registry.settled >= 2);
       await tick();
       await f.emit("agent_settled");
       assert.equal(f.compactCalls.length, 1);
@@ -152,7 +153,7 @@ describe("idle swap, hard hatch, and terminal empty-snapshot failure", () => {
     try {
       below.setPercent(79);
       await below.emit("turn_end");
-      await waitFor(() => below.registry.settled === 1);
+      await waitFor(() => below.registry.settled === 2);
       assert.equal(below.compactCalls.length, 0, "79% only triggers the soft prepare");
     } finally {
       await below.cleanup();

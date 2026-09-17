@@ -12,6 +12,7 @@ import {
   type Fixture,
 } from "./helpers/index-fixture.js";
 import { CHECKPOINT_CUSTOM_TYPE } from "../src/persist.js";
+import { combineUsage } from "../src/summary.js";
 
 const READY_MESSAGE = "shadow-compact: summary ready - swaps in at the next turn";
 const DEFERRED_MESSAGE =
@@ -66,10 +67,10 @@ it("summarizerContextTokens overrides the packet budget independently of models.
   }
 });
 
-/** Runs turn_end at the 60% threshold and waits for the background summary to finish. */
+/** Runs turn_end at the 60% threshold and waits for draft + verification to finish. */
 async function startPreparation(f: Fixture): Promise<void> {
   await f.emit("turn_end");
-  await waitFor(() => f.registry.settled >= 1);
+  await waitFor(() => f.registry.settled >= 2);
 }
 
 describe("shadowCompact extension orchestration", () => {
@@ -98,7 +99,7 @@ describe("shadowCompact extension orchestration", () => {
       assert.equal(f.registry.settled, 0);
       assert.ok(f.registry.prompts[0]?.includes("untrusted transcript data"));
       f.release();
-      await waitFor(() => f.registry.settled === 1);
+      await waitFor(() => f.registry.settled === 2);
       await f.emit("agent_settled");
       assert.equal(f.compactCalls.length, 0);
       assert.equal(f.appendedEntries.length, 1);
@@ -117,7 +118,7 @@ describe("shadowCompact extension orchestration", () => {
       assert.equal(f.registry.calls, 1);
       assert.equal(f.compactCalls.length, 0);
       f.release();
-      await waitFor(() => f.registry.settled === 1);
+      await waitFor(() => f.registry.settled === 2);
       await f.emit("agent_settled");
       assert.equal(f.compactCalls.length, 0);
       assert.equal(f.appendedEntries.length, 1);
@@ -147,12 +148,12 @@ describe("shadowCompact extension orchestration", () => {
         "session_before_compact",
         f.compactEvent({ reason: "threshold", firstKeptEntryId: "e4" }),
       );
-      assert.equal(f.registry.settled, 1);
+      assert.equal(f.registry.settled, 2);
       assert.ok(outcome?.compaction);
       assert.match(outcome.compaction.summary, /Prepared continuation checkpoint/);
       assert.equal(outcome.compaction.firstKeptEntryId, "e4");
       assert.equal(outcome.compaction.tokensBefore, 777);
-      assert.deepEqual(outcome.compaction.usage, USAGE);
+      assert.deepEqual(outcome.compaction.usage, combineUsage(USAGE, USAGE));
       assert.deepEqual(outcome.compaction.details, {
         readFiles: ["src/read.ts"],
         modifiedFiles: ["src/edited.ts"],
@@ -211,7 +212,7 @@ describe("shadowCompact extension orchestration", () => {
       );
       assert.ok(match?.compaction);
       assert.match(match.compaction.summary, /Prepared continuation checkpoint/);
-      assert.equal(f.registry.settled, 1);
+      assert.equal(f.registry.settled, 2);
       assert.equal(f.compactCalls.length, 0);
 
       const mismatch = await f.emit(
@@ -219,14 +220,14 @@ describe("shadowCompact extension orchestration", () => {
         f.compactEvent({ reason: "threshold", firstKeptEntryId: "e1" }),
       );
       assert.equal(mismatch, undefined);
-      assert.equal(f.registry.settled, 1);
+      assert.equal(f.registry.settled, 2);
 
       const again = await f.emit(
         "session_before_compact",
         f.compactEvent({ reason: "threshold", firstKeptEntryId: "e4" }),
       );
       assert.ok(again?.compaction);
-      assert.equal(f.registry.settled, 1);
+      assert.equal(f.registry.settled, 2);
     } finally {
       await f.cleanup();
     }
@@ -251,7 +252,7 @@ describe("shadowCompact extension orchestration", () => {
         f.compactEvent({ reason: "manual" }),
       );
       assert.equal(manualWhilePreparing, undefined);
-      assert.ok(f.registry.signals[1]?.aborted);
+      assert.ok(f.registry.signals.at(-1)?.aborted);
       f.release();
       await waitFor(() => f.registry.settled === 2);
       await tick();
@@ -279,15 +280,17 @@ describe("shadowCompact extension orchestration", () => {
       assert.ok(!f.registry.signals[1]?.aborted);
 
       // The stale completion resolves past its abort and must not touch prepare #2.
+      // Draft and verifier settle in one drain, so intermediate counts are
+      // waited with >= : only the terminal counts are exact.
       f.release();
-      await waitFor(() => f.registry.settled === 1);
+      await waitFor(() => f.registry.settled >= 2);
       await tick();
       assert.ok(!f.registry.signals[1]?.aborted);
       assert.equal(f.compactCalls.length, 0);
       assert.deepEqual(f.notifications, []);
 
       f.release();
-      await waitFor(() => f.registry.settled === 2);
+      await waitFor(() => f.registry.settled >= 4);
       await tick();
       await f.emit("agent_settled");
       assert.equal(f.compactCalls.length, 0);
@@ -304,7 +307,9 @@ describe("shadowCompact extension orchestration", () => {
       await f.emit("turn_end");
       f.appendCompaction();
       f.release();
-      await waitFor(() => f.registry.settled === 1);
+      // Draft completes, then the verifier completes; the branch moved on, so
+      // the verified candidate is discarded as stale.
+      await waitFor(() => f.registry.settled === 2);
       await tick();
       assert.equal(f.compactCalls.length, 0);
       assert.deepEqual(f.notifications, []);
@@ -347,8 +352,9 @@ describe("shadowCompact extension orchestration", () => {
         }),
       );
       await f.emit("turn_end");
-      await waitFor(() => f.registry.settled === 1);
-      assert.equal(f.registry.calls, 1);
+      await waitFor(() => f.registry.settled >= 2);
+      await tick();
+      assert.equal(f.registry.calls, 2);
       // Config error toast, recovery toast, then the ready announcement.
       assert.deepEqual(f.notifications, [
         `shadow-compact: ${join(f.agentDir, "shadow-compact.json")} is not valid JSON`,
@@ -378,6 +384,90 @@ describe("shadowCompact extension orchestration", () => {
       await f.emit("agent_settled");
       assert.equal(f.compactCalls.length, 1);
       assert.deepEqual(f.compactCalls[0], {});
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it("publishes the verified checkpoint text, not the draft", async () => {
+    const f = await fixture();
+    try {
+      f.registry.mode = "verifier-rewrite";
+      await startPreparation(f);
+      await tick();
+
+      const swapped = (await f.emit("context", { messages: f.contextMessages() })) as {
+        messages: Array<{ summary?: unknown }>;
+      };
+      assert.match(String(swapped.messages[0]?.summary), /Verified continuation checkpoint/);
+      assert.doesNotMatch(String(swapped.messages[0]?.summary), /Prepared continuation checkpoint/);
+
+      await f.emit("agent_settled");
+      assert.equal(f.appendedEntries.length, 1);
+      const data = f.appendedEntries[0]?.data as { summary: string };
+      assert.match(data.summary, /Verified continuation checkpoint/);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it("fails closed with one native fallback when verification errors and nothing serves", async () => {
+    const f = await fixture();
+    try {
+      f.registry.mode = "verifier-error";
+      await f.emit("turn_end");
+      await waitFor(() => f.registry.settled >= 2);
+      await tick();
+      assert.equal(f.registry.calls, 2);
+      assert.deepEqual(f.notifications, ["shadow-compact: Verification model stopped with error"]);
+      assert.equal(f.compactCalls.length, 0);
+      assert.equal(f.appendedEntries.length, 0);
+      // A queued fallback owns the next idle point: no new preparation on top of it.
+      await f.emit("turn_end");
+      await tick();
+      assert.equal(f.registry.calls, 2);
+      await f.emit("agent_settled");
+      assert.equal(f.compactCalls.length, 1);
+      assert.deepEqual(f.compactCalls[0], {});
+      assert.equal(f.appendedEntries.length, 0);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it("a failed verification keeps the serving checkpoint and schedules no fallback", async () => {
+    const f = await fixture();
+    try {
+      await startPreparation(f);
+      await tick();
+      assert.ok(await f.emit("context", { messages: f.contextMessages() }), "A serves");
+
+      // Below soft re-arms after the observed swap + shrink; B then fails closed.
+      f.setPercent(30);
+      await f.emit("turn_end");
+      f.setPercent(65);
+      f.registry.mode = "verifier-error";
+      await f.emit("turn_end");
+      await waitFor(() => f.registry.settled >= 4);
+      await tick();
+      f.registry.mode = "ok";
+      assert.deepEqual(f.notifications.at(-1), "shadow-compact: Verification model stopped with error");
+
+      // A keeps serving; no native fallback is queued for a failed replacement.
+      assert.ok(
+        await f.emit("context", { messages: f.contextMessages() }),
+        "A continues serving after B fails verification",
+      );
+      await f.emit("agent_settled");
+      assert.equal(f.compactCalls.length, 0);
+      assert.equal(f.appendedEntries.length, 1);
+
+      // The failure must not manufacture a threshold crossing: still above
+      // soft with no new swap + shrink, so the next crossing is suppressed.
+      f.setPercent(66);
+      await f.emit("turn_end");
+      await tick();
+      assert.equal(f.registry.calls, 4, "no immediate retry after failed verification");
     } finally {
       await f.cleanup();
     }
@@ -423,7 +513,8 @@ describe("shadowCompact extension orchestration", () => {
       stale.appendCompaction();
       await stale.emit("session_compact", compactedEvent(false));
       stale.release();
-      await waitFor(() => stale.registry.settled === 1);
+      // Draft plus verifier complete before the stale candidate is discarded.
+      await waitFor(() => stale.registry.settled === 2);
       await tick();
       await stale.emit("agent_settled");
       // The stale result schedules the documented one-shot native fallback.

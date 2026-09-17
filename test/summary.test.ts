@@ -16,7 +16,10 @@ import {
   isActionFirstEnabled,
   resolveRenderSections,
   resolveSummarizerModel,
+  resolveVerificationModel,
   runSummaryAgent,
+  runVerificationAgent,
+  type Checkpoint,
   type CompletionInterface,
 } from "../src/summary.js";
 import type { NormalizedPacket } from "../src/normalize.js";
@@ -547,6 +550,187 @@ describe("action-first representation toggle", () => {
     } finally {
       if (saved === undefined) delete process.env[ACTION_FIRST_ENV_VAR];
       else process.env[ACTION_FIRST_ENV_VAR] = saved;
+    }
+  });
+});
+
+const verifierModel = { provider: "configured", id: "verifier", api: "test" } as Model<Api>;
+const verifierConfig = {
+  ...config,
+  verificationModel: { provider: "configured", id: "verifier" },
+};
+const draft = checkpoint as Checkpoint;
+
+describe("resolveVerificationModel", () => {
+  it("reuses the summarizer model when no verification pair is configured", () => {
+    const finds: Array<[string, string]> = [];
+
+    assert.equal(resolveVerificationModel(context(finds, summaryModel), config), summaryModel);
+    assert.deepEqual(finds, [["configured", "summary"]]);
+  });
+
+  it("reuses the session model when both pairs are blank", () => {
+    const finds: Array<[string, string]> = [];
+
+    assert.equal(resolveVerificationModel(context(finds, summaryModel), blankModelConfig), sessionModel);
+    assert.deepEqual(finds, []);
+  });
+
+  it("resolves a configured verification pair through the model registry", () => {
+    const finds: Array<[string, string]> = [];
+    const registryWithVerifier = {
+      find(provider: string, id: string) {
+        finds.push([provider, id]);
+        return provider === "configured" && id === "verifier" ? verifierModel : undefined;
+      },
+    } as unknown as SummaryContext["modelRegistry"];
+
+    const resolved = resolveVerificationModel(
+      { model: sessionModel, modelRegistry: registryWithVerifier },
+      verifierConfig,
+    );
+
+    assert.equal(resolved, verifierModel);
+    assert.deepEqual(finds, [["configured", "verifier"]]);
+  });
+
+  it("throws when the configured verification model is missing", () => {
+    assert.throws(
+      () => resolveVerificationModel(context([], undefined), verifierConfig),
+      /Verification model not found: configured\/verifier/,
+    );
+  });
+});
+
+describe("runVerificationAgent", () => {
+  it("audits the draft against the evidence and returns the corrected checkpoint", async () => {
+    const corrected = JSON.stringify({
+      ...checkpoint,
+      completedWork: [],
+      openIssues: [{ text: "Tests still failing", evidenceRefs: ["ev-1"] }],
+    });
+    const completion = new FakeCompletion([response(corrected)]);
+    const finds: Array<[string, string]> = [];
+
+    const result = await runVerificationAgent(context(finds, summaryModel), packet, draft, config, {
+      completion,
+    });
+
+    assert.deepEqual(finds, [["configured", "summary"]]);
+    assert.equal(completion.calls.length, 1);
+    const prompt = messageText(completion.calls[0]!.context.messages[0]!);
+    assert.match(prompt, /Audit this draft continuation checkpoint/);
+    assert.match(prompt, /claims of success such as tests passing/);
+    assert.match(prompt, /high-risk/);
+    assert.ok(prompt.includes(JSON.stringify(draft)));
+    assert.ok(prompt.includes(JSON.stringify(packet.evidence)));
+    assert.match(result.summary, /Tests still failing/);
+    assert.doesNotMatch(result.summary, /Implemented runSummaryAgent/);
+    assert.deepEqual(result.checkpoint.openIssues, [
+      { text: "Tests still failing", evidenceRefs: ["ev-1"] },
+    ]);
+  });
+
+  it("runs on the configured verification model when set", async () => {
+    const completion = new FakeCompletion([response(valid)]);
+    const finds: Array<[string, string]> = [];
+    const registryWithVerifier = {
+      find(provider: string, id: string) {
+        finds.push([provider, id]);
+        if (provider === "configured" && id === "verifier") return verifierModel;
+        if (provider === "configured" && id === "summary") return summaryModel;
+        return undefined;
+      },
+    } as unknown as SummaryContext["modelRegistry"];
+
+    await runVerificationAgent(
+      { model: sessionModel, modelRegistry: registryWithVerifier },
+      packet,
+      draft,
+      verifierConfig,
+      { completion },
+    );
+
+    assert.deepEqual(finds, [["configured", "verifier"]]);
+    assert.equal(completion.calls[0]!.model, verifierModel);
+  });
+
+  it("validates one correction then succeeds, summing usage across attempts", async () => {
+    const completion = new FakeCompletion([response("{not json", 2), response(valid, 3)]);
+
+    const result = await runVerificationAgent(context([], summaryModel), packet, draft, config, {
+      completion,
+    });
+
+    assert.equal(completion.calls.length, 2);
+    assert.equal(result.usage.input, 5);
+    assert.equal(result.summary, renderedLegacy);
+  });
+
+  it("rejects unknown evidence references", async () => {
+    const invalid = JSON.stringify({
+      ...checkpoint,
+      objective: [{ text: "Drift", evidenceRefs: ["ev-9"] }],
+    });
+    const completion = new FakeCompletion([response(invalid), response(invalid)]);
+
+    await assert.rejects(
+      runVerificationAgent(context([], summaryModel), packet, draft, config, { completion }),
+      /Unknown evidence reference: ev-9/,
+    );
+  });
+
+  it("treats an empty repair as unreliable so the caller fails closed", async () => {
+    const completion = new FakeCompletion([response("{}"), response("{}")]);
+
+    await assert.rejects(
+      runVerificationAgent(context([], summaryModel), packet, draft, config, { completion }),
+      /Missing checkpoint section: objective/,
+    );
+    assert.equal(completion.calls.length, 2);
+  });
+
+  it("labels verification failures distinctly from summary failures", async () => {
+    const completion = new FakeCompletion([response("boom", 1, "error")]);
+
+    await assert.rejects(
+      runVerificationAgent(context([], summaryModel), packet, draft, config, { completion }),
+      /Verification model stopped with error/,
+    );
+  });
+
+  it("forwards thinkingLevel as reasoning only for reasoning models", async () => {
+    const reasoningVerifier = { provider: "configured", id: "verifier", reasoning: true } as Model<Api>;
+    const completion = new FakeCompletion([response(valid)]);
+    await runVerificationAgent(context([], reasoningVerifier), packet, draft, config, {
+      completion,
+      thinkingLevel: "high",
+    });
+    assert.equal((completion.calls[0]!.options as { reasoning?: unknown }).reasoning, "high");
+
+    const plain = new FakeCompletion([response(valid)]);
+    await runVerificationAgent(context([], summaryModel), packet, draft, config, {
+      completion: plain,
+      thinkingLevel: "high",
+    });
+    assert.equal("reasoning" in plain.calls[0]!.options, false);
+  });
+
+  it("passes the signal and max-token override on every attempt", async () => {
+    const controller = new AbortController();
+    const completion = new FakeCompletion([response("not json"), response(valid)]);
+
+    await runVerificationAgent(context([], summaryModel), packet, draft, config, {
+      completion,
+      signal: controller.signal,
+      maxTokens: 1234,
+    });
+
+    assert.equal(completion.calls.length, 2);
+    for (const call of completion.calls) {
+      assert.equal(call.options.signal, controller.signal);
+      assert.equal(call.options.maxTokens, 1234);
+      assert.match(call.options.sessionId ?? "", /^[0-9a-f-]{36}$/i);
     }
   });
 });

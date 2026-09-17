@@ -16,6 +16,7 @@ import {
   type PersistedShadowCheckpoint,
 } from "../src/persist.js";
 import { prepareSnapshot } from "../src/prepare.js";
+import { combineUsage } from "../src/summary.js";
 import { TRACE_FILE_ENV_VAR } from "../src/trace.js";
 import {
   fixture,
@@ -232,7 +233,7 @@ describe("soft durability without compaction", () => {
       const f = await fixture();
       try {
         await f.emit("turn_end");
-        await waitFor(() => f.registry.settled === 1);
+        await waitFor(() => f.registry.settled === 2);
         await tick();
         await f.emit("agent_settled");
 
@@ -249,7 +250,7 @@ describe("soft durability without compaction", () => {
         assert.equal(data.leafId, "e4");
         assert.equal(data.latestCompactionId, null);
         assert.equal(data.contextTokensBefore, 600);
-        assert.deepEqual(data.usage, USAGE);
+        assert.deepEqual(data.usage, combineUsage(USAGE, USAGE));
         assert.deepEqual(data.details, {
           readFiles: ["src/read.ts"],
           modifiedFiles: ["src/edited.ts"],
@@ -304,7 +305,7 @@ describe("persistent two-turn lifecycle with reload", () => {
       try {
         // USER TURN 1: cross 60% -> prepare A -> publish -> swap -> settle -> persist A.
         await f.emit("turn_end");
-        await waitFor(() => f.registry.settled === 1);
+        await waitFor(() => f.registry.settled === 2);
         await tick();
         const swapA = (await f.emit("context", { messages: f.contextMessages() })) as {
           messages: Array<Record<string, unknown>>;
@@ -320,15 +321,15 @@ describe("persistent two-turn lifecycle with reload", () => {
         assert.ok(stillA, "A still serves");
         f.setPercent(30);
         await f.emit("turn_end");
-        assert.equal(f.registry.calls, 1, "below-soft re-arms without preparing");
+        assert.equal(f.registry.calls, 2, "below-soft re-arms without preparing");
         f.setPercent(65);
         f.gate();
         await f.emit("turn_end");
-        assert.equal(f.registry.calls, 2, "B prepares while A serves");
+        assert.equal(f.registry.calls, 3, "B prepares while A serves");
         const servingDuringB = await f.emit("context", { messages: f.contextMessages() });
         assert.ok(servingDuringB, "A keeps serving while B prepares");
         f.release();
-        await waitFor(() => f.registry.settled === 2);
+        await waitFor(() => f.registry.settled === 4);
         await tick();
         const swapB = await f.emit("context", { messages: f.contextMessages() });
         assert.ok(swapB, "B swaps in");

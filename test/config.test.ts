@@ -14,6 +14,9 @@ import {
   SUMMARIZER_ID_ENV_VAR,
   SUMMARIZER_PROVIDER_ENV_VAR,
   SUMMARIZER_THINKING_ENV_VAR,
+  VERIFIER_ID_ENV_VAR,
+  VERIFIER_PROVIDER_ENV_VAR,
+  VERIFIER_THINKING_ENV_VAR,
   TARGET_TAIL_ENV_VAR,
   defaultConfig,
   isAtOrAboveSoft,
@@ -34,6 +37,9 @@ let savedModeEnv: string | undefined;
 let savedSummarizerProviderEnv: string | undefined;
 let savedSummarizerIdEnv: string | undefined;
 let savedSummarizerThinkingEnv: string | undefined;
+let savedVerifierProviderEnv: string | undefined;
+let savedVerifierIdEnv: string | undefined;
+let savedVerifierThinkingEnv: string | undefined;
 let agentDir = "";
 
 function context(cwd: string, trusted = true): ExtensionContext {
@@ -104,6 +110,9 @@ beforeEach(async () => {
   savedSummarizerProviderEnv = process.env[SUMMARIZER_PROVIDER_ENV_VAR];
   savedSummarizerIdEnv = process.env[SUMMARIZER_ID_ENV_VAR];
   savedSummarizerThinkingEnv = process.env[SUMMARIZER_THINKING_ENV_VAR];
+  savedVerifierProviderEnv = process.env[VERIFIER_PROVIDER_ENV_VAR];
+  savedVerifierIdEnv = process.env[VERIFIER_ID_ENV_VAR];
+  savedVerifierThinkingEnv = process.env[VERIFIER_THINKING_ENV_VAR];
   delete process.env[SOFT_THRESHOLD_ENV_VAR];
   delete process.env[SOFT_THRESHOLD_ABS_ENV_VAR];
   delete process.env[HARD_THRESHOLD_ENV_VAR];
@@ -112,6 +121,9 @@ beforeEach(async () => {
   delete process.env[SUMMARIZER_PROVIDER_ENV_VAR];
   delete process.env[SUMMARIZER_ID_ENV_VAR];
   delete process.env[SUMMARIZER_THINKING_ENV_VAR];
+  delete process.env[VERIFIER_PROVIDER_ENV_VAR];
+  delete process.env[VERIFIER_ID_ENV_VAR];
+  delete process.env[VERIFIER_THINKING_ENV_VAR];
   agentDir = await mkdtemp(join(tmpdir(), "pi-shadow-compact-agent-"));
   process.env.PI_CODING_AGENT_DIR = agentDir;
 });
@@ -161,6 +173,21 @@ afterEach(async () => {
     delete process.env[SUMMARIZER_THINKING_ENV_VAR];
   } else {
     process.env[SUMMARIZER_THINKING_ENV_VAR] = savedSummarizerThinkingEnv;
+  }
+  if (savedVerifierProviderEnv === undefined) {
+    delete process.env[VERIFIER_PROVIDER_ENV_VAR];
+  } else {
+    process.env[VERIFIER_PROVIDER_ENV_VAR] = savedVerifierProviderEnv;
+  }
+  if (savedVerifierIdEnv === undefined) {
+    delete process.env[VERIFIER_ID_ENV_VAR];
+  } else {
+    process.env[VERIFIER_ID_ENV_VAR] = savedVerifierIdEnv;
+  }
+  if (savedVerifierThinkingEnv === undefined) {
+    delete process.env[VERIFIER_THINKING_ENV_VAR];
+  } else {
+    process.env[VERIFIER_THINKING_ENV_VAR] = savedVerifierThinkingEnv;
   }
   await rm(agentDir, { recursive: true, force: true });
 });
@@ -656,6 +683,173 @@ describe("shadow compact config loading", () => {
         (error: unknown) => {
           assert.ok(error instanceof Error);
           assert.match(error.message, new RegExp(SUMMARIZER_THINKING_ENV_VAR));
+          return true;
+        },
+      );
+    });
+  });
+
+  describe("verification model config", () => {
+    it("is absent by default, so the verifier reuses the summarizer model", async (t) => {
+      const cwd = await temporaryCwd(t);
+
+      const config = await loadConfig(context(cwd));
+      assert.equal(config.verificationModel, undefined);
+      assert.equal(config.verificationThinkingLevel, undefined);
+    });
+
+    it("accepts a verificationModel pair and thinking level from file", async (t) => {
+      const cwd = await temporaryCwd(t);
+      await writeJson(projectConfigPath(cwd), {
+        ...configBody(60, "provider", "model"),
+        verificationModel: { provider: "verify-provider", id: "org/verifier:strong" },
+        verificationThinkingLevel: "high",
+      });
+
+      assert.deepEqual(await loadConfig(context(cwd)), {
+        softCompactThresholdPercent: 60,
+        hardCompactThresholdPercent: DEFAULT_HARD_COMPACT_THRESHOLD_PERCENT,
+        summarizerModel: { provider: "provider", id: "model" },
+        verificationModel: { provider: "verify-provider", id: "org/verifier:strong" },
+        verificationThinkingLevel: "high",
+      });
+    });
+
+    it("accepts a blank verification pair as unset-equivalent", async (t) => {
+      const cwd = await temporaryCwd(t);
+      await writeJson(projectConfigPath(cwd), {
+        ...configBody(60),
+        verificationModel: { provider: "", id: "" },
+      });
+
+      assert.deepEqual((await loadConfig(context(cwd))).verificationModel, {
+        provider: "",
+        id: "",
+      });
+    });
+
+    it("a half-set verification pair throws", async (t) => {
+      const cwd = await temporaryCwd(t);
+      const path = projectConfigPath(cwd);
+      await writeJson(path, {
+        ...configBody(60),
+        verificationModel: { provider: "verify-provider", id: "" },
+      });
+
+      await assertLoadError(
+        loadConfig(context(cwd)),
+        path,
+        /verificationModel\.provider and \.id must both be blank or both be set/,
+      );
+    });
+
+    it("an unknown verificationModel key throws", async (t) => {
+      const cwd = await temporaryCwd(t);
+      const path = projectConfigPath(cwd);
+      await writeJson(path, {
+        ...configBody(60),
+        verificationModel: { provider: "p", id: "m", extra: 1 },
+      });
+
+      await assertLoadError(
+        loadConfig(context(cwd)),
+        path,
+        /verificationModel has unknown key: extra/,
+      );
+    });
+
+    it("an invalid verificationThinkingLevel throws", async (t) => {
+      const cwd = await temporaryCwd(t);
+      const path = projectConfigPath(cwd);
+      await writeJson(path, { ...configBody(60), verificationThinkingLevel: "ultra" });
+
+      await assertLoadError(
+        loadConfig(context(cwd)),
+        path,
+        /verificationThinkingLevel must be one of/,
+      );
+    });
+  });
+
+  describe("verifier environment overrides", () => {
+    it("unset overrides leave file verifier config untouched", async (t) => {
+      const cwd = await temporaryCwd(t);
+      await writeJson(projectConfigPath(cwd), {
+        ...configBody(60, "file-provider", "file-model"),
+        verificationModel: { provider: "file-verify", id: "file-verifier" },
+        verificationThinkingLevel: "low",
+      });
+
+      const config = await loadConfig(context(cwd));
+      assert.deepEqual(config.verificationModel, {
+        provider: "file-verify",
+        id: "file-verifier",
+      });
+      assert.equal(config.verificationThinkingLevel, "low");
+    });
+
+    it("blank overrides are ignored", async (t) => {
+      const cwd = await temporaryCwd(t);
+      process.env[VERIFIER_PROVIDER_ENV_VAR] = "  ";
+      process.env[VERIFIER_ID_ENV_VAR] = "";
+      process.env[VERIFIER_THINKING_ENV_VAR] = " ";
+
+      const config = await loadConfig(context(cwd));
+      assert.equal(config.verificationModel, undefined);
+      assert.equal("verificationThinkingLevel" in config, false);
+    });
+
+    it("provider and id override together, including slash/colon ids", async (t) => {
+      const cwd = await temporaryCwd(t);
+      await writeJson(projectConfigPath(cwd), {
+        ...configBody(60),
+        verificationModel: { provider: "file-verify", id: "file-verifier" },
+      });
+      process.env[VERIFIER_PROVIDER_ENV_VAR] = "bench-provider";
+      process.env[VERIFIER_ID_ENV_VAR] = "org/model:variant";
+
+      const config = await loadConfig(context(cwd));
+      assert.deepEqual(config.verificationModel, {
+        provider: "bench-provider",
+        id: "org/model:variant",
+      });
+    });
+
+    it("a lone provider without id throws naming both variables", async (t) => {
+      const cwd = await temporaryCwd(t);
+      process.env[VERIFIER_PROVIDER_ENV_VAR] = "bench-provider";
+
+      await assert.rejects(
+        loadConfig(context(cwd)),
+        (error: unknown) => {
+          assert.ok(error instanceof Error);
+          assert.match(error.message, new RegExp(VERIFIER_PROVIDER_ENV_VAR));
+          assert.match(error.message, new RegExp(VERIFIER_ID_ENV_VAR));
+          return true;
+        },
+      );
+    });
+
+    it("a valid thinking level overrides the file value", async (t) => {
+      const cwd = await temporaryCwd(t);
+      await writeJson(projectConfigPath(cwd), {
+        ...configBody(60),
+        verificationThinkingLevel: "low",
+      });
+      process.env[VERIFIER_THINKING_ENV_VAR] = "high";
+
+      assert.equal((await loadConfig(context(cwd))).verificationThinkingLevel, "high");
+    });
+
+    it("an invalid thinking level throws naming the variable", async (t) => {
+      const cwd = await temporaryCwd(t);
+      process.env[VERIFIER_THINKING_ENV_VAR] = "ultra";
+
+      await assert.rejects(
+        loadConfig(context(cwd)),
+        (error: unknown) => {
+          assert.ok(error instanceof Error);
+          assert.match(error.message, new RegExp(VERIFIER_THINKING_ENV_VAR));
           return true;
         },
       );
