@@ -35,6 +35,8 @@ export type TraceEventType =
   | "native_fallback";
 
 export function isStderrTraceEnabled(): boolean {
+  // Local read: trace stays dependency-free so telemetry never pulls in
+  // config (and its pi-coding-agent import) just to check a flag.
   const raw = process.env[TRACE_STDERR_ENV_VAR];
   if (raw === undefined) return false;
   const value = raw.trim().toLowerCase();

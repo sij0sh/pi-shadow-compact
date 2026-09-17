@@ -80,14 +80,26 @@ export function isPersistedShadowCheckpoint(value: unknown): value is PersistedS
  * ancestry, newer native compaction) — currency is checked separately, or
  * use findLatestRestorableCheckpoint to skip stale winners outright.
  */
-export function findLatestPersistedCheckpoint(
+/**
+ * Newest-first walk over structurally valid checkpoints. Corrupt entries are
+ * skipped silently; staleness is the caller's decision (structural-only find
+ * vs restorable find), never the iterator's.
+ */
+function* newestValidCheckpoints(
   branch: SessionEntry[],
-): { entryId: string; checkpoint: PersistedShadowCheckpoint } | undefined {
+): Generator<{ entryId: string; checkpoint: PersistedShadowCheckpoint }> {
   for (let index = branch.length - 1; index >= 0; index--) {
     const entry = branch[index];
     if (!entry || entry.type !== "custom" || entry.customType !== CHECKPOINT_CUSTOM_TYPE) continue;
-    if (isPersistedShadowCheckpoint(entry.data)) return { entryId: entry.id, checkpoint: entry.data };
+    if (!isPersistedShadowCheckpoint(entry.data)) continue;
+    yield { entryId: entry.id, checkpoint: entry.data };
   }
+}
+
+export function findLatestPersistedCheckpoint(
+  branch: SessionEntry[],
+): { entryId: string; checkpoint: PersistedShadowCheckpoint } | undefined {
+  for (const found of newestValidCheckpoints(branch)) return found;
   return undefined;
 }
 
@@ -116,16 +128,13 @@ export function findLatestRestorableCheckpoint(
   sessionId: string,
 ): RestorableSearch {
   const skippedStale: SkippedStaleCheckpoint[] = [];
-  for (let index = branch.length - 1; index >= 0; index--) {
-    const entry = branch[index];
-    if (!entry || entry.type !== "custom" || entry.customType !== CHECKPOINT_CUSTOM_TYPE) continue;
-    if (!isPersistedShadowCheckpoint(entry.data)) continue;
-    const reason = checkpointStalenessReason(branch, sessionId, entry.data);
+  for (const { entryId, checkpoint } of newestValidCheckpoints(branch)) {
+    const reason = checkpointStalenessReason(branch, sessionId, checkpoint);
     if (reason !== undefined) {
-      skippedStale.push({ checkpointId: entry.data.checkpointId, reason });
+      skippedStale.push({ checkpointId: checkpoint.checkpointId, reason });
       continue;
     }
-    return { found: { entryId: entry.id, checkpoint: entry.data }, skippedStale };
+    return { found: { entryId, checkpoint }, skippedStale };
   }
   return { found: undefined, skippedStale };
 }

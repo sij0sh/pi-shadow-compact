@@ -232,12 +232,16 @@ function bounded(value: string, limit: number): string {
   return value.slice(0, head) + marker + value.slice(value.length - (available - head));
 }
 
+function evidenceId(index: number): string {
+  return `E${String(index + 1).padStart(4, "0")}`;
+}
+
 function numberEvidence(drafts: DraftEvidence[]): NormalizedEvidence[] {
-  return drafts.map((draft, index) => ({ evidenceId: `E${String(index + 1).padStart(4, "0")}`, ...draft }));
+  return drafts.map((draft, index) => ({ evidenceId: evidenceId(index), ...draft }));
 }
 
 function renumber(evidence: NormalizedEvidence[]): NormalizedEvidence[] {
-  return evidence.map((item, index) => ({ ...item, evidenceId: `E${String(index + 1).padStart(4, "0")}` }));
+  return evidence.map((item, index) => ({ ...item, evidenceId: evidenceId(index) }));
 }
 
 function packetSize(evidence: NormalizedEvidence[]): number {

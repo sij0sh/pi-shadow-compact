@@ -1,9 +1,9 @@
 import type { Usage } from "@earendil-works/pi-ai";
+import type { FileDetails } from "./prepare.js";
 
-export interface FileDetails {
-  readFiles: string[];
-  modifiedFiles: string[];
-}
+// Single definition lives in prepare.ts alongside fileDetails(); re-exported
+// here so existing `.../state.js` import sites keep working.
+export type { FileDetails } from "./prepare.js";
 
 export interface PreparedResult {
   /** Stable identity across persist/restore so an idle settle persists once. */
@@ -150,16 +150,25 @@ export class ShadowCompactStateController {
     return preparing;
   }
 
+  /**
+   * Clears per-checkpoint serving exposure. Every path that installs or drops
+   * the serving checkpoint shares this; only the refresh gate and durability
+   * marker differ per path, so those stay with the caller.
+   */
+  #resetServingFields(): void {
+    this.#publishedSwapped = false;
+    this.#swapCount = 0;
+    this.#firstSwapTurn = undefined;
+    this.#emptySuppressedAtTokens = undefined;
+  }
+
   /** Publishes a completed preparation, replacing the checkpoint being served. */
   publish(generation: number, result: PreparedResult): boolean {
     if (!this.#preparing || this.#preparing.generation !== generation) return false;
     if (this.#preparing.controller.signal.aborted) return false;
     this.#preparing = undefined;
     this.#published = result;
-    this.#publishedSwapped = false;
-    this.#swapCount = 0;
-    this.#firstSwapTurn = undefined;
-    this.#emptySuppressedAtTokens = undefined;
+    this.#resetServingFields();
     return true;
   }
 
@@ -170,11 +179,8 @@ export class ShadowCompactStateController {
    */
   restorePublished(result: PreparedResult): void {
     this.#published = result;
-    this.#publishedSwapped = false;
-    this.#swapCount = 0;
-    this.#firstSwapTurn = undefined;
+    this.#resetServingFields();
     this.#refreshArmed = false;
-    this.#emptySuppressedAtTokens = undefined;
     this.#persistedCheckpointId = result.checkpointId;
   }
 
@@ -277,11 +283,8 @@ export class ShadowCompactStateController {
   discardPublished(): boolean {
     if (!this.#published) return false;
     this.#published = undefined;
-    this.#publishedSwapped = false;
-    this.#swapCount = 0;
-    this.#firstSwapTurn = undefined;
+    this.#resetServingFields();
     this.#refreshArmed = true;
-    this.#emptySuppressedAtTokens = undefined;
     return true;
   }
 
@@ -290,13 +293,10 @@ export class ShadowCompactStateController {
     this.#preparing?.controller.abort();
     this.#preparing = undefined;
     this.#published = undefined;
-    this.#publishedSwapped = false;
-    this.#swapCount = 0;
-    this.#firstSwapTurn = undefined;
+    this.#resetServingFields();
     this.#persistedCheckpointId = undefined;
     this.#generation += 1;
     this.#pendingNativeFallback = null;
     this.#refreshArmed = true;
-    this.#emptySuppressedAtTokens = undefined;
   }
 }
