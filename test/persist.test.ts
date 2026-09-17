@@ -8,10 +8,12 @@ import { MODE_ENV_VAR } from "../src/config.js";
 import { normalizeSnapshot } from "../src/normalize.js";
 import {
   CHECKPOINT_CUSTOM_TYPE,
+  collectShadowSummaries,
   checkpointStalenessReason,
   findLatestPersistedCheckpoint,
   findLatestRestorableCheckpoint,
   isPersistedShadowCheckpoint,
+  SHADOW_CHAIN_LIMIT,
   toPreparedResult,
   type PersistedShadowCheckpoint,
 } from "../src/persist.js";
@@ -583,5 +585,111 @@ describe("checkpoint self-repair (summary omission is not evidence loss)", () =>
         .every((item) => !item.text.includes(MARKER)),
       "the omission is real: no previous-checkpoint carrier mentions the constraint",
     );
+  });
+
+  it("checkpoint C recovers a fact across a native compaction via raw history and the Shadow chain", () => {
+    sequence = 0;
+    const constraint = userMessage(`${MARKER}: deploy only after the canary job goes green`);
+    const earlyBranch: SessionEntry[] = [
+      constraint,
+      userMessage(`background detail ${"x".repeat(500)}`),
+      userMessage(`more background ${"y".repeat(500)}`),
+    ];
+
+    const snapshotA = prepareSnapshot(earlyBranch, 10, { sessionId: "session-1" });
+    assert.ok(snapshotA, "A has evidence to summarize");
+    const summaryA = "Continuation summary that forgets the deployment constraint.";
+    const persistedA = persistedCheckpointEntry(
+      "A",
+      summaryA,
+      snapshotA.firstKeptEntryId,
+      earlyBranch.at(-1)!.id,
+    );
+
+    // A native compaction lands (hard hatch or failure fallback). The branch
+    // is append-only, so raw history and the persisted checkpoint survive;
+    // only Pi's context boundary moves to keptAfter.
+    const keptAfter = userMessage(`post-compaction work ${"c".repeat(500)}`);
+    sequence += 1;
+    const native = {
+      id: `self-repair-${sequence}`,
+      parentId: keptAfter.id,
+      timestamp: "2026-01-01T00:00:00.000Z",
+      type: "compaction",
+      summary: "Native summary covering the early work.",
+      firstKeptEntryId: keptAfter.id,
+      tokensBefore: 150_000,
+    } as unknown as SessionEntry;
+    const later: SessionEntry[] = [
+      userMessage(`follow-up work ${"a".repeat(500)}`),
+      userMessage(`latest question ${"b".repeat(500)}`),
+    ];
+    const branchC: SessionEntry[] = [...earlyBranch, persistedA, keptAfter, native, ...later];
+
+    const snapshotC = prepareSnapshot(branchC, 10, { sessionId: "session-1" });
+    assert.ok(snapshotC, "C has evidence to summarize");
+    // Evidence reaches past the native boundary (cut policy unchanged).
+    assert.ok(
+      snapshotC.sourceEntries.some((entry) => entry.id === constraint.id),
+      "C's evidence still includes the pre-compaction constraint entry",
+    );
+    assert.equal(snapshotC.previousSummary, "Native summary covering the early work.");
+    // The Shadow chain carries A as evidence even though A is stale for swap:
+    // restore currency and summarizer context are deliberately different bars.
+    assert.deepEqual(snapshotC.shadowSummaries, [summaryA]);
+    const { skippedStale } = findLatestRestorableCheckpoint(branchC, "session-1");
+    assert.ok(
+      skippedStale.some((skipped) => skipped.checkpointId === "A" && skipped.reason === "compaction-mismatch"),
+      "A is stale for restore/swap but remains usable as summarizer context",
+    );
+
+    const packetC = normalizeSnapshot({
+      cwd: "/work/project",
+      previousSummary: snapshotC.previousSummary,
+      shadowSummaries: snapshotC.shadowSummaries,
+      entries: [...snapshotC.sourceEntries, ...snapshotC.turnPrefixEntries],
+    });
+    const recovered = packetC.evidence.filter(
+      (item) => item.kind !== "previous_checkpoint" && item.text.includes(MARKER),
+    );
+    assert.ok(
+      recovered.length > 0,
+      "C's packet recovers the constraint from pre-compaction raw history",
+    );
+    assert.deepEqual(
+      packetC.evidence
+        .filter((item) => item.kind === "previous_checkpoint")
+        .map((item) => item.text),
+      ["Native summary covering the early work.", summaryA],
+    );
+  });
+
+  it("collectShadowSummaries keeps the newest session-matching summaries within its limit", () => {
+    sequence = 0;
+    const a = userMessage("a");
+    const b = userMessage("b");
+    const c = userMessage("c");
+    const ckptA = persistedCheckpointEntry("A", "summary A", a.id, c.id);
+    const ckptB = persistedCheckpointEntry("B", "summary B", b.id, c.id);
+    const ckptC = persistedCheckpointEntry("C", "summary C", c.id, c.id);
+    const other = persistedCheckpointEntry("X", "other session summary", c.id, c.id);
+    (other as unknown as { data: PersistedShadowCheckpoint }).data.sessionId = "session-2";
+    const corrupt = {
+      id: "custom-corrupt",
+      parentId: c.id,
+      timestamp: "2026-01-01T00:00:00.000Z",
+      type: "custom",
+      customType: CHECKPOINT_CUSTOM_TYPE,
+      data: { version: 999 },
+    } as unknown as SessionEntry;
+    const staleCut = persistedCheckpointEntry("S", "diverged summary", "no-such-entry", c.id);
+    const branch = [a, b, c, ckptA, ckptB, ckptC, other, corrupt, staleCut];
+
+    assert.equal(SHADOW_CHAIN_LIMIT, 2);
+    assert.deepEqual(collectShadowSummaries(branch, "session-1"), ["summary B", "summary C"]);
+    assert.deepEqual(collectShadowSummaries(branch, "session-1", 1), ["summary C"]);
+    assert.deepEqual(collectShadowSummaries(branch, "session-1", 0), []);
+    assert.deepEqual(collectShadowSummaries(branch, "session-2"), ["other session summary"]);
+    assert.deepEqual(collectShadowSummaries([], "session-1"), []);
   });
 });

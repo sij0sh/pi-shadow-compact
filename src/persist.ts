@@ -15,6 +15,15 @@ import type { PreparedResult } from "./state.js";
  */
 export const CHECKPOINT_CUSTOM_TYPE = "shadow-compact.checkpoint.v1";
 
+/**
+ * How many prior Shadow summaries ride along as protected evidence slots.
+ * Sessions are append-only, so pre-compaction Shadow checkpoints physically
+ * survive native compactions on the branch; carrying the newest two (plus
+ * the native previous summary) keeps Shadow coverage visible to the next
+ * checkpoint without letting protected slots crowd out raw evidence.
+ */
+export const SHADOW_CHAIN_LIMIT = 2;
+
 export interface PersistedShadowCheckpoint {
   version: 1;
   checkpointId: string;
@@ -161,6 +170,33 @@ export function checkpointStalenessReason(
   if (!branch.some((entry) => entry.id === checkpoint.leafId)) return "missing-leaf";
   if (latestCompactionId(branch) !== checkpoint.latestCompactionId) return "compaction-mismatch";
   return undefined;
+}
+
+/**
+ * Newest-first Shadow summaries usable as summarizer context, oldest-first
+ * out. Deliberately weaker than restore currency: swap/restore still require
+ * a fully current checkpoint, but as *evidence* an older Shadow summary is
+ * valuable even after a native compaction landed (compaction-mismatch) or
+ * the leaf moved on (missing-leaf), as long as it belongs to this session
+ * and its cut is still on the branch. Cross-session summaries are never
+ * included.
+ */
+export function collectShadowSummaries(
+  branch: SessionEntry[],
+  sessionId: string,
+  limit: number = SHADOW_CHAIN_LIMIT,
+): string[] {
+  if (limit <= 0) return [];
+  const ids = new Set(branch.map((entry) => entry.id));
+  const matches: string[] = [];
+  for (const entry of branch) {
+    if (entry.type !== "custom" || entry.customType !== CHECKPOINT_CUSTOM_TYPE) continue;
+    if (!isPersistedShadowCheckpoint(entry.data)) continue;
+    if (entry.data.sessionId !== sessionId) continue;
+    if (!ids.has(entry.data.firstKeptEntryId)) continue;
+    matches.push(entry.data.summary);
+  }
+  return matches.slice(Math.max(0, matches.length - limit));
 }
 
 export function latestCompactionId(branch: SessionEntry[]): string | null {

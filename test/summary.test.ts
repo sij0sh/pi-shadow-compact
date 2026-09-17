@@ -130,9 +130,13 @@ const renderedLegacy = `# Continuation Checkpoint
 
 const packet: NormalizedPacket = {
   evidence: [{ evidenceId: "ev-1", sourceEntryId: "e1", kind: "user", text: "Build it" }],
+  overflow: [],
+  manifest: "",
+  manifestOmitted: 0,
   rawEvidenceCount: 1,
   normalizedEvidenceCount: 1,
   evictedEvidenceCount: 0,
+  truncatedItemCount: 0,
   packetTruncated: false,
   oldestRetainedSourceEntryId: "e1",
   newestRetainedSourceEntryId: "e1",
@@ -422,6 +426,140 @@ describe("runSummaryAgent", () => {
       /Preserve this explicit custom focus as a priority: "Preserve the exact API contract"/,
     );
     assert.equal(result.summary, renderedLegacy);
+  });
+});
+
+describe("archived evidence retrieval handshake", () => {
+  const archivedPacket: NormalizedPacket = {
+    evidence: [{ evidenceId: "E0001", sourceEntryId: "e1", kind: "user", text: "Build it" }],
+    overflow: [
+      {
+        evidenceId: "E0002",
+        sourceEntryId: "e0",
+        kind: "user",
+        reason: "evicted",
+        preview: "ARCHIVED_DETAIL deploy…",
+        fullText: "ARCHIVED_DETAIL deploy only after canary",
+      },
+      {
+        evidenceId: "E0003",
+        sourceEntryId: "e-1",
+        kind: "assistant",
+        reason: "evicted",
+        preview: "second archived…",
+        fullText: "second archived note",
+      },
+      {
+        evidenceId: "E0004",
+        sourceEntryId: "e-2",
+        kind: "assistant",
+        reason: "evicted",
+        preview: "third archived…",
+        fullText: "third archived note",
+      },
+    ],
+    manifest: '[\n{"id":"E0002","kind":"user","source":"e0","reason":"evicted","preview":"ARCHIVED_DETAIL deploy…"},\n{"id":"E0003","kind":"assistant","source":"e-1","reason":"evicted","preview":"second archived…"},\n{"id":"E0004","kind":"assistant","source":"e-2","reason":"evicted","preview":"third archived…"}\n]',
+    manifestOmitted: 0,
+    rawEvidenceCount: 4,
+    normalizedEvidenceCount: 1,
+    evictedEvidenceCount: 3,
+    truncatedItemCount: 0,
+    packetTruncated: true,
+    oldestRetainedSourceEntryId: "e1",
+    newestRetainedSourceEntryId: "e1",
+  };
+
+  function checkpointCiting(ref: string, objective = "Ship it after canary"): string {
+    const remapped = Object.fromEntries(
+      Object.entries(checkpoint).map(([section, items]) => [
+        section,
+        (items as Array<{ text: string }>).map((item) => ({ ...item, evidenceRefs: [ref] })),
+      ]),
+    );
+    return JSON.stringify({
+      ...remapped,
+      objective: [{ text: objective, evidenceRefs: [ref] }],
+    });
+  }
+
+  it("supplies archived full text on request, then accepts the citing checkpoint", async () => {
+    const completion = new FakeCompletion([
+      response(JSON.stringify({ needEvidence: ["E0002"] })),
+      response(checkpointCiting("E0002")),
+    ]);
+
+    const result = await runSummaryAgent(context([], summaryModel), archivedPacket, config, {
+      completion,
+    });
+
+    assert.equal(completion.calls.length, 2);
+    assert.equal(result.retrievalRounds, 1);
+    const supplied = messageText(completion.calls[1]!.context.messages[2]!);
+    assert.match(supplied, /ARCHIVED_DETAIL deploy only after canary/);
+    assert.match(result.summary, /Ship it after canary/);
+  });
+
+  it("rejects citations of never-fetched archived ids", async () => {
+    const completion = new FakeCompletion([
+      response(checkpointCiting("E0002")),
+      response(checkpointCiting("E0002")),
+    ]);
+
+    await assert.rejects(
+      runSummaryAgent(context([], summaryModel), archivedPacket, config, { completion }),
+      /Unknown evidence reference: E0002/,
+    );
+  });
+
+  it("routes unknown-id requests through one correction", async () => {
+    const completion = new FakeCompletion([
+      response(JSON.stringify({ needEvidence: ["E9999"] })),
+      response(checkpointCiting("E0001")),
+    ]);
+
+    const result = await runSummaryAgent(context([], summaryModel), archivedPacket, config, {
+      completion,
+    });
+
+    assert.equal(completion.calls.length, 2);
+    assert.equal(result.retrievalRounds, 0);
+    const correction = messageText(completion.calls[1]!.context.messages[2]!);
+    assert.match(correction, /Unknown archived evidence reference: E9999/);
+  });
+
+  it("throws once retrieval rounds are exhausted with no valid checkpoint", async () => {
+    const completion = new FakeCompletion([
+      response(JSON.stringify({ needEvidence: ["E9999"] })),
+      response(JSON.stringify({ needEvidence: ["E0002"] })),
+      response(JSON.stringify({ needEvidence: ["E0003"] })),
+      response(JSON.stringify({ needEvidence: ["E0004"] })),
+    ]);
+
+    await assert.rejects(
+      runSummaryAgent(context([], summaryModel), archivedPacket, config, { completion }),
+      /retrieval exceeds 2 rounds/,
+    );
+    assert.equal(completion.calls.length, 4);
+  });
+
+  it("embeds the manifest in the prompt only when overflow exists", async () => {
+    const withOverflow = new FakeCompletion([response(checkpointCiting("E0001"))]);
+    await runSummaryAgent(context([], summaryModel), archivedPacket, config, {
+      completion: withOverflow,
+    });
+    const overflowPrompt = messageText(withOverflow.calls[0]!.context.messages[0]!);
+    assert.match(overflowPrompt, /Archived overflow evidence/);
+    assert.match(overflowPrompt, /"E0002"/);
+    assert.match(overflowPrompt, /needEvidence/);
+
+    const withoutOverflow = new FakeCompletion([response(valid)]);
+    await runSummaryAgent(context([], summaryModel), packet, config, {
+      completion: withoutOverflow,
+    });
+    assert.doesNotMatch(
+      messageText(withoutOverflow.calls[0]!.context.messages[0]!),
+      /Archived overflow evidence/,
+    );
   });
 });
 

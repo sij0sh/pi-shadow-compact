@@ -16,7 +16,7 @@ import {
   resolveKeepRecentTokens,
   type ShadowCompactConfig,
 } from "./config.js";
-import { normalizeSnapshot } from "./normalize.js";
+import { normalizeSnapshot, tokensToChars } from "./normalize.js";
 import {
   CHECKPOINT_CUSTOM_TYPE,
   findLatestRestorableCheckpoint,
@@ -286,7 +286,9 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         config.targetTailPercent,
         contextUsage?.contextWindow,
       );
-      const snapshot = prepareSnapshot(branch, keepRecentTokens);
+      const snapshot = prepareSnapshot(branch, keepRecentTokens, {
+        sessionId: ctx.sessionManager.getSessionId(),
+      });
       // "Nothing to summarize" at the soft boundary is not a failure: there is
       // not yet enough disposable history under this cut policy. Suppress
       // without queuing a native fallback instead of churning every turn; the
@@ -318,14 +320,19 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         maxTokens * 2 + 8192,
         Math.floor(contextWindow / 2),
       );
-      const budget = contextWindow - reservedTokens;
+      // Unit fix: context windows and reservations are tokens, but the
+      // normalized packet is measured in JSON characters. Passing tokens
+      // straight through capped evidence at ~1/4 of the intended budget
+      // (e.g. 183,616 tokens of budget became 183,616 characters).
+      const budgetChars = tokensToChars(contextWindow - reservedTokens);
       const packet = normalizeSnapshot(
         {
           cwd: ctx.cwd,
           ...(snapshot.previousSummary === undefined ? {} : { previousSummary: snapshot.previousSummary }),
+          ...(snapshot.shadowSummaries.length > 0 ? { shadowSummaries: snapshot.shadowSummaries } : {}),
           entries: [...snapshot.sourceEntries, ...snapshot.turnPrefixEntries],
         },
-        budget,
+        budgetChars,
       );
       if (packet.evidence.length === 0) throw new Error("No evidence is available to summarize");
       const packetChars = JSON.stringify(packet).length;
@@ -398,6 +405,13 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         packetEvidence: packet.normalizedEvidenceCount,
         packetEvicted: packet.evictedEvidenceCount,
         packetTruncated: packet.packetTruncated,
+        packetOverflow: packet.overflow.length,
+        packetTruncatedItems: packet.truncatedItemCount,
+        packetManifestChars: packet.manifest.length,
+        packetManifestOmitted: packet.manifestOmitted,
+        shadowChain: snapshot.shadowSummaries.length,
+        summaryRetrievals: outcome.retrievalRounds,
+        verifierRetrievals: verified.retrievalRounds,
         packetOldestRetained: packet.oldestRetainedSourceEntryId,
         packetNewestRetained: packet.newestRetainedSourceEntryId,
         firstKeptEntryId: snapshot.firstKeptEntryId,
@@ -445,6 +459,15 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     ctx.sessionManager.getSessionId() === result.sessionId &&
     isValidBranchAncestry(ctx.sessionManager.getBranch(), result) &&
     latestCompactionId(ctx.sessionManager.getBranch()) === result.latestCompactionId;
+
+  const earliestCut = (ctx: ExtensionContext, ours: string, theirs: string): string => {
+    const branch = ctx.sessionManager.getBranch();
+    const ourIndex = branch.findIndex((entry) => entry.id === ours);
+    const theirIndex = branch.findIndex((entry) => entry.id === theirs);
+    if (ourIndex < 0) return theirs;
+    if (theirIndex < 0) return ours;
+    return ourIndex <= theirIndex ? ours : theirs;
+  };
 
   // Mid-run swap: a published, current summary replaces the stale prefix in the
   // next request. This touches only the request's message list, so the agent run
@@ -684,19 +707,25 @@ export default function shadowCompact(pi: ExtensionAPI): void {
   pi.on("session_before_compact", (event: SessionBeforeCompactEvent, ctx) => {
     if (isObserveMode()) return;
     // Shadow never compacts proactively; but when Pi compacts natively anyway
-    // (hard hatch, overflow, manual with a matching boundary), reuse the
-    // already-computed checkpoint instead of invoking another summarizer.
+    // (hard hatch, overflow), the verified checkpoint covers strictly more
+    // than a fresh native summary: it was audited against the raw history.
+    // Offer it whenever it is still current, even when Pi's cut lands
+    // elsewhere — the hook's summary and cut are honored verbatim, so a
+    // boundary mismatch no longer silently supersedes Shadow coverage.
     const published = state.published;
-    if (
-      event.reason !== "manual" &&
-      published &&
-      published.firstKeptEntryId === event.preparation.firstKeptEntryId &&
-      resultIsCurrent(ctx, published)
-    ) {
+    if (event.reason !== "manual" && published && resultIsCurrent(ctx, published)) {
+      const exact = published.firstKeptEntryId === event.preparation.firstKeptEntryId;
+      // On a mismatch keep whichever cut drops less: the earliest cut on the
+      // branch. Shadow's summary covers everything before its own cut, so an
+      // earlier cut only overlaps verbatim context — coverage is never lost
+      // from either side.
+      const firstKeptEntryId = exact
+        ? published.firstKeptEntryId
+        : earliestCut(ctx, published.firstKeptEntryId, event.preparation.firstKeptEntryId);
       return {
         compaction: {
           summary: published.summary,
-          firstKeptEntryId: published.firstKeptEntryId,
+          firstKeptEntryId,
           tokensBefore: event.preparation.tokensBefore,
           usage: published.usage,
           details: published.details,

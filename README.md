@@ -4,7 +4,7 @@ Long Pi sessions eat context. This keeps them going without getting in the way.
 
 Pi already compacts when things get full. That works, but it has a weak spot: each summary is built from the last summary. If something important gets dropped once, it's gone for good. Later summaries can't recover what they never saw.
 
-Shadow Compact does the boring thing instead. Around 60% context, it builds a checkpoint from the actual session history in the background, double-checks it, and quietly swaps it in. You keep working. The model just sees a short checkpoint plus your recent messages.
+Shadow Compact solves this by using the session history instead. Around 60% context, it builds a checkpoint from the actual session history in the background, double-checks it, and quietly swaps it in. You keep working. The model just sees a short checkpoint plus your recent messages.
 
 No new tools. No new workflow. Just a smaller working set.
 
@@ -24,9 +24,9 @@ If you like the memory-palace approach with lots of recall tools, this isn't tha
 2. Shadow snapshots what would get compacted and hands it to a background summarizer.
 3. A second background model checks the draft against the evidence. It looks for dropped constraints, fake "tests passed" claims, stale facts, missing files and errors — then fixes or rejects the draft.
 4. The verified checkpoint swaps in on the next request: checkpoint + your recent conversation, verbatim.
-5. When context fills up again, it builds a fresh one from history — not from the last checkpoint. So a miss in one checkpoint doesn't have to haunt you forever.
+5. When context fills up again, it builds a fresh one from history — not just from the last checkpoint. Sessions are append-only, so raw history survives even Pi's own emergency compactions, and prior Shadow checkpoints ride along as extra evidence. Each pass still works within a bounded evidence window (a token-derived character budget plus per-item caps, with the oldest goal and newest work pinned); anything over budget spills to an addressable overflow the summarizer can pull back by id. So a miss in one checkpoint doesn't have to haunt you forever.
 
-Your run never pauses. If anything looks unsafe, it fails closed and lets Pi's normal compaction handle it.
+Your run never pauses. If anything looks unsafe, it fails closed and lets Pi's normal compaction handle it. When that happens, Shadow offers its verified checkpoint to the native compaction and keeps prior checkpoints as evidence, so the chain bends instead of breaking.
 
 ## Install
 

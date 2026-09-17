@@ -93,7 +93,7 @@ test("computes a cut without prior compaction", () => {
   assert.deepEqual(result.modifiedFiles, []);
 });
 
-test("prior compaction bounds the cut and exposes previousSummary and latestCompactionId", () => {
+test("prior compaction bounds the cut but not the evidence, and exposes previousSummary and latestCompactionId", () => {
   sequence = 0;
   const before = userEntry("before checkpoint");
   const kept = userEntry("after checkpoint");
@@ -103,10 +103,33 @@ test("prior compaction bounds the cut and exposes previousSummary and latestComp
 
   const result = prepareSnapshot([before, compaction, kept, bulk, newest], 10);
   assert.ok(result);
-  assert.deepEqual(result.sourceEntries, [kept]);
+  // The cut still mirrors Pi exactly, but evidence reaches past the native
+  // boundary (sessions are append-only): pre-compaction history stays
+  // summarizable so post-compaction checkpoints can self-repair it.
+  assert.deepEqual(result.sourceEntries, [before, compaction, kept]);
   assert.equal(result.firstKeptEntryId, bulk.id);
   assert.equal(result.previousSummary, "Prior checkpoint");
   assert.equal(result.latestCompactionId, compaction.id);
+  assert.deepEqual(result.shadowSummaries, []);
+});
+
+test("preBoundaryEntryLimit bounds the backward reach past a native compaction", () => {
+  sequence = 0;
+  const before = userEntry("before checkpoint");
+  const kept = userEntry("after checkpoint");
+  const compaction = compactionEntry("Prior checkpoint", kept.id);
+  const bulk = userEntry(`y`.repeat(400));
+  const newest = userEntry("newest");
+
+  const branch = [before, compaction, kept, bulk, newest];
+  const disabled = prepareSnapshot(branch, 10, { preBoundaryEntryLimit: 0 });
+  assert.ok(disabled);
+  assert.deepEqual(disabled.sourceEntries, [kept]);
+
+  const oneBack = prepareSnapshot(branch, 10, { preBoundaryEntryLimit: 1 });
+  assert.ok(oneBack);
+  assert.deepEqual(oneBack.sourceEntries, [compaction, kept]);
+  assert.equal(oneBack.firstKeptEntryId, disabled.firstKeptEntryId);
 });
 
 test("split turn yields turnPrefixEntries and keeps the assistant toolCall entry", () => {

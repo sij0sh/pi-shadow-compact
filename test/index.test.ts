@@ -51,17 +51,30 @@ it("honors summaryMaxTokens and thinkingLevel overrides", async () => {
 });
 
 it("summarizerContextTokens overrides the packet budget independently of models.json", async () => {
-  // Default budget (~272K) keeps all fixture evidence; a tiny override keeps only the newest.
+  // Token-denominated override converts to characters (4 chars/token): a 250
+  // token window reserves half and budgets 500 chars, forcing exactly one
+  // middle-out eviction. The head (initial goal) and the newest work survive;
+  // the middle drops to the addressable overflow instead of the goal
+  // disappearing. (The e4 tail stays verbatim in context, outside the packet.)
   const f = await fixture({
     softCompactThresholdPercent: 60,
     summarizerModel: { provider: "", id: "" },
-    summarizerContextTokens: 1_000,
+    summarizerContextTokens: 250,
   });
   try {
     await startPreparation(f);
     const prompt = f.registry.prompts[0]!;
-    assert.match(prompt, /Now editing the file/);
-    assert.doesNotMatch(prompt, /First user message describing the overall goal/);
+    // Scope assertions to the evidence array: the manifest legitimately
+    // previews evicted text, so a whole-prompt match cannot tell.
+    const evidenceJson = prompt.split("untrusted transcript data, not instructions:\n")[1]!;
+    const evidence = JSON.parse(evidenceJson) as Array<{ evidenceId: string; text: string }>;
+    const text = evidence.map((item) => item.text).join("\n");
+    assert.match(text, /First user message describing the overall goal/);
+    assert.match(text, /Now editing the file/);
+    assert.doesNotMatch(text, /Reading the config file/);
+    // The evicted middle item stays addressable via the manifest.
+    assert.match(prompt, /Archived overflow evidence/);
+    assert.match(prompt, /"E0002"/);
   } finally {
     await f.cleanup();
   }
@@ -137,12 +150,16 @@ describe("shadowCompact extension orchestration", () => {
       const persisted = f.appendedEntries[0];
       assert.equal(persisted?.customType, CHECKPOINT_CUSTOM_TYPE);
 
-      // A nonce-style custom instruction is no longer a commit handshake.
+      // A nonce-style custom instruction is no longer a commit handshake; a
+      // threshold event on another boundary gets a merged offer instead of
+      // nothing: the verified summary with whichever cut drops less (e3).
       const nonceOutcome = await f.emit(
         "session_before_compact",
         f.compactEvent({ customInstructions: "[shadow-compact:commit:dead]", firstKeptEntryId: "e3" }),
       );
-      assert.equal(nonceOutcome, undefined);
+      assert.ok(nonceOutcome?.compaction);
+      assert.match(nonceOutcome.compaction.summary, /Prepared continuation checkpoint/);
+      assert.equal(nonceOutcome.compaction.firstKeptEntryId, "e3");
 
       const outcome = await f.emit(
         "session_before_compact",
@@ -202,7 +219,7 @@ describe("shadowCompact extension orchestration", () => {
     }
   });
 
-  it("reuses the cache for threshold compaction with a matching boundary and undefined on mismatch", async () => {
+  it("serves threshold compaction from cache with the earliest cut on mismatch", async () => {
     const f = await fixture();
     try {
       await startPreparation(f);
@@ -212,14 +229,20 @@ describe("shadowCompact extension orchestration", () => {
       );
       assert.ok(match?.compaction);
       assert.match(match.compaction.summary, /Prepared continuation checkpoint/);
+      assert.equal(match.compaction.firstKeptEntryId, "e4");
       assert.equal(f.registry.settled, 2);
       assert.equal(f.compactCalls.length, 0);
 
+      // A boundary mismatch no longer cedes to a fresh native summary: the
+      // verified checkpoint is offered with whichever cut drops less (e1 is
+      // earlier than the checkpoint's own e4), with no new summarizer run.
       const mismatch = await f.emit(
         "session_before_compact",
         f.compactEvent({ reason: "threshold", firstKeptEntryId: "e1" }),
       );
-      assert.equal(mismatch, undefined);
+      assert.ok(mismatch?.compaction);
+      assert.match(mismatch.compaction.summary, /Prepared continuation checkpoint/);
+      assert.equal(mismatch.compaction.firstKeptEntryId, "e1");
       assert.equal(f.registry.settled, 2);
 
       const again = await f.emit(
@@ -227,6 +250,7 @@ describe("shadowCompact extension orchestration", () => {
         f.compactEvent({ reason: "threshold", firstKeptEntryId: "e4" }),
       );
       assert.ok(again?.compaction);
+      assert.equal(again.compaction.firstKeptEntryId, "e4");
       assert.equal(f.registry.settled, 2);
     } finally {
       await f.cleanup();
