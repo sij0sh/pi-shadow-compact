@@ -25,7 +25,7 @@ import {
   type PersistedShadowCheckpoint,
 } from "./persist.js";
 import { prepareSnapshot } from "./prepare.js";
-import { contextSwapDropCount } from "./swap.js";
+import { contextSwapDropCount, hasOrphanedToolResult } from "./swap.js";
 import { ShadowCompactStateController, type PreparedResult } from "./state.js";
 import {
   SUMMARY_MAX_TOKENS,
@@ -481,11 +481,25 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     const drop = contextSwapDropCount(
       ctx.sessionManager.getBranch(),
       result.firstKeptEntryId,
-      result.latestCompactionId,
     );
     if (drop === undefined || drop > event.messages.length) return undefined;
     const kept = event.messages.slice(drop);
     if (kept.length === 0) return undefined;
+    // Fail closed: a kept tool result without its tool call is a transcript
+    // the provider rejects outright. Skip the swap for this request instead
+    // of serving it; Pi sends the full context and the checkpoint stays armed.
+    if (hasOrphanedToolResult(kept)) {
+      traceEvent("swap_applied", {
+        turn: turnCount,
+        generation: state.generation,
+        action: "skipped-orphan",
+        messagesBefore: event.messages.length,
+        messagesDropped: drop,
+        firstKeptEntryId: result.firstKeptEntryId,
+        leafId: result.leafId,
+      });
+      return undefined;
+    }
     const firstSwap = state.markSwapped(turnCount);
     const usage = ctx.getContextUsage();
     traceEvent("swap_applied", {

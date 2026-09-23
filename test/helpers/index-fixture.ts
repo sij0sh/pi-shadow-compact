@@ -421,7 +421,9 @@ function installInstance(shared: SharedSession): Fixture {
     },
     contextMessages(): unknown[] {
       return shared.branch.flatMap((entry) => {
-        if (entry.type === "message") return [entry.message];
+        // Mirrors Pi 0.87+: context handlers see the conversation without
+        // system messages; Pi restores the prompt and tool state afterward.
+        if (entry.type === "message") return entry.message.role === "system" ? [] : [entry.message];
         if (entry.type === "compaction") {
           return [{
             role: "compactionSummary" as const,

@@ -22,11 +22,43 @@ import { combineUsage } from "../src/summary.js";
 import { TRACE_FILE_ENV_VAR } from "../src/trace.js";
 import {
   fixture,
+  userEntry,
   waitFor,
   tick,
   USAGE,
   type Fixture,
 } from "./helpers/index-fixture.js";
+
+function assistantToolCallEntry(id: string, parentId: string, callId: string): SessionEntry {
+  return {
+    type: "message",
+    id,
+    parentId,
+    timestamp: "2026-01-01T00:00:00.000Z",
+    message: {
+      role: "assistant",
+      content: [{ type: "toolCall", id: callId, name: "bash", arguments: {} }],
+      timestamp: 0,
+    },
+  } as unknown as SessionEntry;
+}
+
+function toolResultEntry(id: string, parentId: string, callId: string): SessionEntry {
+  return {
+    type: "message",
+    id,
+    parentId,
+    timestamp: "2026-01-01T00:00:00.000Z",
+    message: {
+      role: "toolResult",
+      toolCallId: callId,
+      toolName: "bash",
+      content: [{ type: "text", text: "ok" }],
+      isError: false,
+      timestamp: 0,
+    },
+  } as unknown as SessionEntry;
+}
 
 function checkpointData(overrides: Partial<PersistedShadowCheckpoint> = {}): PersistedShadowCheckpoint {
   return {
@@ -226,6 +258,40 @@ describe("newest current checkpoint wins", () => {
     const restored = ofType(events, "checkpoint_restored");
     assert.equal(restored.length, 1);
     assert.equal(restored[0]?.checkpointId, "A");
+  });
+
+  it("skips the swap when the restored cut would orphan a tool result", async () => {
+    const { events } = await withTraceFile(async () => {
+      const f = await fixture();
+      try {
+        f.setBranch([
+          userEntry("e1", null, "one"),
+          assistantToolCallEntry("a1", "e1", "call-1"),
+          toolResultEntry("r1", "a1", "call-1"),
+          userEntry("e2", "r1", "two"),
+        ]);
+        f.appendCustom(checkpointData({ firstKeptEntryId: "r1", leafId: "e2" }));
+        const g = f.restart();
+        try {
+          await g.emit("session_start");
+          // The cut lands on the tool result while its call drops off: serving
+          // it would poison the request, so the swap stays out and Pi sends the
+          // full context instead.
+          assert.equal(await g.emit("context", { messages: g.contextMessages() }), undefined);
+        } finally {
+          await g.cleanup();
+        }
+      } finally {
+        await f.cleanup();
+      }
+    });
+    // The checkpoint restored into service, so the skip came from the
+    // pair-integrity guard rather than from having nothing to serve.
+    assert.equal(ofType(events, "checkpoint_restored").length, 1);
+    const swaps = ofType(events, "swap_applied");
+    assert.equal(swaps.length, 1);
+    assert.equal(swaps[0]?.action, "skipped-orphan");
+    assert.equal(swaps[0]?.messagesDropped, 2);
   });
 });
 

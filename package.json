@@ -3,7 +3,9 @@
   "version": "0.2.0",
   "type": "module",
   "description": "Silent soft-threshold compaction for Pi with native fallback",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -19,7 +21,9 @@
     "README.md"
   ],
   "pi": {
-    "extensions": ["./src/index.ts"]
+    "extensions": [
+      "./src/index.ts"
+    ]
   },
   "scripts": {
     "build": "esbuild src/index.ts --bundle --platform=node --format=esm --target=node22 --outfile=dist/shadow-compact.js --external:@earendil-works/pi-ai --external:@earendil-works/pi-coding-agent",
@@ -35,8 +39,8 @@
     "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "^0.84.4",
-    "@earendil-works/pi-coding-agent": "^0.84.4",
+    "@earendil-works/pi-ai": "^0.87.1",
+    "@earendil-works/pi-coding-agent": "^0.87.1",
     "@types/node": "^22.15.0",
     "esbuild": "^0.25.0",
     "tsx": "^4.20.0",
