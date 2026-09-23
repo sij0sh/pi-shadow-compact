@@ -268,13 +268,7 @@ The raw session history remains the durable evidence source; the checkpoint is t
 
 ## Install
 
-From npm:
-
-```bash
-pi install npm:pi-shadow-compact
-```
-
-Or from GitHub:
+From GitHub:
 
 ```bash
 pi install git:github.com/sij0sh/pi-shadow-compact
