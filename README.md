@@ -334,8 +334,7 @@ You can use different models for checkpoint generation and verification:
   },
 
   "thinkingLevel": "medium",
-  "verificationThinkingLevel": "high",
-  "summaryMaxTokens": 8192
+  "verificationThinkingLevel": "high"
 }
 ```
 
@@ -383,9 +382,9 @@ If the working context reaches it before Shadow has safely recovered enough spac
 
 ### `summaryMaxTokens`
 
-Controls the maximum generated checkpoint size.
+Optionally caps the generated checkpoint size. When omitted, Shadow does not impose its own output cap and lets the model/provider use its registered output limit.
 
-The goal is not to make the smallest possible summary. The goal is to retain enough operational state that another coding agent can continue correctly.
+Set this only when you intentionally want a smaller response. A low value can stop checkpoint generation before its strict JSON output is complete.
 
 ### Summarizer and verification reasoning
 

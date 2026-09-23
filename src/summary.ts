@@ -13,7 +13,6 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { NormalizedEvidence, NormalizedPacket, OverflowRecord } from "./normalize.js";
 import { readEnvFlag, type ShadowCompactConfig } from "./config.js";
 
-export const SUMMARY_MAX_TOKENS = 4096;
 /**
  * Retrieval-handshake caps. The model may request archived overflow text by
  * id instead of guessing from previews; each round re-injects full text into
@@ -228,7 +227,7 @@ async function runCheckpointAgent(
   const messages: Message[] = [];
   const usages: Usage[] = [];
   const options = {
-    maxTokens: request.maxTokens ?? SUMMARY_MAX_TOKENS,
+    ...(request.maxTokens !== undefined ? { maxTokens: request.maxTokens } : {}),
     ...(request.signal ? { signal: request.signal } : {}),
     ...(model.reasoning && request.thinkingLevel && request.thinkingLevel !== "off"
       ? { reasoning: request.thinkingLevel }

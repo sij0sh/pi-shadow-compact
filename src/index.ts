@@ -28,7 +28,6 @@ import { prepareSnapshot } from "./prepare.js";
 import { contextSwapDropCount, hasOrphanedToolResult } from "./swap.js";
 import { ShadowCompactStateController, type PreparedResult } from "./state.js";
 import {
-  SUMMARY_MAX_TOKENS,
   combineUsage,
   isActionFirstEnabled,
   resolveSummarizerModel,
@@ -309,15 +308,18 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       }
 
       const model = resolveSummarizerModel(ctx, config);
-      const maxTokens =
-        config.summaryMaxTokens ?? Math.min(SUMMARY_MAX_TOKENS, model.maxTokens ?? SUMMARY_MAX_TOKENS);
+      // An explicit override remains available, but the default request uses the
+      // model/provider output limit instead of imposing Shadow's old 4096-token cap.
+      const maxTokens = config.summaryMaxTokens;
       // The override decouples the summarizer budget from models.json: Pi keeps its own
       // context accounting while the summary request uses the deployment's real capacity.
       const contextWindow = config.summarizerContextTokens ?? model.contextWindow;
-      // Keep evidence usable when a large override is budgeted: never reserve more than
-      // half the context window, so the input side always retains room to work with.
+      // Budget against the output capacity even when no request cap is sent. This keeps
+      // enough context available for generation while allowing the provider to use the
+      // model's full registered output limit.
+      const outputBudget = maxTokens ?? model.maxTokens;
       const reservedTokens = Math.min(
-        maxTokens * 2 + 8192,
+        outputBudget * 2 + 8192,
         Math.floor(contextWindow / 2),
       );
       // Unit fix: context windows and reservations are tokens, but the
@@ -341,7 +343,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       const outcome = await runSummaryAgent(ctx, packet, config, {
         signal: controller.signal,
         model,
-        maxTokens,
+        ...(maxTokens !== undefined ? { maxTokens } : {}),
         ...(config.thinkingLevel ? { thinkingLevel: config.thinkingLevel } : {}),
       });
       if (bailIfStale()) return;
@@ -358,7 +360,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       const verified = await runVerificationAgent(ctx, packet, outcome.checkpoint, config, {
         signal: controller.signal,
         model: verifierModel,
-        maxTokens,
+        ...(maxTokens !== undefined ? { maxTokens } : {}),
         ...(verifierThinking ? { thinkingLevel: verifierThinking } : {}),
       });
       if (bailIfStale()) return;

@@ -19,14 +19,16 @@ const DEFERRED_MESSAGE =
   "shadow-compact: summary still preparing - swap deferred until the agent is idle";
 
 
-it("uses the default summary token cap and no reasoning without overrides", async () => {
+it("does not impose a summary token cap by default", async () => {
   const f = await fixture();
   try {
     await startPreparation(f);
-    const options = f.registry.optionsList[0];
-    assert.ok(options);
-    assert.equal(options.maxTokens, 4096);
-    assert.equal((options as { reasoning?: unknown }).reasoning, undefined);
+    assert.equal(f.registry.optionsList.length, 2);
+    for (const options of f.registry.optionsList) {
+      assert.ok(options);
+      assert.equal("maxTokens" in options, false);
+      assert.equal((options as { reasoning?: unknown }).reasoning, undefined);
+    }
   } finally {
     await f.cleanup();
   }
@@ -41,10 +43,12 @@ it("honors summaryMaxTokens and thinkingLevel overrides", async () => {
   });
   try {
     await startPreparation(f);
-    const options = f.registry.optionsList[0];
-    assert.ok(options);
-    assert.equal(options.maxTokens, 32_768);
-    assert.equal((options as { reasoning?: unknown }).reasoning, "high");
+    assert.equal(f.registry.optionsList.length, 2);
+    for (const options of f.registry.optionsList) {
+      assert.ok(options);
+      assert.equal(options.maxTokens, 32_768);
+      assert.equal((options as { reasoning?: unknown }).reasoning, "high");
+    }
   } finally {
     await f.cleanup();
   }

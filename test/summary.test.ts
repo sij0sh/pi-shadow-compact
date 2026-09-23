@@ -12,7 +12,6 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   ACTION_FIRST_ENV_VAR,
   RENDER_SECTIONS,
-  SUMMARY_MAX_TOKENS,
   isActionFirstEnabled,
   resolveRenderSections,
   resolveSummarizerModel,
@@ -265,7 +264,7 @@ describe("runSummaryAgent", () => {
     const prompt = messageText(call.context.messages[0]!);
     assert.match(prompt, /Create a durable continuation checkpoint/);
     assert.ok(prompt.includes(JSON.stringify(packet.evidence)));
-    assert.equal(call.options.maxTokens, SUMMARY_MAX_TOKENS);
+    assert.equal("maxTokens" in call.options, false);
     assert.equal(call.options.cacheRetention, "none");
     assert.match(call.options.sessionId ?? "", /^[0-9a-f-]{36}$/i);
     assert.equal(result.summary, renderedLegacy);
