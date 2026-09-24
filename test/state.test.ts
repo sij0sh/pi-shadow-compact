@@ -299,7 +299,7 @@ describe("ShadowCompactStateController", () => {
     assert.equal(controller.phase, "idle");
   });
 
-  it("tracks why a fallback is queued: failure is unconditional, hard-threshold is rechecked", () => {
+  it("tracks why a fallback is queued: failure is unconditional, emergency is rechecked", () => {
     const controller = new ShadowCompactStateController();
     assert.equal(controller.pendingFallbackReason, undefined);
 
@@ -313,7 +313,7 @@ describe("ShadowCompactStateController", () => {
     const preparing = prepare(controller);
     assert.equal(controller.requestNativeFallback(), true);
     assert.equal(preparing.controller.signal.aborted, true);
-    assert.equal(controller.pendingFallbackReason, "hard-threshold");
+    assert.equal(controller.pendingFallbackReason, "emergency");
     assert.equal(controller.clearPendingNativeFallback(), true);
     assert.equal(controller.pendingFallbackReason, undefined);
 
@@ -358,6 +358,39 @@ describe("ShadowCompactStateController", () => {
     assert.ok(controller.discardPublished());
     assert.equal(controller.swapCount, 0);
     assert.equal(controller.firstSwapTurn, undefined);
+  });
+
+  it("abortPreparing drops in-flight work without touching the serving checkpoint", () => {
+    const controller = new ShadowCompactStateController();
+    assert.equal(controller.abortPreparing(), false);
+
+    const first = prepare(controller);
+    assert.ok(first);
+    assert.equal(controller.publish(first.generation, prepared()), true);
+    const second = prepare(controller);
+    assert.ok(second);
+    assert.equal(controller.phase, "ready-preparing");
+    assert.equal(controller.abortPreparing(), true);
+    assert.equal(second.controller.signal.aborted, true);
+    assert.equal(controller.preparing, undefined);
+    assert.equal(controller.phase, "ready");
+    assert.ok(controller.published, "serving checkpoint survives");
+    assert.equal(controller.pendingNativeFallback, false, "no fallback queued");
+    assert.equal(controller.refreshArmed, true, "released attempts re-arm");
+    // The aborted completion no-ops on its stale generation.
+    assert.equal(controller.publish(second.generation, prepared()), false);
+    assert.equal(controller.fail(second.generation), false);
+  });
+
+  it("active is true once a published checkpoint has swapped", () => {
+    const controller = new ShadowCompactStateController();
+    assert.equal(controller.active, false);
+    const preparing = prepare(controller);
+    assert.ok(preparing);
+    assert.equal(controller.publish(preparing.generation, prepared()), true);
+    assert.equal(controller.active, false);
+    controller.markSwapped(3);
+    assert.equal(controller.active, true);
   });
 
   it("reset aborts preparing, clears everything, bumps generation, and re-arms", () => {

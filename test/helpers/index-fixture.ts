@@ -35,8 +35,11 @@ export const USAGE: Usage = {
 };
 const TIMESTAMP = "2026-01-01T00:00:00.000Z";
 
-function checkpointJson(evidenceId: string, objective = "Prepared continuation checkpoint"): string {
-  return JSON.stringify({
+function checkpointObject(
+  evidenceId: string,
+  objective = "Prepared continuation checkpoint",
+): Record<string, unknown> {
+  return {
     objective: [{ text: objective, evidenceRefs: [evidenceId] }],
     constraints: [],
     completedWork: [],
@@ -47,7 +50,13 @@ function checkpointJson(evidenceId: string, objective = "Prepared continuation c
     criticalContext: [],
     modifiedFiles: [],
     referencedFiles: [],
-  });
+    verificationState: [],
+    continuationState: {
+      currentGoal: objective,
+      currentApproach: "fake approach",
+      immediateNextStep: "fake next step",
+    },
+  };
 }
 
 function promptText(context: Context): string {
@@ -64,12 +73,12 @@ export class FakeRegistry {
   calls = 0;
   settled = 0;
   /**
-   * - "ok": every completion returns a valid checkpoint.
+   * - "ok": every completion behaves (reads, valid submits).
    * - "error": every completion fails (the draft never completes).
    * - "verifier-error": the draft succeeds but verifier completions fail.
    * - "verifier-invalid": the draft succeeds but verifier completions return
-   *   invalid JSON (both the attempt and its one retry).
-   * - "verifier-rewrite": the draft succeeds and the verifier returns a
+   *   text without tool calls (both the attempt and its one retry).
+   * - "verifier-rewrite": the draft succeeds and the verifier repairs with a
    *   differently worded valid checkpoint, proving publication uses the
    *   verified text.
    */
@@ -79,6 +88,7 @@ export class FakeRegistry {
   readonly models: Model<Api>[] = [];
   readonly signals: Array<AbortSignal | undefined> = [];
   readonly optionsList: Array<ModelsApiStreamOptions<Api> | undefined> = [];
+  readonly toolsUsed: boolean[] = [];
   readonly finds: Array<[string, string]> = [];
   readonly summaryModel = {
     api: "openai-completions",
@@ -105,44 +115,32 @@ export class FakeRegistry {
     this.signals.push(options?.signal);
     this.optionsList.push(options);
     this.prompts.push(promptText(context));
+    this.toolsUsed.push((context.tools?.length ?? 0) > 0);
     if (this.pendingGates.length > 0) await this.pendingGates.shift();
     this.settled++;
-    // Draft and verifier completions are distinguished by prompt content, not
-    // call index: retries and rolling refreshes interleave both kinds.
-    const isVerifierCall = (this.prompts.at(-1) ?? "").includes("Audit this draft");
-    if (this.mode === "error" || (this.mode === "verifier-error" && isVerifierCall)) {
-      return {
-        role: "assistant",
-        content: [],
-        api: model.api,
-        provider: model.provider,
-        model: model.id,
-        usage: USAGE,
-        stopReason: "error",
-        errorMessage: "synthetic failure",
-      } as unknown as AssistantMessage;
-    }
-    const evidenceId = this.prompts.at(-1)?.match(/"evidenceId":"([^"]+)"/)?.[1];
-    assert.ok(evidenceId, "summary prompt must contain normalized evidence");
-    if (this.mode === "verifier-invalid" && isVerifierCall) {
-      return {
-        role: "assistant",
-        content: [{ type: "text", text: "{not valid checkpoint json" }],
-        api: model.api,
-        provider: model.provider,
-        model: model.id,
-        usage: USAGE,
-        stopReason: "stop",
-        timestamp: Date.now(),
-      } as AssistantMessage;
-    }
-    const objective =
-      this.mode === "verifier-rewrite" && isVerifierCall
-        ? "Verified continuation checkpoint"
-        : "Prepared continuation checkpoint";
+    if ((context.tools?.length ?? 0) > 0) return this.completeToolCall(model, context);
+    // No tool-free scoring branch: every checkpoint model call carries agent
+    // tools, so a tool-free completion is an architectural regression.
+    throw new Error("fixture: unexpected tool-free model call during checkpoint generation");
+  }
+
+  private errorStop(model: Model<Api>): AssistantMessage {
     return {
       role: "assistant",
-      content: [{ type: "text", text: checkpointJson(evidenceId, objective) }],
+      content: [],
+      api: model.api,
+      provider: model.provider,
+      model: model.id,
+      usage: USAGE,
+      stopReason: "error",
+      errorMessage: "synthetic failure",
+    } as unknown as AssistantMessage;
+  }
+
+  private textResponse(model: Model<Api>, text: string): AssistantMessage {
+    return {
+      role: "assistant",
+      content: [{ type: "text", text }],
       api: model.api,
       provider: model.provider,
       model: model.id,
@@ -151,6 +149,93 @@ export class FakeRegistry {
       timestamp: Date.now(),
     } as AssistantMessage;
   }
+
+  private toolCallResponse(
+    model: Model<Api>,
+    calls: Array<{ name: string; args: Record<string, unknown> }>,
+  ): AssistantMessage {
+    return {
+      role: "assistant",
+      content: calls.map((call, index) => ({
+        type: "toolCall",
+        id: `fake-${this.calls}-${index}`,
+        name: call.name,
+        arguments: call.args,
+      })),
+      api: model.api,
+      provider: model.provider,
+      model: model.id,
+      usage: USAGE,
+      stopReason: "toolUse",
+      timestamp: Date.now(),
+    } as unknown as AssistantMessage;
+  }
+
+  /**
+   * Minimal tool-capable model: pages every turn via read_turn_range, then
+   * submits. Draft and verifier runs are distinguished by prompt content,
+   * not call index: retries and rolling refreshes interleave both kinds.
+   */
+  private completeToolCall(model: Model<Api>, context: Context): AssistantMessage {
+    const prompt = this.prompts.at(-1) ?? "";
+    assert.ok(prompt.includes("Session manifest"), "agent prompt must carry the session manifest");
+    // Draft and verifier completions are distinguished by prompt content, not
+    // call index: retries and rolling refreshes interleave both kinds.
+    const isVerifierCall = prompt.includes("Audit this draft");
+    if (this.mode === "error" || (this.mode === "verifier-error" && isVerifierCall)) {
+      return this.errorStop(model);
+    }
+    if (this.mode === "verifier-invalid" && isVerifierCall) {
+      return this.textResponse(model, "here is my verdict prose without any tool call");
+    }
+    const ranges = context.messages
+      .filter((message) => message.role === "toolResult")
+      .filter((message) => (message as { toolName?: unknown }).toolName === "read_turn_range")
+      .map((message) => {
+        const content = (message as { content: Array<{ text?: string }> }).content;
+        return JSON.parse(content[0]?.text ?? "{}") as {
+          startTurn: number;
+          endTurn: number;
+          totalTurns: number;
+          turns: Array<{ endEntryId: string }>;
+        };
+      });
+    const last = ranges.at(-1);
+    if (!last || last.endTurn < last.totalTurns) {
+      return this.toolCallResponse(model, [
+        {
+          name: "read_turn_range",
+          args: { startTurn: last ? last.endTurn + 1 : 1, count: 1000 },
+        },
+      ]);
+    }
+    const coverageEndEntryId = last.turns.at(-1)?.endEntryId ?? "";
+    if (!isVerifierCall) {
+      return this.toolCallResponse(model, [
+        {
+          name: "submit_checkpoint",
+          args: {
+            checkpoint: checkpointObject("E0001"),
+            coverageEndEntryId,
+          },
+        },
+      ]);
+    }
+    if (this.mode === "verifier-rewrite") {
+      return this.toolCallResponse(model, [
+        {
+          name: "submit_verdict",
+          args: {
+            verdict: "repair",
+            checkpoint: checkpointObject("E0001", "Verified continuation checkpoint"),
+            coverageEndEntryId,
+          },
+        },
+      ]);
+    }
+    return this.toolCallResponse(model, [{ name: "submit_verdict", args: { verdict: "accept" } }]);
+  }
+
 }
 
 export function userEntry(id: string, parentId: string | null, text: string): SessionEntry {
@@ -228,6 +313,11 @@ interface SharedSession {
   failNextAppend: boolean;
 }
 
+export interface RegisteredCommand {
+  description?: string;
+  handler: (args: string, ctx: unknown) => Promise<void>;
+}
+
 export interface Fixture {
   readonly registry: FakeRegistry;
   readonly compactCalls: CompactCall[];
@@ -235,8 +325,10 @@ export interface Fixture {
   readonly appendedEntries: AppendedEntry[];
   readonly branch: SessionEntry[];
   readonly agentDir: string;
+  readonly commands: Map<string, RegisteredCommand>;
   setBranch(entries: SessionEntry[]): void;
   setPercent(percent: number | undefined): void;
+  setUsage(tokens: number | null, contextWindow: number, percent?: number | null): void;
   /** Invalidates the captured ctx the way Pi does after session replacement. */
   setStale(): void;
   gate(): void;
@@ -258,6 +350,7 @@ export interface Fixture {
     reason?: SessionBeforeCompactEvent["reason"];
     customInstructions?: string;
     firstKeptEntryId?: string;
+    signal?: AbortSignal;
   }): SessionBeforeCompactEvent;
   cleanup(): Promise<void>;
 }
@@ -290,6 +383,7 @@ export async function fixture(globalConfig?: Record<string, unknown>): Promise<F
 
 function installInstance(shared: SharedSession): Fixture {
   const handlers = new Map<string, Handler[]>();
+  const commands = new Map<string, RegisteredCommand>();
   const appendCustomEntry = (customType: string, data?: unknown): void => {
     if (shared.failNextAppend) {
       shared.failNextAppend = false;
@@ -314,10 +408,17 @@ function installInstance(shared: SharedSession): Fixture {
       handlers.set(name, list);
     },
     appendEntry: appendCustomEntry,
+    registerCommand(name: string, options: RegisteredCommand) {
+      commands.set(name, options);
+    },
   } as unknown as ExtensionAPI;
   shadowCompact(pi);
 
-  let percent: number | undefined = 60;
+  let usage: { tokens: number | null; contextWindow: number; percent: number | null } | undefined = {
+    tokens: 600,
+    contextWindow: 1000,
+    percent: 60,
+  };
   let idle = false;
   let stale = false;
   const releases: Array<() => void> = [];
@@ -345,9 +446,7 @@ function installInstance(shared: SharedSession): Fixture {
     },
     getContextUsage: () => {
       throwIfStale();
-      return percent === undefined
-        ? undefined
-        : { tokens: percent * 10, contextWindow: 1000, percent };
+      return usage;
     },
     compact: (options?: CompactCall) => {
       throwIfStale();
@@ -381,6 +480,7 @@ function installInstance(shared: SharedSession): Fixture {
     compactCalls,
     notifications,
     agentDir: shared.agentDir,
+    commands,
     get appendedEntries() {
       return shared.appended;
     },
@@ -391,7 +491,14 @@ function installInstance(shared: SharedSession): Fixture {
       shared.branch = entries;
     },
     setPercent(next) {
-      percent = next;
+      usage = next === undefined ? undefined : { tokens: next * 10, contextWindow: 1000, percent: next };
+    },
+    setUsage(tokens, contextWindow, percent) {
+      usage = {
+        tokens,
+        contextWindow,
+        percent: percent ?? (tokens === null ? null : (tokens / contextWindow) * 100),
+      };
     },
     setStale() {
       stale = true;
@@ -458,7 +565,7 @@ function installInstance(shared: SharedSession): Fixture {
         ...(options.customInstructions === undefined ? {} : { customInstructions: options.customInstructions }),
         reason: options.reason ?? "threshold",
         willRetry: false,
-        signal: new AbortController().signal,
+        signal: options.signal ?? new AbortController().signal,
       };
     },
     async cleanup() {

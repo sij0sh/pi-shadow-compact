@@ -11,9 +11,15 @@ import { fixture, waitFor, tick } from "./helpers/index-fixture.js";
  * idle point racing teardown) keeps the checkpoint serving for a later retry.
  * These tests pin the stand-down behavior.
  */
+const SWAP_CONFIG = {
+  prepareThresholdPercent: 60,
+  summarizerModel: { provider: "", id: "" },
+  recentTurns: 1,
+};
+
 describe("stale context after session replacement", () => {
   it("a summary completion on a dead session releases quietly instead of crashing", async () => {
-    const f = await fixture();
+    const f = await fixture(SWAP_CONFIG);
     try {
       f.gate();
       await f.emit("turn_end");
@@ -22,7 +28,7 @@ describe("stale context after session replacement", () => {
       // The session dies while the summary runs.
       f.setStale();
       f.release();
-      await waitFor(() => f.registry.settled === 1);
+      await waitFor(() => f.registry.settled >= 1);
       await tick();
       await tick();
 
@@ -35,10 +41,10 @@ describe("stale context after session replacement", () => {
   });
 
   it("a failed append at settle keeps serving and retries at the next settle", async () => {
-    const f = await fixture();
+    const f = await fixture(SWAP_CONFIG);
     try {
       await f.emit("turn_end");
-      await waitFor(() => f.registry.settled === 2);
+      await waitFor(() => f.registry.settled === 4);
       await tick();
 
       // The idle point races teardown: the append throws, nothing crashes.

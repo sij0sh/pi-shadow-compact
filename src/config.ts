@@ -7,11 +7,21 @@ import {
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 
-export const DEFAULT_SOFT_COMPACT_THRESHOLD_PERCENT = 60;
-export const DEFAULT_HARD_COMPACT_THRESHOLD_PERCENT = 80;
+export const DEFAULT_PREPARE_THRESHOLD_PERCENT = 60;
+export const DEFAULT_SWAP_THRESHOLD_PERCENT = 80;
+export const DEFAULT_NATIVE_FALLBACK_THRESHOLD_PERCENT = 92;
+export const DEFAULT_IDLE_COMPACT_MIN_TOKENS = 20_000;
+export const DEFAULT_RECENT_TURNS = 10;
+
+/** Legacy aliases for the preparation/swap thresholds (one release). */
+export const DEFAULT_SOFT_COMPACT_THRESHOLD_PERCENT = DEFAULT_PREPARE_THRESHOLD_PERCENT;
+export const DEFAULT_HARD_COMPACT_THRESHOLD_PERCENT = DEFAULT_SWAP_THRESHOLD_PERCENT;
 
 export const SOFT_THRESHOLD_ENV_VAR = "SHADOW_COMPACT_SOFT_THRESHOLD_PERCENT";
 export const HARD_THRESHOLD_ENV_VAR = "SHADOW_COMPACT_HARD_THRESHOLD_PERCENT";
+export const NATIVE_THRESHOLD_ENV_VAR = "SHADOW_COMPACT_NATIVE_THRESHOLD_PERCENT";
+export const MANUAL_MODE_ENV_VAR = "SHADOW_COMPACT_MANUAL_MODE";
+export const IDLE_MIN_TOKENS_ENV_VAR = "SHADOW_COMPACT_IDLE_MIN_TOKENS";
 /**
  * Benchmark-only absolute soft trigger (env-only, never a file setting).
  * When set, the soft trigger compares raw context tokens instead of
@@ -25,7 +35,6 @@ export const HARD_THRESHOLD_ENV_VAR = "SHADOW_COMPACT_HARD_THRESHOLD_PERCENT";
  */
 export const SOFT_THRESHOLD_ABS_ENV_VAR = "SHADOW_COMPACT_SOFT_THRESHOLD_ABS";
 export const ROLLING_ENV_VAR = "SHADOW_COMPACT_ROLLING";
-export const TARGET_TAIL_ENV_VAR = "SHADOW_COMPACT_TARGET_TAIL_PERCENT";
 export const MODE_ENV_VAR = "SHADOW_COMPACT_MODE";
 /**
  * Benchmark-only summarizer overrides (all default-off). Provider and ID are
@@ -77,23 +86,6 @@ export function isObserveMode(): boolean {
   return readEnvFlag(MODE_ENV_VAR) === "observe";
 }
 
-/**
- * Derives Shadow's retained-tail budget from the experimental tail knob.
- *
- * Keeps approximately targetTailPercent of the session model's context window
- * as verbatim recent history after the checkpoint boundary. Capped at Pi's
- * keepRecentTokens so an absent, tiny-window, or oversized target leaves
- * production behavior unchanged.
- */
-export function resolveKeepRecentTokens(
-  piKeepRecentTokens: number,
-  targetTailPercent: number | undefined,
-  contextWindow: number | undefined,
-): number {
-  if (targetTailPercent === undefined || contextWindow === undefined) return piKeepRecentTokens;
-  return Math.min(piKeepRecentTokens, Math.floor((contextWindow * targetTailPercent) / 100));
-}
-
 export const THINKING_LEVELS = [
   "off",
   "minimal",
@@ -104,19 +96,22 @@ export const THINKING_LEVELS = [
   "max",
 ] as const satisfies readonly ModelThinkingLevel[];
 
+export type ManualCompactMode = "shadow" | "native";
+
 export interface ShadowCompactConfig {
-  softCompactThresholdPercent: number;
-  hardCompactThresholdPercent: number;
-  /** Benchmark-only absolute soft trigger in tokens (env-only, never from file). */
+  /** Usage percent where checkpoint preparation starts. */
+  prepareThresholdPercent: number;
+  /** Usage percent where a ready checkpoint becomes the mandatory working context. */
+  swapThresholdPercent: number;
+  /** Emergency percent for one native compaction (true provider-limit path). */
+  nativeFallbackThresholdPercent: number;
+  /** Benchmark-only absolute prepare trigger in tokens (env-only, never from file). */
   softCompactThresholdTokens?: number;
-  /** Experimental harness knob (env-only): retained-tail budget as context-window percent. */
-  targetTailPercent?: number;
   summarizerModel: {
     provider: string;
     id: string;
   };
   summaryMaxTokens?: number;
-  summarizerContextTokens?: number;
   thinkingLevel?: ModelThinkingLevel;
   /**
    * Second-pass verification model (verifier.md). Optional so existing
@@ -129,13 +124,24 @@ export interface ShadowCompactConfig {
   };
   /** Verifier reasoning level; falls back to `thinkingLevel` when unset. */
   verificationThinkingLevel?: ModelThinkingLevel;
+  idleCompact: {
+    enabled: boolean;
+    minimumTokens: number;
+  };
+  /** Minimum complete recent turns retained verbatim past any checkpoint. */
+  recentTurns: number;
+  manualCompactMode: ManualCompactMode;
 }
 
 export function defaultConfig(): ShadowCompactConfig {
   return {
-    softCompactThresholdPercent: DEFAULT_SOFT_COMPACT_THRESHOLD_PERCENT,
-    hardCompactThresholdPercent: DEFAULT_HARD_COMPACT_THRESHOLD_PERCENT,
+    prepareThresholdPercent: DEFAULT_PREPARE_THRESHOLD_PERCENT,
+    swapThresholdPercent: DEFAULT_SWAP_THRESHOLD_PERCENT,
+    nativeFallbackThresholdPercent: DEFAULT_NATIVE_FALLBACK_THRESHOLD_PERCENT,
     summarizerModel: { provider: "", id: "" },
+    idleCompact: { enabled: true, minimumTokens: DEFAULT_IDLE_COMPACT_MIN_TOKENS },
+    recentTurns: DEFAULT_RECENT_TURNS,
+    manualCompactMode: "shadow",
   };
 }
 
@@ -204,19 +210,22 @@ function parseEnvThinking(name: string): ModelThinkingLevel | undefined {
 }
 
 /**
- * Resolved soft-trigger comparison. An absolute token threshold wins when
+ * Resolved prepare-trigger comparison. An absolute token threshold wins when
  * set and the runtime reports a token count; otherwise the percent
  * threshold applies. Single abstraction for both the initial trigger and
  * the rolling below-threshold re-arm so hysteresis stays consistent.
  */
-export interface SoftThresholdUsage {
+export interface ThresholdUsage {
   tokens?: number | null | undefined;
   percent?: number | null | undefined;
 }
 
-export function isAtOrAboveSoft(
-  usage: SoftThresholdUsage,
-  config: Pick<ShadowCompactConfig, "softCompactThresholdPercent" | "softCompactThresholdTokens">,
+/** Legacy alias for ThresholdUsage. */
+export type SoftThresholdUsage = ThresholdUsage;
+
+export function isAtOrAbovePrepare(
+  usage: ThresholdUsage,
+  config: Pick<ShadowCompactConfig, "prepareThresholdPercent" | "softCompactThresholdTokens">,
 ): boolean {
   if (
     config.softCompactThresholdTokens !== undefined &&
@@ -228,15 +237,41 @@ export function isAtOrAboveSoft(
   return (
     usage.percent !== undefined &&
     usage.percent !== null &&
-    usage.percent >= config.softCompactThresholdPercent
+    usage.percent >= config.prepareThresholdPercent
   );
 }
 
-export function isBelowSoft(
-  usage: SoftThresholdUsage,
-  config: Pick<ShadowCompactConfig, "softCompactThresholdPercent" | "softCompactThresholdTokens">,
+export function isBelowPrepare(
+  usage: ThresholdUsage,
+  config: Pick<ShadowCompactConfig, "prepareThresholdPercent" | "softCompactThresholdTokens">,
 ): boolean {
-  return !isAtOrAboveSoft(usage, config);
+  return !isAtOrAbovePrepare(usage, config);
+}
+
+/** Legacy aliases: the soft threshold is the prepare threshold. */
+export const isAtOrAboveSoft = isAtOrAbovePrepare;
+export const isBelowSoft = isBelowPrepare;
+
+export function isAtOrAboveSwap(
+  usage: ThresholdUsage,
+  config: Pick<ShadowCompactConfig, "swapThresholdPercent">,
+): boolean {
+  return (
+    usage.percent !== undefined &&
+    usage.percent !== null &&
+    usage.percent >= config.swapThresholdPercent
+  );
+}
+
+export function isAtOrAboveNativeFallback(
+  usage: ThresholdUsage,
+  config: Pick<ShadowCompactConfig, "nativeFallbackThresholdPercent">,
+): boolean {
+  return (
+    usage.percent !== undefined &&
+    usage.percent !== null &&
+    usage.percent >= config.nativeFallbackThresholdPercent
+  );
 }
 
 function assertEnvPair(
@@ -250,11 +285,22 @@ function assertEnvPair(
   }
 }
 
+function parseEnvManualMode(): ManualCompactMode | undefined {
+  const env = rawEnv(MANUAL_MODE_ENV_VAR);
+  if (env === undefined) return undefined;
+  if (env.trimmed !== "shadow" && env.trimmed !== "native") {
+    throw new Error(`${MANUAL_MODE_ENV_VAR} must be "shadow" or "native", got ${JSON.stringify(env.raw)}`);
+  }
+  return env.trimmed;
+}
+
 export function applyEnvOverrides(config: ShadowCompactConfig): ShadowCompactConfig {
   const soft = parseEnvThreshold(SOFT_THRESHOLD_ENV_VAR);
   const hard = parseEnvThreshold(HARD_THRESHOLD_ENV_VAR);
+  const native = parseEnvThreshold(NATIVE_THRESHOLD_ENV_VAR);
   const softTokens = parseEnvTokenCount(SOFT_THRESHOLD_ABS_ENV_VAR);
-  const targetTail = parseEnvThreshold(TARGET_TAIL_ENV_VAR);
+  const idleMinTokens = parseEnvTokenCount(IDLE_MIN_TOKENS_ENV_VAR);
+  const manualMode = parseEnvManualMode();
   const summarizerProvider = parseOptionalString(SUMMARIZER_PROVIDER_ENV_VAR);
   const summarizerId = parseOptionalString(SUMMARIZER_ID_ENV_VAR);
   assertEnvPair(summarizerProvider, SUMMARIZER_PROVIDER_ENV_VAR, summarizerId, SUMMARIZER_ID_ENV_VAR);
@@ -265,10 +311,14 @@ export function applyEnvOverrides(config: ShadowCompactConfig): ShadowCompactCon
   const verifierThinking = parseEnvThinking(VERIFIER_THINKING_ENV_VAR);
   const merged: ShadowCompactConfig = {
     ...config,
-    ...(soft !== undefined ? { softCompactThresholdPercent: soft } : {}),
-    ...(hard !== undefined ? { hardCompactThresholdPercent: hard } : {}),
+    ...(soft !== undefined ? { prepareThresholdPercent: soft } : {}),
+    ...(hard !== undefined ? { swapThresholdPercent: hard } : {}),
+    ...(native !== undefined ? { nativeFallbackThresholdPercent: native } : {}),
     ...(softTokens !== undefined ? { softCompactThresholdTokens: softTokens } : {}),
-    ...(targetTail !== undefined ? { targetTailPercent: targetTail } : {}),
+    ...(idleMinTokens !== undefined
+      ? { idleCompact: { ...config.idleCompact, minimumTokens: idleMinTokens } }
+      : {}),
+    ...(manualMode !== undefined ? { manualCompactMode: manualMode } : {}),
     ...(summarizerProvider !== undefined && summarizerId !== undefined
       ? { summarizerModel: { provider: summarizerProvider, id: summarizerId } }
       : {}),
@@ -278,17 +328,26 @@ export function applyEnvOverrides(config: ShadowCompactConfig): ShadowCompactCon
       : {}),
     ...(verifierThinking !== undefined ? { verificationThinkingLevel: verifierThinking } : {}),
   };
-  // File-only pairs keep their existing validation: an explicit file hard threshold
-  // must exceed soft, while an implicit default hard may equal it. The merged
-  // check below applies only when env moves at least one threshold, so file
+  // File-only pairs keep their existing validation: an explicit file swap
+  // threshold must exceed prepare, while implicit defaults fill silently.
+  // The merged checks below apply only when env moves a threshold, so file
   // behavior stays byte-identical and env misuse still fails fast.
   if (
     (soft !== undefined || hard !== undefined) &&
-    merged.hardCompactThresholdPercent <= merged.softCompactThresholdPercent
+    merged.swapThresholdPercent <= merged.prepareThresholdPercent
   ) {
     throw new Error(
-      `${HARD_THRESHOLD_ENV_VAR} must be greater than the soft threshold ` +
-        `(${merged.softCompactThresholdPercent}), got ${merged.hardCompactThresholdPercent}`,
+      `${HARD_THRESHOLD_ENV_VAR} must be greater than the prepare threshold ` +
+        `(${merged.prepareThresholdPercent}), got ${merged.swapThresholdPercent}`,
+    );
+  }
+  if (
+    native !== undefined &&
+    merged.nativeFallbackThresholdPercent <= merged.swapThresholdPercent
+  ) {
+    throw new Error(
+      `${NATIVE_THRESHOLD_ENV_VAR} must be greater than the swap threshold ` +
+        `(${merged.swapThresholdPercent}), got ${merged.nativeFallbackThresholdPercent}`,
     );
   }
   return merged;
@@ -357,6 +416,69 @@ function parseThinkingLevel(value: unknown, path: string, key: string): ModelThi
   return value as ModelThinkingLevel;
 }
 
+function parseFileThreshold(value: unknown, path: string, key: string): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error(`${path} ${key} must be a number`);
+  }
+  if (value < 1 || value > 99) {
+    throw new Error(`${path} ${key} must be between 1 and 99`);
+  }
+  return value;
+}
+
+/**
+ * Resolves a canonical threshold key with its legacy alias. Both present
+ * with different values is a config bug and throws; otherwise the explicit
+ * value wins and the default fills a fully absent threshold.
+ */
+function resolveThreshold(
+  record: Record<string, unknown>,
+  path: string,
+  key: string,
+  aliasKey: string,
+  defaultValue: number,
+): number {
+  const primary = parseFileThreshold(record[key], path, key);
+  const alias = parseFileThreshold(record[aliasKey], path, aliasKey);
+  if (primary !== undefined && alias !== undefined && primary !== alias) {
+    throw new Error(`${path} ${key} and legacy ${aliasKey} conflict; use ${key}`);
+  }
+  return primary ?? alias ?? defaultValue;
+}
+
+function parseBoolean(value: unknown, path: string, key: string): boolean | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") {
+    throw new Error(`${path} ${key} must be a boolean`);
+  }
+  return value;
+}
+
+function parseManualMode(value: unknown, path: string): ManualCompactMode | undefined {
+  if (value === undefined) return undefined;
+  if (value !== "shadow" && value !== "native") {
+    throw new Error(`${path} manualCompactMode must be "shadow" or "native"`);
+  }
+  return value;
+}
+
+function parseIdleCompact(
+  value: unknown,
+  path: string,
+): ShadowCompactConfig["idleCompact"] | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${path} idleCompact must be an object`);
+  }
+  const record = value as Record<string, unknown>;
+  assertKnownKeys(record, ["enabled", "minimumTokens"], path, "idleCompact");
+  const enabled = parseBoolean(record.enabled, path, "idleCompact.enabled") ?? true;
+  const minimumTokens = parsePositiveInt(record.minimumTokens, path, "idleCompact.minimumTokens")
+    ?? DEFAULT_IDLE_COMPACT_MIN_TOKENS;
+  return { enabled, minimumTokens };
+}
+
 export function parseConfig(source: string, path: string): ShadowCompactConfig {
   let value: unknown;
   try {
@@ -371,56 +493,71 @@ export function parseConfig(source: string, path: string): ShadowCompactConfig {
   assertKnownKeys(
     record,
     [
+      "prepareThresholdPercent",
+      "swapThresholdPercent",
+      "nativeFallbackThresholdPercent",
       "softCompactThresholdPercent",
       "hardCompactThresholdPercent",
       "summarizerModel",
       "summaryMaxTokens",
-      "summarizerContextTokens",
       "thinkingLevel",
       "verificationModel",
       "verificationThinkingLevel",
+      "idleCompact",
+      "recentTurns",
+      "manualCompactMode",
     ],
     path,
     "",
   );
 
-  const rawThreshold = record.softCompactThresholdPercent;
-  if (typeof rawThreshold !== "number" || !Number.isFinite(rawThreshold)) {
-    throw new Error(`${path} softCompactThresholdPercent must be a number`);
+  const prepareThresholdPercent = resolveThreshold(
+    record,
+    path,
+    "prepareThresholdPercent",
+    "softCompactThresholdPercent",
+    DEFAULT_PREPARE_THRESHOLD_PERCENT,
+  );
+  const swapThresholdPercent = resolveThreshold(
+    record,
+    path,
+    "swapThresholdPercent",
+    "hardCompactThresholdPercent",
+    DEFAULT_SWAP_THRESHOLD_PERCENT,
+  );
+  const swapExplicit = record.swapThresholdPercent !== undefined || record.hardCompactThresholdPercent !== undefined;
+  if (swapExplicit && swapThresholdPercent <= prepareThresholdPercent) {
+    throw new Error(`${path} swapThresholdPercent must be greater than prepareThresholdPercent`);
   }
-  if (rawThreshold < 1 || rawThreshold > 99) {
-    throw new Error(`${path} softCompactThresholdPercent must be between 1 and 99`);
+  const nativeFallbackThresholdPercent = parseFileThreshold(
+    record.nativeFallbackThresholdPercent,
+    path,
+    "nativeFallbackThresholdPercent",
+  ) ?? DEFAULT_NATIVE_FALLBACK_THRESHOLD_PERCENT;
+  if (
+    record.nativeFallbackThresholdPercent !== undefined &&
+    nativeFallbackThresholdPercent <= swapThresholdPercent
+  ) {
+    throw new Error(`${path} nativeFallbackThresholdPercent must be greater than swapThresholdPercent`);
   }
 
-  const { provider, id } = parseModelPair(record.summarizerModel, path, "summarizerModel");
+  const summarizer = record.summarizerModel === undefined
+    ? { provider: "", id: "" }
+    : parseModelPair(record.summarizerModel, path, "summarizerModel");
 
   const config: ShadowCompactConfig = {
-    softCompactThresholdPercent: rawThreshold,
-    hardCompactThresholdPercent: DEFAULT_HARD_COMPACT_THRESHOLD_PERCENT,
-    summarizerModel: { provider, id },
+    prepareThresholdPercent,
+    swapThresholdPercent,
+    nativeFallbackThresholdPercent,
+    summarizerModel: summarizer,
+    idleCompact: parseIdleCompact(record.idleCompact, path)
+      ?? { enabled: true, minimumTokens: DEFAULT_IDLE_COMPACT_MIN_TOKENS },
+    recentTurns: parsePositiveInt(record.recentTurns, path, "recentTurns") ?? DEFAULT_RECENT_TURNS,
+    manualCompactMode: parseManualMode(record.manualCompactMode, path) ?? "shadow",
   };
-
-  const rawHardThreshold = record.hardCompactThresholdPercent;
-  if (rawHardThreshold !== undefined) {
-    if (typeof rawHardThreshold !== "number" || !Number.isFinite(rawHardThreshold)) {
-      throw new Error(`${path} hardCompactThresholdPercent must be a number`);
-    }
-    if (rawHardThreshold < 1 || rawHardThreshold > 99) {
-      throw new Error(`${path} hardCompactThresholdPercent must be between 1 and 99`);
-    }
-    if (rawHardThreshold <= config.softCompactThresholdPercent) {
-      throw new Error(
-        `${path} hardCompactThresholdPercent must be greater than softCompactThresholdPercent`,
-      );
-    }
-    config.hardCompactThresholdPercent = rawHardThreshold;
-  }
 
   const maxTokens = parsePositiveInt(record.summaryMaxTokens, path, "summaryMaxTokens");
   if (maxTokens !== undefined) config.summaryMaxTokens = maxTokens;
-
-  const contextTokens = parsePositiveInt(record.summarizerContextTokens, path, "summarizerContextTokens");
-  if (contextTokens !== undefined) config.summarizerContextTokens = contextTokens;
 
   const thinkingLevel = parseThinkingLevel(record.thinkingLevel, path, "thinkingLevel");
   if (thinkingLevel !== undefined) config.thinkingLevel = thinkingLevel;

@@ -5,9 +5,9 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { buildSessionContext, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { MODE_ENV_VAR } from "../src/config.js";
-import { normalizeSnapshot } from "../src/normalize.js";
 import {
   CHECKPOINT_CUSTOM_TYPE,
+  CHECKPOINT_CUSTOM_TYPE_LEGACY,
   collectShadowSummaries,
   checkpointStalenessReason,
   findLatestPersistedCheckpoint,
@@ -16,9 +16,12 @@ import {
   SHADOW_CHAIN_LIMIT,
   toPreparedResult,
   type PersistedShadowCheckpoint,
+  type PersistedShadowCheckpointV1,
+  type PersistedShadowCheckpointV2Legacy,
+  type PersistedShadowCheckpointV3,
 } from "../src/persist.js";
-import { prepareSnapshot } from "../src/prepare.js";
 import { combineUsage } from "../src/summary.js";
+import { SessionHistoryIndex } from "../src/session-reader.js";
 import { TRACE_FILE_ENV_VAR } from "../src/trace.js";
 import {
   fixture,
@@ -60,7 +63,75 @@ function toolResultEntry(id: string, parentId: string, callId: string): SessionE
   } as unknown as SessionEntry;
 }
 
-function checkpointData(overrides: Partial<PersistedShadowCheckpoint> = {}): PersistedShadowCheckpoint {
+const SWAP_CONFIG = {
+  prepareThresholdPercent: 60,
+  summarizerModel: { provider: "", id: "" },
+  recentTurns: 1,
+};
+
+function structuredFixture(): PersistedShadowCheckpointV3["structured"] {
+  return {
+    objective: [{ text: "objective", evidenceRefs: ["E0001"] }],
+    constraints: [],
+    completedWork: [],
+    currentState: [],
+    decisions: [],
+    openIssues: [],
+    nextActions: [],
+    criticalContext: [],
+    modifiedFiles: [],
+    referencedFiles: [],
+    verificationState: [],
+    continuationState: {
+      currentGoal: "goal",
+      currentApproach: "approach",
+      immediateNextStep: "next",
+    },
+  };
+}
+
+function checkpointDataV3(
+  overrides: Partial<PersistedShadowCheckpointV3> = {},
+): PersistedShadowCheckpointV3 {
+  return {
+    ...checkpointData(),
+    version: 3,
+    structured: structuredFixture(),
+    coverage: {
+      sourceStartEntryId: null,
+      coverageEndEntryId: "e3",
+      preparedAtLeafId: "e4",
+      publishedAtLeafId: "e4",
+    },
+    prompts: { summaryPromptVersion: 2, verifierPromptVersion: 2 },
+    generatedAt: 0,
+    ...overrides,
+  };
+}
+
+function checkpointDataV2Legacy(
+  overrides: Partial<PersistedShadowCheckpointV2Legacy> = {},
+): PersistedShadowCheckpointV2Legacy {
+  return {
+    ...checkpointData(),
+    version: 2,
+    structured: structuredFixture(),
+    coverage: {
+      sourceStartEntryId: null,
+      coverageEndEntryId: "e3",
+      preparedAtLeafId: "e4",
+      publishedAtLeafId: "e4",
+    },
+    prompts: { summaryPromptVersion: 2, verifierPromptVersion: 2, relevancePromptVersion: 1 },
+    historicTurns: [],
+    generatedAt: 0,
+    ...overrides,
+  };
+}
+
+function checkpointData(
+  overrides: Partial<PersistedShadowCheckpointV1> = {},
+): PersistedShadowCheckpointV1 {
   return {
     version: 1,
     checkpointId: "checkpoint-test",
@@ -194,6 +265,97 @@ describe("persisted checkpoint validation", () => {
     assert.equal(result.contextTokensBefore, 600);
     assert.deepEqual(result.usage, USAGE);
     assert.deepEqual(result.details, { readFiles: ["src/read.ts"], modifiedFiles: ["src/edited.ts"] });
+    assert.equal(result.coverage, undefined);
+    assert.equal(result.structured, undefined);
+  });
+
+  it("accepts v3 checkpoints and rejects malformed v3 payloads", () => {
+    assert.equal(isPersistedShadowCheckpoint(checkpointDataV3()), true);
+    assert.equal(isPersistedShadowCheckpoint({ ...checkpointDataV3(), structured: {} }), false);
+    assert.equal(isPersistedShadowCheckpoint({ ...checkpointDataV3(), coverage: null }), false);
+    assert.equal(
+      isPersistedShadowCheckpoint({ ...checkpointDataV3(), coverage: { coverageEndEntryId: "e3" } }),
+      false,
+    );
+    assert.equal(isPersistedShadowCheckpoint({ ...checkpointDataV3(), prompts: {} }), false);
+    assert.equal(isPersistedShadowCheckpoint({ ...checkpointDataV3(), generatedAt: "now" }), false);
+    assert.equal(isPersistedShadowCheckpoint({ ...checkpointDataV3(), version: 4 }), false);
+  });
+
+  it("accepts legacy v2 checkpoints and rejects malformed v2 payloads", () => {
+    assert.equal(isPersistedShadowCheckpoint(checkpointDataV2Legacy()), true);
+    // The Jev payload must be structurally present (a corrupt v2 entry is
+    // skipped like any corrupt entry) even though restore ignores it.
+    assert.equal(
+      isPersistedShadowCheckpoint({ ...checkpointDataV2Legacy(), historicTurns: {} }),
+      false,
+    );
+    assert.equal(
+      isPersistedShadowCheckpoint({
+        ...checkpointDataV2Legacy(),
+        prompts: { summaryPromptVersion: 2, verifierPromptVersion: 2 },
+      }),
+      false,
+    );
+    assert.equal(isPersistedShadowCheckpoint({ ...checkpointDataV2Legacy(), structured: {} }), false);
+    assert.equal(
+      isPersistedShadowCheckpoint({ ...checkpointDataV2Legacy(), generatedAt: "now" }),
+      false,
+    );
+  });
+
+  it("reports missing-coverage-end for v2 and v3 checkpoints off the branch", async () => {
+    const f = await fixture();
+    try {
+      // The v2 arm is the migration regression: old checkpoints must not
+      // skip coverage validation just because the schema moved to v3.
+      for (const data of [checkpointDataV2Legacy(), checkpointDataV3()]) {
+        assert.equal(checkpointStalenessReason(f.branch, "session-1", data), undefined);
+        assert.equal(
+          checkpointStalenessReason(f.branch, "session-1", {
+            ...data,
+            coverage: {
+              sourceStartEntryId: null,
+              coverageEndEntryId: "missing",
+              preparedAtLeafId: "e4",
+              publishedAtLeafId: "e4",
+            },
+          }),
+          "missing-coverage-end",
+        );
+      }
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it("round-trips a v3 checkpoint back into the serving shape", () => {
+    const data = checkpointDataV3({ checkpointId: "round-trip-v3" });
+    const result = toPreparedResult(data);
+    assert.equal(result.checkpointId, "round-trip-v3");
+    assert.equal(result.coverage?.coverageEndEntryId, "e3");
+    assert.equal(result.structured?.objective[0]?.text, "objective");
+    assert.deepEqual(result.prompts, {
+      summaryPromptVersion: 2,
+      verifierPromptVersion: 2,
+    });
+    assert.ok(!("historicTurns" in result));
+  });
+
+  it("restores a legacy v2 checkpoint while discarding its Jev payload", () => {
+    const data = checkpointDataV2Legacy({
+      checkpointId: "round-trip-v2",
+      historicTurns: [{ turn: { id: "turn-1" }, relevance: 0.9, reason: "fake" }],
+    });
+    const result = toPreparedResult(data);
+    assert.equal(result.checkpointId, "round-trip-v2");
+    assert.equal(result.coverage?.coverageEndEntryId, "e3");
+    assert.equal(result.structured?.objective[0]?.text, "objective");
+    assert.deepEqual(result.prompts, {
+      summaryPromptVersion: 2,
+      verifierPromptVersion: 2,
+    });
+    assert.ok(!("historicTurns" in result));
   });
 });
 
@@ -232,7 +394,7 @@ describe("newest current checkpoint wins", () => {
 
   it("reload serves the older current checkpoint past a stale newest one", async () => {
     const { events } = await withTraceFile(async () => {
-      const f = await fixture();
+      const f = await fixture(SWAP_CONFIG);
       try {
         f.appendCustom(checkpointData({ checkpointId: "A", summary: "SUMMARY-A" }));
         f.appendCustom(
@@ -262,7 +424,7 @@ describe("newest current checkpoint wins", () => {
 
   it("skips the swap when the restored cut would orphan a tool result", async () => {
     const { events } = await withTraceFile(async () => {
-      const f = await fixture();
+      const f = await fixture(SWAP_CONFIG);
       try {
         f.setBranch([
           userEntry("e1", null, "one"),
@@ -293,15 +455,68 @@ describe("newest current checkpoint wins", () => {
     assert.equal(swaps[0]?.action, "skipped-orphan");
     assert.equal(swaps[0]?.messagesDropped, 2);
   });
+
+  it("reload serves a legacy v2 checkpoint while discarding its obsolete historic-turn payload", async () => {
+    const f = await fixture(SWAP_CONFIG);
+    try {
+      f.appendCustom(
+        checkpointDataV2Legacy({
+          checkpointId: "V2",
+          summary: "SUMMARY-V2",
+          // Obsolete payload, including entries long off the branch: restore
+          // must ignore it entirely, not filter or serve it.
+          historicTurns: [
+            { turn: { id: "turn-1", entryIds: ["gone"] }, relevance: 1, reason: "fake" },
+          ],
+        }),
+      );
+      const g = f.restart();
+      try {
+        await g.emit("session_start");
+        const outcome = (await g.emit("context", { messages: g.contextMessages() })) as {
+          messages: Array<Record<string, unknown>>;
+        };
+        const summary = outcome.messages[0]?.summary as string;
+        assert.match(summary, /SUMMARY-V2/);
+        assert.ok(!summary.includes("turn-1"));
+      } finally {
+        await g.cleanup();
+      }
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it("reads checkpoints persisted under the legacy namespace", async () => {
+    const f = await fixture(SWAP_CONFIG);
+    try {
+      f.appendCustom(
+        checkpointData({ checkpointId: "LEGACY", summary: "SUMMARY-LEGACY" }),
+        CHECKPOINT_CUSTOM_TYPE_LEGACY,
+      );
+      const g = f.restart();
+      try {
+        await g.emit("session_start");
+        const outcome = (await g.emit("context", { messages: g.contextMessages() })) as {
+          messages: Array<Record<string, unknown>>;
+        };
+        assert.match(outcome.messages[0]?.summary as string, /SUMMARY-LEGACY/);
+      } finally {
+        await g.cleanup();
+      }
+    } finally {
+      await f.cleanup();
+    }
+  });
 });
 
 describe("soft durability without compaction", () => {
   it("persists once at settle with the full checkpoint payload; raw evidence stays intact", async () => {
     const { events } = await withTraceFile(async () => {
-      const f = await fixture();
+      const f = await fixture(SWAP_CONFIG);
       try {
         await f.emit("turn_end");
-        await waitFor(() => f.registry.settled === 2);
+        await waitFor(() => f.registry.settled === 4);
         await tick();
         await f.emit("agent_settled");
 
@@ -310,7 +525,8 @@ describe("soft durability without compaction", () => {
         const [persisted] = f.appendedEntries;
         assert.equal(persisted?.customType, CHECKPOINT_CUSTOM_TYPE);
         const data = persisted?.data as PersistedShadowCheckpoint;
-        assert.equal(data.version, 1);
+        assert.equal(data.version, 3);
+        assert.ok(data.version === 3);
         assert.ok(typeof data.checkpointId === "string" && data.checkpointId.length > 0);
         assert.equal(data.sessionId, "session-1");
         assert.match(data.summary, /Prepared continuation checkpoint/);
@@ -318,12 +534,21 @@ describe("soft durability without compaction", () => {
         assert.equal(data.leafId, "e4");
         assert.equal(data.latestCompactionId, null);
         assert.equal(data.contextTokensBefore, 600);
-        assert.deepEqual(data.usage, combineUsage(USAGE, USAGE));
+        assert.deepEqual(data.usage, [USAGE, USAGE, USAGE, USAGE].reduce(combineUsage));
         assert.deepEqual(data.details, {
           readFiles: ["src/read.ts"],
           modifiedFiles: ["src/edited.ts"],
         });
         assert.ok(typeof data.createdAt === "number");
+        assert.equal(data.coverage.coverageEndEntryId, "e4");
+        assert.equal(data.coverage.preparedAtLeafId, "e4");
+        assert.equal(data.coverage.publishedAtLeafId, "e4");
+        assert.deepEqual(data.prompts, {
+          summaryPromptVersion: 2,
+          verifierPromptVersion: 2,
+        });
+        assert.match(data.structured.objective[0]?.text ?? "", /Prepared continuation checkpoint/);
+        assert.ok(!("historicTurns" in data), "v3 carries no historic-turn payload");
 
         // The session file still holds the complete raw pre-checkpoint evidence.
         const ids = f.branch.map((entry) => entry.id);
@@ -352,10 +577,10 @@ describe("soft durability without compaction", () => {
     }
   });
 
-  it("the hard hatch still runs one native compaction and persists nothing", async () => {
+  it("the emergency hatch still runs one native compaction and persists nothing", async () => {
     const f = await fixture();
     try {
-      f.setPercent(80);
+      f.setPercent(92);
       await f.emit("turn_end");
       await f.emit("agent_settled");
       assert.deepEqual(f.compactCalls, [{}]);
@@ -369,11 +594,11 @@ describe("soft durability without compaction", () => {
 describe("persistent two-turn lifecycle with reload", () => {
   it("turn 1 persists A, turn 2 replaces it with B, reload restores B serving", async () => {
     const { result, events } = await withTraceFile(async () => {
-      const f = await fixture();
+      const f = await fixture(SWAP_CONFIG);
       try {
         // USER TURN 1: cross 60% -> prepare A -> publish -> swap -> settle -> persist A.
         await f.emit("turn_end");
-        await waitFor(() => f.registry.settled === 2);
+        await waitFor(() => f.registry.settled === 4);
         await tick();
         const swapA = (await f.emit("context", { messages: f.contextMessages() })) as {
           messages: Array<Record<string, unknown>>;
@@ -389,15 +614,15 @@ describe("persistent two-turn lifecycle with reload", () => {
         assert.ok(stillA, "A still serves");
         f.setPercent(30);
         await f.emit("turn_end");
-        assert.equal(f.registry.calls, 2, "below-soft re-arms without preparing");
+        assert.equal(f.registry.calls, 4, "below-threshold re-arms without preparing");
         f.setPercent(65);
         f.gate();
         await f.emit("turn_end");
-        assert.equal(f.registry.calls, 3, "B prepares while A serves");
+        assert.equal(f.registry.calls, 5, "B prepares while A serves");
         const servingDuringB = await f.emit("context", { messages: f.contextMessages() });
         assert.ok(servingDuringB, "A keeps serving while B prepares");
         f.release();
-        await waitFor(() => f.registry.settled === 4);
+        await waitFor(() => f.registry.settled === 8);
         await tick();
         const swapB = await f.emit("context", { messages: f.contextMessages() });
         assert.ok(swapB, "B swaps in");
@@ -439,7 +664,7 @@ describe("persistent two-turn lifecycle with reload", () => {
   });
 
   it("restored checkpoint is B, not A", async () => {
-    const f = await fixture();
+    const f = await fixture(SWAP_CONFIG);
     try {
       f.appendCustom(checkpointData({ checkpointId: "A", summary: "SUMMARY-A" }));
       f.appendCustom(checkpointData({ checkpointId: "B", summary: "SUMMARY-B" }));
@@ -603,53 +828,45 @@ describe("checkpoint self-repair (summary omission is not evidence loss)", () =>
 
     // Checkpoint A covers the early history, but its summary deliberately
     // omits the constraint — the omission the self-repair story must survive.
-    const snapshotA = prepareSnapshot(earlyBranch, 10);
-    assert.ok(snapshotA, "A has evidence to summarize");
-    assert.ok(
-      snapshotA.sourceEntries.some((entry) => entry.id === constraint.id),
-      "A's range includes the constraint entry",
-    );
     const summaryA = "Continuation summary that forgets the deployment constraint.";
     assert.doesNotMatch(summaryA, new RegExp(MARKER));
     const persistedA = persistedCheckpointEntry(
       "A",
       summaryA,
-      snapshotA.firstKeptEntryId,
+      earlyBranch[0]!.id,
       earlyBranch.at(-1)!.id,
     );
 
-    // More history accrues after A persists; B prepares from the raw branch.
+    // More history accrues after A persists; B reads the raw branch itself.
     const later: SessionEntry[] = [
       userMessage(`follow-up work ${"a".repeat(500)}`),
       userMessage(`latest question ${"b".repeat(500)}`),
     ];
     const branchB: SessionEntry[] = [...earlyBranch, persistedA, ...later];
-    const snapshotB = prepareSnapshot(branchB, 10);
-    assert.ok(snapshotB, "B has evidence to summarize");
-
-    // Intercept B's normalized evidence packet: the persisted checkpoint is
-    // invisible to the normalizer, so recovery must come from raw history.
-    const packetB = normalizeSnapshot({
+    const indexB = new SessionHistoryIndex({
+      branch: branchB,
       cwd: "/work/project",
-      previousSummary: summaryA,
-      entries: [...snapshotB.sourceEntries, ...snapshotB.turnPrefixEntries],
+      previousCheckpointSummary: summaryA,
     });
+
+    // The persisted checkpoint entry itself serves no text: recovery must
+    // come from raw history, never from re-reading the stale summary.
+    const served = indexB.readTurnRange(1, 10);
+    const carrier = served.turns.flatMap((turn) => turn.entries).find((item) => item.entryId === persistedA.id);
+    assert.equal(carrier?.text, "");
+    assert.doesNotMatch(indexB.previousCheckpoint()?.summary ?? "", new RegExp(MARKER));
+
+    // Both discovery paths recover the constraint from raw history despite
+    // A's omission: keyword search and direct turn reads.
+    const hits = indexB.searchSessionHistory(MARKER);
+    assert.ok(hits.some((hit) => hit.entryId === constraint.id), "search recovers the constraint");
+    const recovered = served.turns
+      .flatMap((turn) => turn.entries)
+      .filter((item) => item.text.includes(MARKER));
+    assert.ok(recovered.length > 0, "turn reads recover the constraint from raw history");
     assert.ok(
-      packetB.evidence.every((item) => item.sourceEntryId !== persistedA.id),
-      "the persisted checkpoint contributes no evidence of its own",
-    );
-    const recovered = packetB.evidence.filter(
-      (item) => item.kind !== "previous_checkpoint" && item.text.includes(MARKER),
-    );
-    assert.ok(
-      recovered.length > 0,
-      "B's packet recovers the constraint from raw history despite A's omission",
-    );
-    assert.ok(
-      packetB.evidence
-        .filter((item) => item.kind === "previous_checkpoint")
-        .every((item) => !item.text.includes(MARKER)),
-      "the omission is real: no previous-checkpoint carrier mentions the constraint",
+      recovered.every((item) => item.entryId === constraint.id),
+      "the constraint arrives with its stable evidence id, not the carrier's",
     );
   });
 
@@ -662,17 +879,15 @@ describe("checkpoint self-repair (summary omission is not evidence loss)", () =>
       userMessage(`more background ${"y".repeat(500)}`),
     ];
 
-    const snapshotA = prepareSnapshot(earlyBranch, 10, { sessionId: "session-1" });
-    assert.ok(snapshotA, "A has evidence to summarize");
     const summaryA = "Continuation summary that forgets the deployment constraint.";
     const persistedA = persistedCheckpointEntry(
       "A",
       summaryA,
-      snapshotA.firstKeptEntryId,
+      earlyBranch[0]!.id,
       earlyBranch.at(-1)!.id,
     );
 
-    // A native compaction lands (hard hatch or failure fallback). The branch
+    // A native compaction lands (emergency hatch or failure fallback). The branch
     // is append-only, so raw history and the persisted checkpoint survive;
     // only Pi's context boundary moves to keptAfter.
     const keptAfter = userMessage(`post-compaction work ${"c".repeat(500)}`);
@@ -692,43 +907,24 @@ describe("checkpoint self-repair (summary omission is not evidence loss)", () =>
     ];
     const branchC: SessionEntry[] = [...earlyBranch, persistedA, keptAfter, native, ...later];
 
-    const snapshotC = prepareSnapshot(branchC, 10, { sessionId: "session-1" });
-    assert.ok(snapshotC, "C has evidence to summarize");
-    // Evidence reaches past the native boundary (cut policy unchanged).
+    // The reader has no compaction boundary: pre-compaction raw history stays
+    // directly readable, so C recovers the constraint with plain reads.
+    const indexC = new SessionHistoryIndex({ branch: branchC, cwd: "/work/project" });
     assert.ok(
-      snapshotC.sourceEntries.some((entry) => entry.id === constraint.id),
-      "C's evidence still includes the pre-compaction constraint entry",
+      indexC.readTurnRange(1, 10).turns.flatMap((turn) => turn.entries).some((item) => item.text.includes(MARKER)),
+      "C recovers the constraint from pre-compaction raw history",
     );
-    assert.equal(snapshotC.previousSummary, "Native summary covering the early work.");
-    // The Shadow chain carries A as evidence even though A is stale for swap:
-    // restore currency and summarizer context are deliberately different bars.
-    assert.deepEqual(snapshotC.shadowSummaries, [summaryA]);
+    // The Shadow chain still carries A as orientation even though A is stale
+    // for restore/swap: restore currency and reader context are deliberately
+    // different bars.
+    assert.deepEqual(collectShadowSummaries(branchC, "session-1"), [summaryA]);
     const { skippedStale } = findLatestRestorableCheckpoint(branchC, "session-1");
     assert.ok(
       skippedStale.some((skipped) => skipped.checkpointId === "A" && skipped.reason === "compaction-mismatch"),
-      "A is stale for restore/swap but remains usable as summarizer context",
-    );
-
-    const packetC = normalizeSnapshot({
-      cwd: "/work/project",
-      previousSummary: snapshotC.previousSummary,
-      shadowSummaries: snapshotC.shadowSummaries,
-      entries: [...snapshotC.sourceEntries, ...snapshotC.turnPrefixEntries],
-    });
-    const recovered = packetC.evidence.filter(
-      (item) => item.kind !== "previous_checkpoint" && item.text.includes(MARKER),
-    );
-    assert.ok(
-      recovered.length > 0,
-      "C's packet recovers the constraint from pre-compaction raw history",
-    );
-    assert.deepEqual(
-      packetC.evidence
-        .filter((item) => item.kind === "previous_checkpoint")
-        .map((item) => item.text),
-      ["Native summary covering the early work.", summaryA],
+      "A is stale for restore/swap but remains usable as reader context",
     );
   });
+
 
   it("collectShadowSummaries keeps the newest session-matching summaries within its limit", () => {
     sequence = 0;

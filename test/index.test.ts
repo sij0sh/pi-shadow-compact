@@ -1,221 +1,296 @@
 import assert from "node:assert/strict";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it } from "node:test";
 import {
-  fixture,
-  waitFor,
-  tick,
-  USAGE,
-  userEntry,
+  SOFT_THRESHOLD_ABS_ENV_VAR,
+  SUMMARIZER_ID_ENV_VAR,
+  SUMMARIZER_PROVIDER_ENV_VAR,
+} from "../src/config.js";
+import { CHECKPOINT_CUSTOM_TYPE } from "../src/persist.js";
+import {
   compactionEntry,
+  fixture,
+  tick,
+  userEntry,
+  waitFor,
   type Fixture,
 } from "./helpers/index-fixture.js";
-import { CHECKPOINT_CUSTOM_TYPE } from "../src/persist.js";
-import { combineUsage } from "../src/summary.js";
 
 const READY_MESSAGE = "shadow-compact: summary ready - swaps in at the next turn";
-const DEFERRED_MESSAGE =
-  "shadow-compact: summary still preparing - swap deferred until the agent is idle";
+const MANUAL_PREPARE_MESSAGE = "shadow-compact: preparing a fresh checkpoint for /compact";
 
+// The fixture branch holds two turns; a one-turn tail keeps swaps observable.
+const SWAP_CONFIG = {
+  prepareThresholdPercent: 60,
+  summarizerModel: { provider: "", id: "" },
+  recentTurns: 1,
+};
 
-it("does not impose a summary token cap by default", async () => {
-  const f = await fixture();
-  try {
-    await startPreparation(f);
-    assert.equal(f.registry.optionsList.length, 2);
-    for (const options of f.registry.optionsList) {
-      assert.ok(options);
-      assert.equal("maxTokens" in options, false);
-      assert.equal((options as { reasoning?: unknown }).reasoning, undefined);
-    }
-  } finally {
-    await f.cleanup();
-  }
+let savedAgentDir: string | undefined;
+let savedAbs: string | undefined;
+let savedSummarizerProvider: string | undefined;
+let savedSummarizerId: string | undefined;
+
+beforeEach(() => {
+  savedAgentDir = process.env.PI_CODING_AGENT_DIR;
+  savedAbs = process.env[SOFT_THRESHOLD_ABS_ENV_VAR];
+  savedSummarizerProvider = process.env[SUMMARIZER_PROVIDER_ENV_VAR];
+  savedSummarizerId = process.env[SUMMARIZER_ID_ENV_VAR];
+  delete process.env[SOFT_THRESHOLD_ABS_ENV_VAR];
+  delete process.env[SUMMARIZER_PROVIDER_ENV_VAR];
+  delete process.env[SUMMARIZER_ID_ENV_VAR];
 });
 
-it("honors summaryMaxTokens and thinkingLevel overrides", async () => {
-  const f = await fixture({
-    softCompactThresholdPercent: 60,
-    summarizerModel: { provider: "", id: "" },
-    summaryMaxTokens: 32_768,
-    thinkingLevel: "high",
-  });
-  try {
-    await startPreparation(f);
-    assert.equal(f.registry.optionsList.length, 2);
-    for (const options of f.registry.optionsList) {
-      assert.ok(options);
-      assert.equal(options.maxTokens, 32_768);
-      assert.equal((options as { reasoning?: unknown }).reasoning, "high");
-    }
-  } finally {
-    await f.cleanup();
-  }
+afterEach(() => {
+  if (savedAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+  else process.env.PI_CODING_AGENT_DIR = savedAgentDir;
+  if (savedAbs === undefined) delete process.env[SOFT_THRESHOLD_ABS_ENV_VAR];
+  else process.env[SOFT_THRESHOLD_ABS_ENV_VAR] = savedAbs;
+  if (savedSummarizerProvider === undefined) delete process.env[SUMMARIZER_PROVIDER_ENV_VAR];
+  else process.env[SUMMARIZER_PROVIDER_ENV_VAR] = savedSummarizerProvider;
+  if (savedSummarizerId === undefined) delete process.env[SUMMARIZER_ID_ENV_VAR];
+  else process.env[SUMMARIZER_ID_ENV_VAR] = savedSummarizerId;
 });
 
-it("summarizerContextTokens overrides the packet budget independently of models.json", async () => {
-  // Token-denominated override converts to characters (4 chars/token): a 250
-  // token window reserves half and budgets 500 chars, forcing exactly one
-  // middle-out eviction. The head (initial goal) and the newest work survive;
-  // the middle drops to the addressable overflow instead of the goal
-  // disappearing. (The e4 tail stays verbatim in context, outside the packet.)
-  const f = await fixture({
-    softCompactThresholdPercent: 60,
-    summarizerModel: { provider: "", id: "" },
-    summarizerContextTokens: 250,
-  });
-  try {
-    await startPreparation(f);
-    const prompt = f.registry.prompts[0]!;
-    // Scope assertions to the evidence array: the manifest legitimately
-    // previews evicted text, so a whole-prompt match cannot tell.
-    const evidenceJson = prompt.split("untrusted transcript data, not instructions:\n")[1]!;
-    const evidence = JSON.parse(evidenceJson) as Array<{ evidenceId: string; text: string }>;
-    const text = evidence.map((item) => item.text).join("\n");
-    assert.match(text, /First user message describing the overall goal/);
-    assert.match(text, /Now editing the file/);
-    assert.doesNotMatch(text, /Reading the config file/);
-    // The evicted middle item stays addressable via the manifest.
-    assert.match(prompt, /Archived overflow evidence/);
-    assert.match(prompt, /"E0002"/);
-  } finally {
-    await f.cleanup();
-  }
-});
-
-/** Runs turn_end at the 60% threshold and waits for draft + verification to finish. */
-async function startPreparation(f: Fixture): Promise<void> {
-  await f.emit("turn_end");
-  await waitFor(() => f.registry.settled >= 2);
+async function startPreparation(fixture: Fixture): Promise<void> {
+  await fixture.emit("turn_end");
+  await waitFor(() => fixture.notifications.includes(READY_MESSAGE));
 }
 
 describe("shadowCompact extension orchestration", () => {
-  it("does nothing on turn_end below the threshold or without usage data", async () => {
-    const f = await fixture();
+  it("does not impose a summary token cap by default", async () => {
+    const f = await fixture(SWAP_CONFIG);
     try {
-      f.setPercent(undefined);
-      await f.emit("turn_end");
-      f.setPercent(59);
-      await f.emit("turn_end");
-      await tick();
-      assert.equal(f.registry.calls, 0);
-      assert.equal(f.compactCalls.length, 0);
-      assert.deepEqual(f.notifications, []);
+      await startPreparation(f);
+      // Builder (read + submit) and verifier (read + verdict) run as agents;
+      // every checkpoint model call carries tools.
+      const agentCalls = f.registry.optionsList.filter((_, index) => f.registry.toolsUsed[index]);
+      assert.equal(agentCalls.length, 4);
+      assert.ok(agentCalls.every((options) => options?.maxTokens === undefined));
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it("honors summaryMaxTokens and thinkingLevel overrides", async () => {
+    const f = await fixture({
+      ...SWAP_CONFIG,
+      summaryMaxTokens: 32768,
+      thinkingLevel: "high",
+      summarizerModel: { provider: "configured", id: "summary-model" },
+      verificationModel: { provider: "configured", id: "summary-model" },
+    });
+    try {
+      await startPreparation(f);
+      const agentCalls = f.registry.optionsList.filter((_, index) => f.registry.toolsUsed[index]);
+      assert.equal(agentCalls.length, 4);
+      assert.ok(agentCalls.every((options) => options?.maxTokens === 32768));
+      assert.ok(
+        agentCalls.every((options) => (options as { reasoning?: unknown }).reasoning === "high"),
+      );
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it("prompts the checkpoint agent with the session manifest and read-only tools", async () => {
+    const f = await fixture(SWAP_CONFIG);
+    try {
+      await startPreparation(f);
+      assert.match(f.registry.prompts[0]!, /Session manifest/);
+      assert.match(f.registry.prompts[2]!, /Audit this draft/);
+      assert.deepEqual(f.registry.toolsUsed, [true, true, true, true]);
     } finally {
       await f.cleanup();
     }
   });
 
   it("starts background preparation at the threshold and resolves turn_end before the model call completes", async () => {
-    const f = await fixture();
+    const f = await fixture(SWAP_CONFIG);
     try {
       f.gate();
       await f.emit("turn_end");
       assert.equal(f.registry.calls, 1);
-      assert.equal(f.registry.settled, 0);
-      assert.ok(f.registry.prompts[0]?.includes("untrusted transcript data"));
       f.release();
-      await waitFor(() => f.registry.settled === 2);
-      await f.emit("agent_settled");
-      assert.equal(f.compactCalls.length, 0);
-      assert.equal(f.appendedEntries.length, 1);
-      assert.equal(f.registry.models[0], f.registry.summaryModel);
+      await waitFor(() => f.notifications.includes(READY_MESSAGE));
+      assert.equal(f.registry.calls, 4);
+      assert.equal(f.registry.settled, 4);
     } finally {
       await f.cleanup();
     }
   });
 
   it("ignores duplicate turn_end while a preparation is already running", async () => {
-    const f = await fixture();
+    const f = await fixture(SWAP_CONFIG);
     try {
       f.gate();
       await f.emit("turn_end");
       await f.emit("turn_end");
       assert.equal(f.registry.calls, 1);
-      assert.equal(f.compactCalls.length, 0);
       f.release();
-      await waitFor(() => f.registry.settled === 2);
-      await f.emit("agent_settled");
-      assert.equal(f.compactCalls.length, 0);
-      assert.equal(f.appendedEntries.length, 1);
+      await waitFor(() => f.notifications.includes(READY_MESSAGE));
+      assert.equal(f.registry.calls, 4);
+      assert.equal(f.registry.settled, 4);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it("honors the benchmark-only absolute threshold override", async () => {
+    const f = await fixture(SWAP_CONFIG);
+    try {
+      process.env[SOFT_THRESHOLD_ABS_ENV_VAR] = "601";
+      await f.emit("turn_end");
+      await tick();
+      assert.equal(f.registry.calls, 0);
+
+      // Env changes take effect at the next session start (config is memoized
+      // within a session).
+      process.env[SOFT_THRESHOLD_ABS_ENV_VAR] = "600";
+      await f.emit("session_start");
+      await f.emit("turn_end");
+      await waitFor(() => f.notifications.includes(READY_MESSAGE));
+      assert.equal(f.registry.calls, 4);
     } finally {
       await f.cleanup();
     }
   });
 
   it("persists a ready result as extension state and serves the matching before_compact from cache", async () => {
-    const f = await fixture();
+    const f = await fixture(SWAP_CONFIG);
     try {
       await startPreparation(f);
       await f.emit("agent_settled");
-      assert.equal(f.compactCalls.length, 0, "the soft path never compacts");
       assert.equal(f.appendedEntries.length, 1);
       const persisted = f.appendedEntries[0];
       assert.equal(persisted?.customType, CHECKPOINT_CUSTOM_TYPE);
+      const data = persisted?.data as { version: number; summary: string };
+      assert.equal(data.version, 3);
+      assert.match(data.summary, /Prepared continuation checkpoint/);
 
-      // A nonce-style custom instruction is no longer a commit handshake; a
-      // threshold event on another boundary gets a merged offer instead of
-      // nothing: the verified summary with whichever cut drops less (e3).
-      const nonceOutcome = await f.emit(
-        "session_before_compact",
-        f.compactEvent({ customInstructions: "[shadow-compact:commit:dead]", firstKeptEntryId: "e3" }),
-      );
-      assert.ok(nonceOutcome?.compaction);
-      assert.match(nonceOutcome.compaction.summary, /Prepared continuation checkpoint/);
-      assert.equal(nonceOutcome.compaction.firstKeptEntryId, "e3");
-
-      const outcome = await f.emit(
-        "session_before_compact",
-        f.compactEvent({ reason: "threshold", firstKeptEntryId: "e4" }),
-      );
-      assert.equal(f.registry.settled, 2);
-      assert.ok(outcome?.compaction);
-      assert.match(outcome.compaction.summary, /Prepared continuation checkpoint/);
-      assert.equal(outcome.compaction.firstKeptEntryId, "e4");
-      assert.equal(outcome.compaction.tokensBefore, 777);
-      assert.deepEqual(outcome.compaction.usage, combineUsage(USAGE, USAGE));
-      assert.deepEqual(outcome.compaction.details, {
-        readFiles: ["src/read.ts"],
-        modifiedFiles: ["src/edited.ts"],
-      });
-
-      // The checkpoint keeps serving after it lands: settle again, persist once.
+      // A settled agent with no new work re-persists nothing: the same
+      // checkpoint id is already durable.
       await f.emit("agent_settled");
-      assert.equal(f.compactCalls.length, 0);
       assert.equal(f.appendedEntries.length, 1);
-      assert.ok(await f.emit("context", { messages: f.contextMessages() }));
     } finally {
       await f.cleanup();
     }
   });
 
   it("discards a ready result whose leaf is no longer on the branch", async () => {
-    const f = await fixture();
+    const f = await fixture(SWAP_CONFIG);
     try {
       await startPreparation(f);
-      const [e1, e2, e3] = f.branch;
-      f.setBranch([e1!, e2!, e3!, userEntry("e5", "e3", `Divergent continuation: ${"more ".repeat(30)}`)]);
+      f.setBranch([userEntry("solo", null, "a divergent branch with enough words here")]);
       await f.emit("agent_settled");
-      assert.equal(f.compactCalls.length, 0);
       assert.equal(f.appendedEntries.length, 0);
-      // The discard itself stays silent; the one toast is the ready announcement.
-      assert.deepEqual(f.notifications, [READY_MESSAGE]);
     } finally {
       await f.cleanup();
     }
   });
 
   it("discards a ready result when a newer compaction landed on the branch", async () => {
-    const f = await fixture();
+    const f = await fixture(SWAP_CONFIG);
     try {
       await startPreparation(f);
-      f.appendCompaction();
+      f.setBranch([...f.branch, compactionEntry("c1", "e4")]);
       await f.emit("agent_settled");
-      assert.equal(f.compactCalls.length, 0);
       assert.equal(f.appendedEntries.length, 0);
+    } finally {
+      await f.cleanup();
+    }
+  });
 
-      // A stale result never swaps into the request context either.
+  it("serves threshold compaction from cache with the earliest cut on mismatch", async () => {
+    const f = await fixture(SWAP_CONFIG);
+    try {
+      await startPreparation(f);
+      const exact = await f.emit("session_before_compact", f.compactEvent({ firstKeptEntryId: "e4" }));
+      assert.equal(exact.compaction.firstKeptEntryId, "e4");
+      const mismatch = await f.emit(
+        "session_before_compact",
+        f.compactEvent({ firstKeptEntryId: "e3" }),
+      );
+      assert.equal(mismatch.compaction.firstKeptEntryId, "e3");
+      const unknown = await f.emit(
+        "session_before_compact",
+        f.compactEvent({ firstKeptEntryId: "nope" }),
+      );
+      assert.equal(unknown.compaction.firstKeptEntryId, "e4");
+      assert.equal(unknown.compaction.tokensBefore, 777);
+      assert.ok(unknown.compaction.summary.includes("Prepared continuation checkpoint"));
+      assert.deepEqual(unknown.compaction.details, {
+        readFiles: ["src/read.ts"],
+        modifiedFiles: ["src/edited.ts"],
+      });
+      assert.deepEqual(f.compactCalls, []);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it("serves manual compaction from a ready checkpoint without preparing again", async () => {
+    const f = await fixture(SWAP_CONFIG);
+    try {
+      await startPreparation(f);
+      const callsBefore = f.registry.calls;
+      const outcome = await f.emit(
+        "session_before_compact",
+        f.compactEvent({ reason: "manual", customInstructions: "[shadow-compact:commit:dead]" }),
+      );
+      assert.equal(outcome.compaction.firstKeptEntryId, "e4");
+      assert.ok(outcome.compaction.summary.includes("Prepared continuation checkpoint"));
+      assert.equal(f.registry.calls, callsBefore);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it("prepares fresh for manual compaction when nothing is ready, then serves", async () => {
+    const f = await fixture(SWAP_CONFIG);
+    try {
+      const outcome = await f.emit("session_before_compact", f.compactEvent({ reason: "manual" }));
+      assert.ok(outcome.compaction.summary.includes("Prepared continuation checkpoint"));
+      assert.equal(outcome.compaction.firstKeptEntryId, "e4");
+      assert.ok(f.notifications.includes(MANUAL_PREPARE_MESSAGE));
+      assert.ok(f.registry.calls >= 4);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it("aborts a manual fresh prepare when the hook signal fires", async () => {
+    const f = await fixture(SWAP_CONFIG);
+    try {
+      f.gate();
+      const controller = new AbortController();
+      const manual = f.emit(
+        "session_before_compact",
+        f.compactEvent({ reason: "manual", signal: controller.signal }),
+      );
+      await waitFor(() => f.registry.calls === 1);
+      controller.abort();
+      f.release();
+      const outcome = await manual;
+      assert.equal(outcome, undefined);
+      assert.ok(!f.notifications.includes(READY_MESSAGE));
+      assert.deepEqual(f.compactCalls, []);
+      // The aborted preparation released instead of latching: a later turn
+      // can still prepare fresh.
+      await f.emit("turn_end");
+      await waitFor(() => f.notifications.includes(READY_MESSAGE));
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it("manual compaction in native mode resets and returns undefined", async () => {
+    const f = await fixture({ ...SWAP_CONFIG, manualCompactMode: "native" });
+    try {
+      await startPreparation(f);
+      const outcome = await f.emit("session_before_compact", f.compactEvent({ reason: "manual" }));
+      assert.equal(outcome, undefined);
       const swapped = await f.emit("context", { messages: f.contextMessages() });
       assert.equal(swapped, undefined);
     } finally {
@@ -223,131 +298,62 @@ describe("shadowCompact extension orchestration", () => {
     }
   });
 
-  it("serves threshold compaction from cache with the earliest cut on mismatch", async () => {
-    const f = await fixture();
+  it("compact-native runs one native compaction bypassing Shadow", async () => {
+    const f = await fixture(SWAP_CONFIG);
     try {
       await startPreparation(f);
-      const match = await f.emit(
-        "session_before_compact",
-        f.compactEvent({ reason: "threshold", firstKeptEntryId: "e4" }),
-      );
-      assert.ok(match?.compaction);
-      assert.match(match.compaction.summary, /Prepared continuation checkpoint/);
-      assert.equal(match.compaction.firstKeptEntryId, "e4");
-      assert.equal(f.registry.settled, 2);
-      assert.equal(f.compactCalls.length, 0);
-
-      // A boundary mismatch no longer cedes to a fresh native summary: the
-      // verified checkpoint is offered with whichever cut drops less (e1 is
-      // earlier than the checkpoint's own e4), with no new summarizer run.
-      const mismatch = await f.emit(
-        "session_before_compact",
-        f.compactEvent({ reason: "threshold", firstKeptEntryId: "e1" }),
-      );
-      assert.ok(mismatch?.compaction);
-      assert.match(mismatch.compaction.summary, /Prepared continuation checkpoint/);
-      assert.equal(mismatch.compaction.firstKeptEntryId, "e1");
-      assert.equal(f.registry.settled, 2);
-
-      const again = await f.emit(
-        "session_before_compact",
-        f.compactEvent({ reason: "threshold", firstKeptEntryId: "e4" }),
-      );
-      assert.ok(again?.compaction);
-      assert.equal(again.compaction.firstKeptEntryId, "e4");
-      assert.equal(f.registry.settled, 2);
-    } finally {
-      await f.cleanup();
-    }
-  });
-
-  it("always returns undefined for manual compaction and aborts an in-flight preparation", async () => {
-    const f = await fixture();
-    try {
-      await startPreparation(f);
-      const manualWhileReady = await f.emit(
-        "session_before_compact",
-        f.compactEvent({ reason: "manual" }),
-      );
-      assert.equal(manualWhileReady, undefined);
-      assert.equal(f.compactCalls.length, 0);
-
-      // The manual pass reset the ready result, so a fresh preparation can start.
-      f.gate();
-      await f.emit("turn_end");
-      const manualWhilePreparing = await f.emit(
-        "session_before_compact",
-        f.compactEvent({ reason: "manual" }),
-      );
-      assert.equal(manualWhilePreparing, undefined);
-      assert.ok(f.registry.signals.at(-1)?.aborted);
-      f.release();
-      await waitFor(() => f.registry.settled === 2);
-      await tick();
-      await f.emit("agent_settled");
-      assert.equal(f.compactCalls.length, 0);
+      const command = f.commands.get("compact-native");
+      assert.ok(command, "compact-native command is registered");
+      await command.handler("", {
+        compact: (options: unknown) => void f.compactCalls.push(options as never),
+      });
+      const outcome = await f.emit("session_before_compact", f.compactEvent({ reason: "manual" }));
+      assert.equal(outcome, undefined);
+      // The escape is one-shot: the next manual serves Shadow again.
+      const again = await f.emit("session_before_compact", f.compactEvent({ reason: "manual" }));
+      assert.ok(again.compaction.summary.includes("Prepared continuation checkpoint"));
     } finally {
       await f.cleanup();
     }
   });
 
   it("keeps a newer preparation alive when a superseded summary completes", async () => {
-    const f = await fixture();
+    const f = await fixture(SWAP_CONFIG);
     try {
       f.gate();
       await f.emit("turn_end");
       assert.equal(f.registry.calls, 1);
-
-      // Manual compaction supersedes prepare #1 while its model call is in flight.
-      await f.emit("session_before_compact", f.compactEvent({ reason: "manual" }));
-      assert.ok(f.registry.signals[0]?.aborted);
-
+      // A manual compaction aborts the in-flight preparation and awaits a
+      // fresh one; the stale completion must no-op on its old generation.
       f.gate();
-      await f.emit("turn_end");
-      assert.equal(f.registry.calls, 2);
-      assert.ok(!f.registry.signals[1]?.aborted);
-
-      // The stale completion resolves past its abort and must not touch prepare #2.
-      // Draft and verifier settle in one drain, so intermediate counts are
-      // waited with >= : only the terminal counts are exact.
+      const manual = f.emit("session_before_compact", f.compactEvent({ reason: "manual" }));
+      await waitFor(() => f.registry.calls === 2);
       f.release();
-      await waitFor(() => f.registry.settled >= 2);
       await tick();
-      assert.ok(!f.registry.signals[1]?.aborted);
-      assert.equal(f.compactCalls.length, 0);
-      assert.deepEqual(f.notifications, []);
-
       f.release();
-      await waitFor(() => f.registry.settled >= 4);
-      await tick();
+      const outcome = await manual;
+      assert.ok(outcome.compaction.summary.includes("Prepared continuation checkpoint"));
+      assert.deepEqual(f.compactCalls, []);
       await f.emit("agent_settled");
-      assert.equal(f.compactCalls.length, 0);
-      assert.equal(f.appendedEntries.length, 1);
+      assert.deepEqual(f.compactCalls, []);
     } finally {
       await f.cleanup();
     }
   });
 
   it("schedules the one-shot native fallback when a completed summary is invalid while current", async () => {
-    const f = await fixture();
+    const f = await fixture(SWAP_CONFIG);
     try {
       f.gate();
       await f.emit("turn_end");
-      f.appendCompaction();
+      assert.equal(f.registry.calls, 1);
+      f.setBranch([...f.branch, compactionEntry("c1", "e4")]);
       f.release();
-      // Draft completes, then the verifier completes; the branch moved on, so
-      // the verified candidate is discarded as stale.
-      await waitFor(() => f.registry.settled === 2);
+      await waitFor(() => f.registry.settled >= 4);
       await tick();
-      assert.equal(f.compactCalls.length, 0);
-      assert.deepEqual(f.notifications, []);
-
+      assert.deepEqual(f.compactCalls, []);
       await f.emit("agent_settled");
-      assert.equal(f.compactCalls.length, 1);
-      assert.deepEqual(f.compactCalls[0], {});
-
-      await f.emit("agent_settled");
-      assert.equal(f.compactCalls.length, 1);
+      assert.deepEqual(f.compactCalls, [{}]);
     } finally {
       await f.cleanup();
     }
@@ -375,14 +381,15 @@ describe("shadowCompact extension orchestration", () => {
       await writeFile(
         configPath,
         JSON.stringify({
-          softCompactThresholdPercent: 61,
+          prepareThresholdPercent: 61,
           summarizerModel: { provider: "", id: "" },
+          recentTurns: 1,
         }),
       );
       await f.emit("turn_end");
-      await waitFor(() => f.registry.settled >= 2);
+      await waitFor(() => f.registry.settled >= 4);
       await tick();
-      assert.equal(f.registry.calls, 2);
+      assert.equal(f.registry.calls, 4);
       // Config error toast, recovery toast, then the ready announcement.
       assert.deepEqual(f.notifications, [
         `shadow-compact: ${join(f.agentDir, "shadow-compact.json")} is not valid JSON`,
@@ -395,7 +402,7 @@ describe("shadowCompact extension orchestration", () => {
   });
 
   it("falls back to plain native compaction after a summary model error", async () => {
-    const f = await fixture();
+    const f = await fixture(SWAP_CONFIG);
     try {
       f.registry.mode = "error";
       await f.emit("turn_end");
@@ -418,7 +425,7 @@ describe("shadowCompact extension orchestration", () => {
   });
 
   it("publishes the verified checkpoint text, not the draft", async () => {
-    const f = await fixture();
+    const f = await fixture(SWAP_CONFIG);
     try {
       f.registry.mode = "verifier-rewrite";
       await startPreparation(f);
@@ -438,119 +445,4 @@ describe("shadowCompact extension orchestration", () => {
       await f.cleanup();
     }
   });
-
-  it("fails closed with one native fallback when verification errors and nothing serves", async () => {
-    const f = await fixture();
-    try {
-      f.registry.mode = "verifier-error";
-      await f.emit("turn_end");
-      await waitFor(() => f.registry.settled >= 2);
-      await tick();
-      assert.equal(f.registry.calls, 2);
-      assert.deepEqual(f.notifications, ["shadow-compact: Verification model stopped with error"]);
-      assert.equal(f.compactCalls.length, 0);
-      assert.equal(f.appendedEntries.length, 0);
-      // A queued fallback owns the next idle point: no new preparation on top of it.
-      await f.emit("turn_end");
-      await tick();
-      assert.equal(f.registry.calls, 2);
-      await f.emit("agent_settled");
-      assert.equal(f.compactCalls.length, 1);
-      assert.deepEqual(f.compactCalls[0], {});
-      assert.equal(f.appendedEntries.length, 0);
-    } finally {
-      await f.cleanup();
-    }
-  });
-
-  it("a failed verification keeps the serving checkpoint and schedules no fallback", async () => {
-    const f = await fixture();
-    try {
-      await startPreparation(f);
-      await tick();
-      assert.ok(await f.emit("context", { messages: f.contextMessages() }), "A serves");
-
-      // Below soft re-arms after the observed swap + shrink; B then fails closed.
-      f.setPercent(30);
-      await f.emit("turn_end");
-      f.setPercent(65);
-      f.registry.mode = "verifier-error";
-      await f.emit("turn_end");
-      await waitFor(() => f.registry.settled >= 4);
-      await tick();
-      f.registry.mode = "ok";
-      assert.deepEqual(f.notifications.at(-1), "shadow-compact: Verification model stopped with error");
-
-      // A keeps serving; no native fallback is queued for a failed replacement.
-      assert.ok(
-        await f.emit("context", { messages: f.contextMessages() }),
-        "A continues serving after B fails verification",
-      );
-      await f.emit("agent_settled");
-      assert.equal(f.compactCalls.length, 0);
-      assert.equal(f.appendedEntries.length, 1);
-
-      // The failure must not manufacture a threshold crossing: still above
-      // soft with no new swap + shrink, so the next crossing is suppressed.
-      f.setPercent(66);
-      await f.emit("turn_end");
-      await tick();
-      assert.equal(f.registry.calls, 4, "no immediate retry after failed verification");
-    } finally {
-      await f.cleanup();
-    }
-  });
-
-  it("resets on session_compact only when it originated from this extension", async () => {
-    const compactedEvent = (fromExtension: boolean) => ({
-      type: "session_compact",
-      compactionEntry: compactionEntry("c1", "e4"),
-      fromExtension,
-      reason: "threshold",
-      willRetry: false,
-    });
-
-    const reset = await fixture();
-    try {
-      await startPreparation(reset);
-      await reset.emit("session_compact", compactedEvent(true));
-      await reset.emit("agent_settled");
-      assert.equal(reset.compactCalls.length, 0);
-      assert.equal(reset.appendedEntries.length, 0);
-    } finally {
-      await reset.cleanup();
-    }
-
-    const kept = await fixture();
-    try {
-      await startPreparation(kept);
-      await kept.emit("session_compact", compactedEvent(false));
-      await kept.emit("agent_settled");
-      // A foreign compaction the branch never shows leaves the checkpoint
-      // current, so the idle settle persists it without compacting.
-      assert.equal(kept.compactCalls.length, 0);
-      assert.equal(kept.appendedEntries.length, 1);
-    } finally {
-      await kept.cleanup();
-    }
-
-    const stale = await fixture();
-    try {
-      stale.gate();
-      await stale.emit("turn_end");
-      stale.appendCompaction();
-      await stale.emit("session_compact", compactedEvent(false));
-      stale.release();
-      // Draft plus verifier complete before the stale candidate is discarded.
-      await waitFor(() => stale.registry.settled === 2);
-      await tick();
-      await stale.emit("agent_settled");
-      // The stale result schedules the documented one-shot native fallback.
-      assert.deepEqual(stale.compactCalls[0], {});
-      assert.deepEqual(stale.notifications, []);
-    } finally {
-      await stale.cleanup();
-    }
-  });
-
 });

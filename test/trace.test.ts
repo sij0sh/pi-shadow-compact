@@ -26,6 +26,12 @@ async function readEvents(path: string): Promise<Array<Record<string, unknown>>>
     .map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 
+const SWAP_CONFIG = {
+  prepareThresholdPercent: 60,
+  summarizerModel: { provider: "", id: "" },
+  recentTurns: 1,
+};
+
 describe("trace sinks", () => {
   it("isStderrTraceEnabled honors opt-out spellings", () => {
     const previous = process.env[TRACE_STDERR_ENV_VAR];
@@ -91,10 +97,10 @@ describe("trace lifecycle flow", () => {
     const previous = process.env[TRACE_FILE_ENV_VAR];
     process.env[TRACE_FILE_ENV_VAR] = path;
     try {
-      const f = await fixture();
+      const f = await fixture(SWAP_CONFIG);
       try {
         await f.emit("turn_end");
-        await waitFor(() => f.registry.settled >= 2);
+        await waitFor(() => f.registry.settled >= 4);
         await tick();
         await f.emit("context", { messages: f.contextMessages() });
         await f.emit("agent_settled");
@@ -139,13 +145,30 @@ describe("trace lifecycle flow", () => {
       "verifierModel",
       "verifierThinking",
       "verifierWallMs",
+      "verifierVerdict",
       "summaryWallMs",
-      "packetChars",
-      "sourceEntries",
+      "inspectedEntries",
+      "builderRounds",
+      "verifierRounds",
+      "coverageEnd",
+      "preparedAtLeaf",
+      "publishedAtLeaf",
       "firstKeptEntryId",
       "leafId",
     ]) {
       assert.ok(completed[0]![field] !== undefined, `prepare_completed carries ${field}`);
+    }
+    for (const field of [
+      "historicCandidateCount",
+      "historicSelectedCount",
+      "historicTokens",
+      "historicBudgetTokens",
+      "scorerModel",
+      "scorerCacheHits",
+      "scorerInput",
+      "scorerOutput",
+    ]) {
+      assert.equal(completed[0]![field], undefined, `prepare_completed dropped ${field}`);
     }
 
     assert.equal(byType("checkpoint_published").length, 1);
@@ -159,8 +182,20 @@ describe("trace lifecycle flow", () => {
       "messagesDropped",
       "contextTokensBefore",
       "firstKeptEntryId",
+      "coverageEnd",
+      "swapStart",
+      "checkpointTokens",
+      "continuityTokens",
+      "totalInjectedTokens",
     ]) {
       assert.ok(swaps[0]![field] !== undefined && swaps[0]![field] !== null, `swap carries ${field}`);
+    }
+    assert.equal(
+      swaps[0]!.totalInjectedTokens,
+      (swaps[0]!.checkpointTokens as number) + (swaps[0]!.continuityTokens as number),
+    );
+    for (const field of ["historicTokens", "historicCandidateCount", "historicSelectedCount"]) {
+      assert.equal(swaps[0]![field], undefined, `swap dropped ${field}`);
     }
 
     const persisted = byType("checkpoint_persisted");
@@ -169,7 +204,7 @@ describe("trace lifecycle flow", () => {
     assert.equal(persisted[0]!.action, undefined);
   });
 
-  it("skips a stale hard-threshold fallback when context recovered before idle", async () => {
+  it("skips a stale emergency fallback when context recovered before idle", async () => {
     const dir = await mkdtemp(join(tmpdir(), "shadow-trace-"));
     const path = join(dir, "trace.jsonl");
     const previous = process.env[TRACE_FILE_ENV_VAR];
@@ -177,8 +212,8 @@ describe("trace lifecycle flow", () => {
     try {
       const f = await fixture();
       try {
-        // Spike past the default hard threshold (80) queues the hatch.
-        f.setPercent(85);
+        // Spike past the default emergency threshold (92) queues the hatch.
+        f.setPercent(95);
         await f.emit("turn_end");
         // The run drains below hard before the idle point: the hatch is stale.
         f.setPercent(50);
@@ -195,10 +230,10 @@ describe("trace lifecycle flow", () => {
     await rm(dir, { recursive: true, force: true });
     const fallbacks = events.filter((event) => event.event === "native_fallback");
     assert.equal(fallbacks.length, 2);
-    assert.equal(fallbacks[0]!.reason, "hard-threshold");
-    assert.equal(fallbacks[0]!.contextPercent, 85);
+    assert.equal(fallbacks[0]!.reason, "emergency");
+    assert.equal(fallbacks[0]!.contextPercent, 95);
     assert.equal(fallbacks[0]!.action, undefined);
-    assert.equal(fallbacks[1]!.reason, "hard-threshold");
+    assert.equal(fallbacks[1]!.reason, "emergency");
     assert.equal(fallbacks[1]!.action, "skipped-recovered");
     assert.equal(fallbacks[1]!.contextPercent, 50);
   });
@@ -209,10 +244,10 @@ describe("trace lifecycle flow", () => {
     const previous = process.env[TRACE_FILE_ENV_VAR];
     process.env[TRACE_FILE_ENV_VAR] = path;
     try {
-      const f = await fixture();
+      const f = await fixture(SWAP_CONFIG);
       try {
         await f.emit("turn_end");
-        await waitFor(() => f.registry.settled >= 2);
+        await waitFor(() => f.registry.settled >= 4);
         await tick();
         await f.emit("context", { messages: f.contextMessages() });
         await f.emit("turn_end");
@@ -245,7 +280,7 @@ describe("trace lifecycle flow", () => {
     assert.equal(last.postSwapModelTurns, 1);
   });
 
-  it("records the hard-threshold native fallback with its trigger context", async () => {
+  it("records the emergency native fallback with its trigger context", async () => {
     const dir = await mkdtemp(join(tmpdir(), "shadow-trace-"));
     const path = join(dir, "trace.jsonl");
     const previous = process.env[TRACE_FILE_ENV_VAR];
@@ -253,7 +288,7 @@ describe("trace lifecycle flow", () => {
     try {
       const f = await fixture();
       try {
-        f.setPercent(80);
+        f.setPercent(92);
         await f.emit("turn_end");
         await f.emit("agent_settled");
         assert.equal(f.compactCalls.length, 1);
@@ -268,7 +303,7 @@ describe("trace lifecycle flow", () => {
     await rm(dir, { recursive: true, force: true });
     const fallbacks = events.filter((event) => event.event === "native_fallback");
     assert.equal(fallbacks.length, 1);
-    assert.equal(fallbacks[0]!.reason, "hard-threshold");
-    assert.equal(fallbacks[0]!.contextPercent, 80);
+    assert.equal(fallbacks[0]!.reason, "emergency");
+    assert.equal(fallbacks[0]!.contextPercent, 92);
   });
 });

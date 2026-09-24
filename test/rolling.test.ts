@@ -13,10 +13,16 @@ import {
 
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 
-const SOFT_FIVE = {
-  softCompactThresholdPercent: 5,
+// A five-percent prepare threshold with a one-turn tail so swaps stay
+// observable on the two-turn fixture branch.
+const THRESHOLD_FIVE = {
+  prepareThresholdPercent: 5,
   summarizerModel: { provider: "", id: "" },
+  recentTurns: 1,
 };
+
+/** Model calls per successful preparation: builder read + submit, verifier read + verdict. */
+const CALLS_PER_PREPARE = 4;
 
 type TraceRecord = Record<string, unknown> & { event: string };
 
@@ -82,9 +88,9 @@ describe("isRollingEnabled", () => {
 describe("rolling two-refresh smoke (fix §9)", () => {
   it("publishes A, serves it while B prepares, replaces it, and persists B once", async () => {
     const { events } = await withTraceFile(async () => {
-      const f = await fixture({ ...SOFT_FIVE });
+      const f = await fixture({ ...THRESHOLD_FIVE });
       try {
-        // turn 1: 3% — below soft, nothing happens.
+        // turn 1: 3% — below the prepare threshold, nothing happens.
         await turn(f, 3);
         await tick();
         assert.equal(f.registry.calls, 0);
@@ -96,7 +102,7 @@ describe("rolling two-refresh smoke (fix §9)", () => {
         await turn(f, 6);
         assert.equal(f.registry.calls, 1);
         f.release();
-        await waitFor(() => f.registry.settled === 2);
+        await waitFor(() => f.registry.settled === CALLS_PER_PREPARE);
         await tick();
 
         // Summary A ready: the next request swaps without aborting the run.
@@ -109,24 +115,25 @@ describe("rolling two-refresh smoke (fix §9)", () => {
 
         // turn 4: swapped context reads 2.8% — the gate re-arms.
         await turn(f, 2.8);
-        assert.equal(f.registry.calls, 2);
+        assert.equal(f.registry.calls, CALLS_PER_PREPARE);
 
-        // turn 5: 4% — below soft, nothing happens.
+        // turn 5: 4% — below the prepare threshold, nothing happens.
         await turn(f, 4);
-        assert.equal(f.registry.calls, 2);
+        assert.equal(f.registry.calls, CALLS_PER_PREPARE);
 
         // turn 6: 5.1% — prepare B while A keeps serving.
         f.gate();
         await turn(f, 5.1);
-        assert.equal(f.registry.calls, 3);
+        assert.equal(f.registry.calls, CALLS_PER_PREPARE + 1);
         const swapWhilePreparing = await f.emit("context", { messages: f.contextMessages() });
         assert.ok(swapWhilePreparing, "A keeps serving while B prepares");
         assert.equal(f.compactCalls.length, 0, "an active run must not be aborted");
 
-        // turn 7: swap B.
+        // turn 7: B publishes and swaps in.
         f.release();
-        await waitFor(() => f.registry.settled === 4);
+        await waitFor(() => f.registry.settled === CALLS_PER_PREPARE + 4);
         await tick();
+        assert.equal(f.registry.calls, CALLS_PER_PREPARE + 4);
         const swapB = await f.emit("context", { messages: f.contextMessages() });
         assert.ok(swapB, "B serves after publishing");
 
@@ -174,42 +181,50 @@ describe("rolling two-refresh smoke (fix §9)", () => {
     assert.ok(order("checkpoint_published", 1) < order("checkpoint_persisted", 0));
     assert.equal(ofType(events, "checkpoint_persisted").length, 1);
 
-    // Every completed preparation carries its summarizer cost (no longer hidden).
+    // Every completed preparation carries its agent cost and evidence
+    // boundary (no longer hidden).
     for (const event of completed) {
       assert.ok(typeof event.summaryInput === "number");
       assert.ok(typeof event.summaryOutput === "number");
       assert.ok(typeof event.summaryChars === "number");
       assert.ok(typeof event.summaryWallMs === "number");
+      assert.ok(typeof event.builderRounds === "number");
+      assert.ok(typeof event.verifierRounds === "number");
+      assert.ok(typeof event.inspectedEntries === "number");
+      assert.ok(typeof event.coverageEnd === "string");
     }
     // Every swap carries the pre/post message shape for swap-reduction analysis.
     for (const event of swaps) {
       assert.ok(typeof event.messagesBefore === "number");
       assert.ok(typeof event.messagesAfter === "number");
       assert.ok(typeof event.messagesDropped === "number");
+      assert.ok(typeof event.checkpointTokens === "number");
+      assert.ok(typeof event.continuityTokens === "number");
+      assert.ok(typeof event.totalInjectedTokens === "number");
     }
   });
 
   it("a failed B keeps A serving with safe fallback behavior", async () => {
-    const f = await fixture({ ...SOFT_FIVE });
+    const f = await fixture({ ...THRESHOLD_FIVE });
     const previous = process.env[TRACE_FILE_ENV_VAR];
     delete process.env[TRACE_FILE_ENV_VAR];
     try {
       await turn(f, 5.2);
-      await waitFor(() => f.registry.settled === 2);
+      await waitFor(() => f.registry.settled === CALLS_PER_PREPARE);
       await tick();
       const swapA = await f.emit("context", { messages: f.contextMessages() });
       assert.ok(swapA, "A serves");
 
       await turn(f, 2.8);
-      assert.equal(f.registry.calls, 2);
+      assert.equal(f.registry.calls, CALLS_PER_PREPARE);
 
       // B fails: A remains published and keeps serving; no fallback is queued.
       f.registry.mode = "error";
       f.gate();
       await turn(f, 5.1);
-      assert.equal(f.registry.calls, 3);
+      assert.equal(f.registry.calls, CALLS_PER_PREPARE + 1);
       f.release();
-      await waitFor(() => f.registry.settled === 3);
+      await waitFor(() => f.registry.settled === CALLS_PER_PREPARE + 1);
       await tick();
       f.registry.mode = "ok";
       assert.match(f.notifications.at(-1) ?? "", /Summary model stopped with error/);
@@ -218,16 +233,17 @@ describe("rolling two-refresh smoke (fix §9)", () => {
       assert.equal(f.compactCalls.length, 0);
 
       // The failure must not manufacture a threshold crossing: still above
-      // soft with no new swap + shrink, so the next crossing is suppressed.
+      // the prepare threshold with no new swap + shrink, so the next crossing
+      // is suppressed.
       await turn(f, 5.3);
       await tick();
-      assert.equal(f.registry.calls, 3, "no immediate retry after a failed replacement");
+      assert.equal(f.registry.calls, CALLS_PER_PREPARE + 1, "no immediate retry after a failed replacement");
 
-      // Only an observed swap + shrink re-arms: below soft, then C prepares.
+      // Only an observed swap + shrink re-arms: below the threshold, then C prepares.
       await turn(f, 2.8);
       await turn(f, 5.4);
-      await waitFor(() => f.registry.calls === 5);
-      await waitFor(() => f.registry.settled === 5);
+      await waitFor(() => f.registry.calls === CALLS_PER_PREPARE + 5);
+      await waitFor(() => f.registry.settled === CALLS_PER_PREPARE + 5);
       await tick();
       await f.emit("agent_settled");
       assert.equal(f.compactCalls.length, 0);
@@ -239,27 +255,27 @@ describe("rolling two-refresh smoke (fix §9)", () => {
     }
   });
 
-  it("no re-arm while the swapped working set stays above soft", async () => {
+  it("no re-arm while the swapped working set stays above the prepare threshold", async () => {
     const { events } = await withTraceFile(async () => {
-      const f = await fixture({ ...SOFT_FIVE });
+      const f = await fixture({ ...THRESHOLD_FIVE });
       try {
         await turn(f, 5.2);
-        await waitFor(() => f.registry.settled === 2);
+        await waitFor(() => f.registry.settled === CALLS_PER_PREPARE);
         await tick();
         assert.ok(await f.emit("context", { messages: f.contextMessages() }));
 
-        // The swap did not bring context below soft: log, don't refresh.
+        // The swap did not bring context below the threshold: log, don't refresh.
         await turn(f, 5.5);
         await tick();
-        assert.equal(f.registry.calls, 2);
+        assert.equal(f.registry.calls, CALLS_PER_PREPARE);
         await turn(f, 5.6);
         await tick();
-        assert.equal(f.registry.calls, 2);
+        assert.equal(f.registry.calls, CALLS_PER_PREPARE);
 
-        // Once the working set actually shrinks below soft, the gate re-opens.
+        // Once the working set actually shrinks below the threshold, the gate re-opens.
         await turn(f, 2.8);
         await turn(f, 5.1);
-        await waitFor(() => f.registry.calls >= 4);
+        await waitFor(() => f.registry.calls >= CALLS_PER_PREPARE + 1);
       } finally {
         await f.cleanup();
       }
@@ -278,18 +294,18 @@ describe("rolling two-refresh smoke (fix §9)", () => {
     const previous = process.env.SHADOW_COMPACT_ROLLING;
     process.env.SHADOW_COMPACT_ROLLING = "0";
     try {
-      const f = await fixture({ ...SOFT_FIVE });
+      const f = await fixture({ ...THRESHOLD_FIVE });
       try {
         await turn(f, 5.2);
-        await waitFor(() => f.registry.settled === 2);
+        await waitFor(() => f.registry.settled === CALLS_PER_PREPARE);
         await tick();
         assert.ok(await f.emit("context", { messages: f.contextMessages() }));
 
-        // Below soft and back above: no refresh while A is published.
+        // Below the threshold and back above: no refresh while A is published.
         await turn(f, 2.8);
         await turn(f, 5.1);
         await tick();
-        assert.equal(f.registry.calls, 2);
+        assert.equal(f.registry.calls, CALLS_PER_PREPARE);
 
         // The idle persist keeps A serving (no stand-down): still exactly one
         // checkpoint per run, and further crossings do not refresh.
@@ -300,7 +316,7 @@ describe("rolling two-refresh smoke (fix §9)", () => {
         await turn(f, 2.8);
         await turn(f, 5.4);
         await tick();
-        assert.equal(f.registry.calls, 2);
+        assert.equal(f.registry.calls, CALLS_PER_PREPARE);
         await f.emit("agent_settled");
         assert.equal(f.appendedEntries.length, 1);
       } finally {

@@ -1,5 +1,7 @@
 import type { Usage } from "@earendil-works/pi-ai";
+import type { CheckpointCoverage, PromptVersions } from "./checkpoint.js";
 import type { FileDetails } from "./prepare.js";
+import type { Checkpoint } from "./summary.js";
 
 // Single definition lives in prepare.ts alongside fileDetails(); re-exported
 // here so existing `.../state.js` import sites keep working.
@@ -17,6 +19,12 @@ export interface PreparedResult {
   details: FileDetails;
   /** Context size observed at publish; metadata for the mid-run swap message. */
   contextTokensBefore?: number;
+  /** Evidence boundary; absent on v1 restores (derived from firstKeptEntryId). */
+  coverage?: CheckpointCoverage;
+  /** Structured checkpoint behind the rendering; absent on v1 restores. */
+  structured?: Checkpoint;
+  generatedAt?: number;
+  prompts?: PromptVersions;
 }
 
 export interface PreparingInfo {
@@ -29,12 +37,12 @@ export interface PreparingInfo {
  *
  * - `"failure"`: the background summary failed with nothing serving, so one
  *   ordinary native compaction is the only safe recovery. Unconditional.
- * - `"hard-threshold"`: context spiked past the hard threshold. Conditional:
- *   the idle point rechecks the threshold first, because the spike may have
- *   recovered while the run drained (a stale hatch must not compact a
- *   healthy working set).
+ * - `"emergency"`: context spiked past the emergency native threshold.
+ *   Conditional: the idle point rechecks the threshold first, because the
+ *   spike may have recovered while the run drained (a stale hatch must not
+ *   compact a healthy working set).
  */
-export type PendingFallbackReason = "failure" | "hard-threshold";
+export type PendingFallbackReason = "failure" | "emergency";
 
 /**
  * Rolling working-set maintenance state.
@@ -83,6 +91,11 @@ export class ShadowCompactStateController {
   /** Whether the serving checkpoint has swapped into at least one request. */
   get publishedSwapped(): boolean {
     return this.#publishedSwapped;
+  }
+
+  /** Whether a checkpoint is actively serving (published and swapped at least once). */
+  get active(): boolean {
+    return this.#published !== undefined && this.#publishedSwapped;
   }
 
   get preparing(): PreparingInfo | undefined {
@@ -261,7 +274,24 @@ export class ShadowCompactStateController {
     return true;
   }
 
-  requestNativeFallback(reason: PendingFallbackReason = "hard-threshold"): boolean {
+  /**
+   * Aborts an in-flight preparation without queuing a fallback and without
+   * dropping the serving checkpoint. Used when a fresher preparation takes
+   * over (manual /compact) or the compaction hook aborts. The released
+   * attempt re-arms the refresh gate — it never published, so it must not
+   * latch future crossings shut — and the aborted completion no-ops on its
+   * stale generation.
+   */
+  abortPreparing(): boolean {
+    if (!this.#preparing) return false;
+    this.#preparing.controller.abort();
+    this.#preparing = undefined;
+    this.#generation += 1;
+    this.#refreshArmed = true;
+    return true;
+  }
+
+  requestNativeFallback(reason: PendingFallbackReason = "emergency"): boolean {
     if (this.#pendingNativeFallback) return false;
     this.#preparing?.controller.abort();
     this.#preparing = undefined;

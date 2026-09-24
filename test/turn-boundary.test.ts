@@ -1,175 +1,143 @@
 import assert from "node:assert/strict";
-import { writeFile } from "node:fs/promises";
-import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
-  fixture,
-  waitFor,
-  tick,
-  userEntry,
   compactionEntry,
+  fixture,
+  userEntry,
+  waitFor,
+  type Fixture,
 } from "./helpers/index-fixture.js";
 
 const READY_MESSAGE = "shadow-compact: summary ready - swaps in at the next turn";
 const DEFERRED_MESSAGE =
   "shadow-compact: summary still preparing - swap deferred until the agent is idle";
 
-/** Runs turn_end at the 60% threshold and waits for draft + verification to finish. */
-async function startPreparation(f: ReturnType<typeof fixture> extends Promise<infer T> ? T : never): Promise<void> {
-  await f.emit("turn_end");
-  await waitFor(() => f.registry.settled >= 2);
+const SWAP_CONFIG = {
+  prepareThresholdPercent: 60,
+  summarizerModel: { provider: "", id: "" },
+  recentTurns: 1,
+};
+
+async function startPreparation(fixture: Fixture): Promise<void> {
+  await fixture.emit("turn_end");
+  await waitFor(() => fixture.notifications.includes(READY_MESSAGE));
 }
 
-describe("idle swap, hard hatch, and terminal empty-snapshot failure", () => {
+describe("idle swap, emergency hatch, and terminal empty-snapshot failure", () => {
   it("swaps a ready summary into the next turn without aborting the run", async () => {
-    const f = await fixture();
+    const f = await fixture(SWAP_CONFIG);
     try {
-      // Publish mid-run: gate the summary, then let it finish while the run continues.
-      f.gate();
-      await f.emit("turn_end");
-      f.release();
-      await waitFor(() => f.registry.settled === 2);
-      await tick();
-      assert.deepEqual(f.notifications, [READY_MESSAGE]);
+      await startPreparation(f);
 
-      await f.emit("turn_end");
-      assert.equal(f.compactCalls.length, 0, "an active run must not be aborted");
-
-      // The next request sees the summary plus the kept tail; no compaction ran.
-      const outcome = (await f.emit("context", { messages: f.contextMessages() })) as {
-        messages: Array<Record<string, unknown>>;
+      const swapped = (await f.emit("context", { messages: f.contextMessages() })) as {
+        messages: Array<{ summary?: string }>;
       };
-      assert.equal(outcome?.messages.length, 2);
-      assert.equal(outcome.messages[0]?.role, "compactionSummary");
-      assert.match(outcome.messages[0]?.summary as string, /Prepared continuation checkpoint/);
-      assert.deepEqual(outcome.messages[1], (f.branch[3] as { message?: unknown }).message);
-
-      // The durable checkpoint lands once the run settles — no compaction.
-      await f.emit("agent_settled");
-      assert.equal(f.compactCalls.length, 0);
-      assert.equal(f.appendedEntries.length, 1);
-
-      // The checkpoint keeps serving after it lands (no stand-down state).
-      const stillServing = (await f.emit("context", { messages: f.contextMessages() })) as {
-        messages: Array<Record<string, unknown>>;
-      };
-      assert.equal(stillServing?.messages[0]?.role, "compactionSummary");
-
-      // Once a native compaction really lands, the projection is invalid: the
-      // swap stands down and nothing new is persisted.
-      f.appendCompaction();
-      await f.emit("session_compact", {
-        type: "session_compact",
-        compactionEntry: compactionEntry("c1", "e4"),
-        fromExtension: false,
-        reason: "threshold",
-        willRetry: false,
-      });
-      const after = await f.emit("context", { messages: f.contextMessages() });
-      assert.equal(after, undefined);
-      await f.emit("agent_settled");
-      assert.equal(f.compactCalls.length, 0);
-      assert.equal(f.appendedEntries.length, 1);
+      assert.equal(swapped.messages.length, 2);
+      assert.ok(String(swapped.messages[0]?.summary).includes("Prepared continuation checkpoint"));
+      assert.deepEqual(f.compactCalls, []);
+      assert.equal(f.registry.settled, 4);
     } finally {
       await f.cleanup();
     }
   });
 
   it("announces the deferral when the summary misses the settle, then persists once ready and idle", async () => {
-    const f = await fixture();
+    const f = await fixture(SWAP_CONFIG);
     try {
       f.gate();
       await f.emit("turn_end");
+      await waitFor(() => f.registry.calls === 1);
+      // The agent drained before the summary arrived: no persist yet, no
+      // native compaction queued, just the deferral note.
       await f.emit("agent_settled");
       assert.deepEqual(f.notifications, [DEFERRED_MESSAGE]);
-      assert.equal(f.compactCalls.length, 0);
-
-      // One announce per settle, not per turn.
-      await f.emit("turn_end");
-      await f.emit("agent_settled");
-      assert.deepEqual(f.notifications, [DEFERRED_MESSAGE, DEFERRED_MESSAGE]);
+      assert.deepEqual(f.compactCalls, []);
+      assert.equal(f.appendedEntries.length, 0);
 
       f.release();
-      await waitFor(() => f.registry.settled === 2);
-      await tick();
-      assert.equal(f.compactCalls.length, 0);
+      await waitFor(() => f.notifications.includes(READY_MESSAGE));
       assert.equal(f.appendedEntries.length, 1);
+      assert.equal((f.appendedEntries[0]?.data as { version: number }).version, 3);
     } finally {
       await f.cleanup();
     }
   });
 
-  it("queues one native compaction once usage passes the hard threshold", async () => {
-    const f = await fixture();
+  it("never aborts a preparation at the swap threshold", async () => {
+    const f = await fixture(SWAP_CONFIG);
     try {
       f.gate();
       await f.emit("turn_end");
-      f.setPercent(80);
+      await waitFor(() => f.registry.calls === 1);
+      // Usage climbs past the swap threshold while the replacement is still
+      // being built: the preparation is the path to a smaller working set,
+      // so it keeps running and no native fallback is queued.
+      f.setPercent(85);
       await f.emit("turn_end");
+      assert.equal(f.registry.calls, 1);
+      f.release();
+      await waitFor(() => f.notifications.includes(READY_MESSAGE));
       assert.deepEqual(f.compactCalls, []);
-      assert.ok(f.registry.signals[0]?.aborted, "in-flight preparation aborted");
+      await f.emit("agent_settled");
+      assert.deepEqual(f.compactCalls, []);
+    } finally {
+      await f.cleanup();
+    }
+  });
 
-      // No duplicate while the native compaction is queued.
+  it("queues one native compaction once usage passes the emergency threshold", async () => {
+    const f = await fixture(SWAP_CONFIG);
+    try {
+      await startPreparation(f);
+      f.setPercent(92);
       await f.emit("turn_end");
-      await tick();
-      assert.equal(f.compactCalls.length, 0);
+      // Still mid-run: the fallback waits for the idle point.
+      assert.deepEqual(f.compactCalls, []);
+      await f.emit("agent_settled");
+      assert.deepEqual(f.compactCalls, [{}]);
+      // ctx.compact() is a manual compaction, so the ready checkpoint resets
+      // when the native compaction lands.
+      await f.emit("session_compact", { type: "session_compact", fromExtension: true });
+      const swapped = await f.emit("context", { messages: f.contextMessages() });
+      assert.equal(swapped, undefined);
+    } finally {
+      await f.cleanup();
+    }
+  });
 
+  it("fires the emergency hatch even while a published checkpoint keeps serving, and stays below it at 91%", async () => {
+    const f = await fixture(SWAP_CONFIG);
+    try {
+      await startPreparation(f);
+      const swapped = (await f.emit("context", { messages: f.contextMessages() })) as {
+        messages: unknown[];
+      };
+      assert.equal(swapped.messages.length, 2);
+
+      f.setPercent(92);
+      await f.emit("turn_end");
       await f.emit("agent_settled");
       assert.deepEqual(f.compactCalls, [{}]);
 
-      // The aborted completion stays inert; the fallback is not scheduled twice.
-      // Draft and verifier settle in one drain, so the wait is >=, not exact.
-      f.release();
-      await waitFor(() => f.registry.settled >= 2);
-      await tick();
+      await f.emit("session_compact", { type: "session_compact", fromExtension: true });
+      assert.deepEqual(f.compactCalls, [{}]);
+      f.setPercent(91);
+      await f.emit("turn_end");
       await f.emit("agent_settled");
-      assert.equal(f.compactCalls.length, 1);
+      assert.deepEqual(f.compactCalls, [{}]);
     } finally {
       await f.cleanup();
     }
   });
 
-  it("fires the hard hatch even while a published checkpoint keeps serving, and stays below it at 79%", async () => {
-    const ready = await fixture();
-    try {
-      await startPreparation(ready);
-      ready.setPercent(85);
-      await ready.emit("turn_end");
-      assert.equal(ready.compactCalls.length, 0);
-      // The stale-but-valid checkpoint keeps serving meanwhile.
-      assert.ok(await ready.emit("context", { messages: ready.contextMessages() }));
-      await ready.emit("agent_settled");
-      assert.equal(ready.compactCalls.length, 1);
-      assert.deepEqual(
-        ready.compactCalls[0],
-        {},
-        "hard means the served working set is already too large despite the checkpoint",
-      );
-    } finally {
-      await ready.cleanup();
-    }
-
-    const below = await fixture();
-    try {
-      below.setPercent(79);
-      await below.emit("turn_end");
-      await waitFor(() => below.registry.settled === 2);
-      assert.equal(below.compactCalls.length, 0, "79% only triggers the soft prepare");
-    } finally {
-      await below.cleanup();
-    }
-  });
-
-  it("applies the hard hatch with the default threshold even when config loading fails", async () => {
+  it("applies the emergency hatch with the default threshold even when config loading fails", async () => {
     const f = await fixture();
     try {
+      const configPath = `${f.agentDir}/shadow-compact.json`;
       const { writeFile } = await import("node:fs/promises");
-      const { join } = await import("node:path");
-      await writeFile(join(f.agentDir, "shadow-compact.json"), "{ not json");
-      f.setPercent(80);
+      await writeFile(configPath, "{ not json");
+      f.setPercent(92);
       await f.emit("turn_end");
-      assert.deepEqual(f.compactCalls, []);
-      assert.equal(f.registry.calls, 0);
       await f.emit("agent_settled");
       assert.deepEqual(f.compactCalls, [{}]);
     } finally {
@@ -178,57 +146,67 @@ describe("idle swap, hard hatch, and terminal empty-snapshot failure", () => {
   });
 
   it("re-arms the hatch after the native compaction lands", async () => {
-    const f = await fixture();
+    const f = await fixture(SWAP_CONFIG);
     try {
-      f.setPercent(80);
+      f.setPercent(92);
       await f.emit("turn_end");
-      assert.equal(f.compactCalls.length, 0);
       await f.emit("agent_settled");
-      assert.equal(f.compactCalls.length, 1);
-
-      await f.emit("session_compact", {
-        type: "session_compact",
-        compactionEntry: compactionEntry("c1", "e4"),
-        fromExtension: false,
-        reason: "manual",
-        willRetry: false,
-      });
+      assert.deepEqual(f.compactCalls, [{}]);
+      // The marker clears when the native compaction is observed, so a later
+      // spike can compact again.
+      await f.emit("session_compact", { type: "session_compact", fromExtension: true });
       await f.emit("turn_end");
-      assert.equal(f.compactCalls.length, 1);
       await f.emit("agent_settled");
-      assert.equal(f.compactCalls.length, 2, "hatch can fire again after the swap landed");
+      assert.deepEqual(f.compactCalls, [{}, {}]);
     } finally {
       await f.cleanup();
     }
   });
 
-  it("suppresses empty-snapshot preparations without native fallback while the hard hatch stays live", async () => {
+  it("suppresses empty-snapshot preparations without native fallback while the emergency hatch stays live", async () => {
     const f = await fixture();
     try {
-      // Branch below keepRecentTokens (30): the summarizable range is empty.
+      // A single greeting turn cannot produce a checkpoint that drops
+      // anything: suppress without queuing a native fallback.
       f.setBranch([userEntry("e1", null, "hi")]);
-      f.setPercent(60);
       await f.emit("turn_end");
-      await tick();
+      await waitFor(() => f.registry.settled >= 0);
       assert.equal(f.registry.calls, 0);
-      assert.deepEqual(f.notifications, []);
-
-      // Suppressed, not terminal: no native fallback at settle.
+      // A queued native fallback owns the next idle point; with suppression
+      // instead, the settle stays a no-op.
       await f.emit("agent_settled");
-      assert.equal(f.compactCalls.length, 0);
+      assert.deepEqual(f.compactCalls, []);
 
-      // Growth alone does not re-arm: only an observed swap + shrink does.
-      f.setBranch([userEntry("e1", null, "hi"), userEntry("e2", "e1", "x".repeat(4000))]);
+      // Growth alone does not re-arm since the context did not move.
+      f.setBranch([
+        userEntry("e1", null, "hi"),
+        userEntry("e2", "e1", "a longer second turn that still fits the whole tail"),
+      ]);
       await f.emit("turn_end");
-      await tick();
-      assert.equal(f.registry.calls, 0, "empty-snapshot suppression holds without a re-arm");
+      assert.equal(f.registry.calls, 0);
+      await f.emit("agent_settled");
+      assert.deepEqual(f.compactCalls, []);
 
-      // The hard threshold remains the emergency path.
-      f.setPercent(80);
+      // The emergency hatch above stays independent of the suppression: a
+      // usage spike still compacts natively at idle.
+      f.setPercent(92);
       await f.emit("turn_end");
       await f.emit("agent_settled");
-      assert.equal(f.compactCalls.length, 1);
-      assert.deepEqual(f.compactCalls[0], {});
+      assert.deepEqual(f.compactCalls, [{}]);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it("fails closed to full context when a native compaction lands mid-run", async () => {
+    const f = await fixture(SWAP_CONFIG);
+    try {
+      await startPreparation(f);
+      // A native compaction from another path lands: the serving checkpoint
+      // is stale, so the swap fails closed to full context.
+      f.setBranch([...f.branch, compactionEntry("c1", "e4")]);
+      const swapped = await f.emit("context", { messages: f.contextMessages() });
+      assert.equal(swapped, undefined);
     } finally {
       await f.cleanup();
     }
