@@ -10,7 +10,7 @@ import {
   isStderrTraceEnabled,
   traceEvent,
 } from "../src/trace.js";
-import { fixture, waitFor, tick } from "./helpers/index-fixture.js";
+import { fixtureWithHistory as fixture, waitFor, tick } from "./helpers/index-fixture.js";
 
 function restoreEnv(name: string, previous: string | undefined): void {
   if (previous === undefined) delete process.env[name];

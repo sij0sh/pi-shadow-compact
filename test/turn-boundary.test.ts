@@ -2,16 +2,16 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   compactionEntry,
-  fixture,
+  fixtureWithHistory as fixture,
   tick,
   userEntry,
   waitFor,
   type Fixture,
 } from "./helpers/index-fixture.js";
 
-const READY_MESSAGE = "shadow-compact: summary ready - swaps in at the next turn";
+const READY_MESSAGE = "shadow-compact: checkpoint ready; next safe request will use it";
 const DEFERRED_MESSAGE =
-  "shadow-compact: summary still preparing - swap deferred until the agent is idle";
+  "shadow-compact: checkpoint still preparing in background";
 
 const SWAP_CONFIG = {
   prepareThresholdPercent: 60,
@@ -33,7 +33,7 @@ describe("idle swap, emergency hatch, and terminal empty-snapshot failure", () =
       const swapped = (await f.emit("context", { messages: f.contextMessages() })) as {
         messages: Array<{ summary?: string }>;
       };
-      assert.equal(swapped.messages.length, 2);
+      assert.equal(swapped.messages.length, 10);
       assert.ok(String(swapped.messages[0]?.summary).includes("Prepared continuation checkpoint"));
       assert.deepEqual(f.compactCalls, []);
       assert.equal(f.registry.settled, 4);
@@ -113,7 +113,7 @@ describe("idle swap, emergency hatch, and terminal empty-snapshot failure", () =
       const swapped = (await f.emit("context", { messages: f.contextMessages() })) as {
         messages: unknown[];
       };
-      assert.equal(swapped.messages.length, 2);
+      assert.equal(swapped.messages.length, 10);
 
       f.setPercent(92);
       await f.emit("turn_end");

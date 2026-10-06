@@ -11,16 +11,17 @@ import { CHECKPOINT_CUSTOM_TYPE } from "../src/persist.js";
 import {
   compactionEntry,
   fixture,
+  fixtureWithHistory,
   tick,
   userEntry,
   waitFor,
   type Fixture,
 } from "./helpers/index-fixture.js";
 
-const READY_MESSAGE = "shadow-compact: summary ready - swaps in at the next turn";
+const READY_MESSAGE = "shadow-compact: checkpoint ready; next safe request will use it";
 const MANUAL_PREPARE_MESSAGE = "shadow-compact: preparing a fresh checkpoint for /compact";
 
-// The fixture branch holds two turns; a one-turn tail keeps swaps observable.
+// Small snapshots exercise preparation. Serving tests add disposable history.
 const SWAP_CONFIG = {
   prepareThresholdPercent: 60,
   summarizerModel: { provider: "", id: "" },
@@ -286,7 +287,7 @@ describe("shadowCompact extension orchestration", () => {
   });
 
   it("compact-native runs one native compaction bypassing Shadow", async () => {
-    const f = await fixture({ ...SWAP_CONFIG, recentTurns: 2 });
+    const f = await fixtureWithHistory({ ...SWAP_CONFIG, recentTurns: 2 });
     try {
       await startPreparation(f);
       const command = f.commands.get("compact-native");
@@ -398,7 +399,7 @@ describe("shadowCompact extension orchestration", () => {
       await waitFor(() => f.registry.settled >= 1);
       await tick();
       assert.equal(f.registry.calls, 1);
-      assert.deepEqual(f.notifications, ["shadow-compact: Summary model stopped with error"]);
+      assert.deepEqual(f.notifications, ["shadow-compact: Summary model (configured/summary-model) stopped with error: synthetic failure"]);
       assert.equal(f.compactCalls.length, 0);
       // A queued fallback owns the next idle point: no new preparation on top of it.
       await f.emit("turn_end");
@@ -413,7 +414,7 @@ describe("shadowCompact extension orchestration", () => {
   });
 
   it("publishes the verified checkpoint text, not the draft", async () => {
-    const f = await fixture(SWAP_CONFIG);
+    const f = await fixtureWithHistory(SWAP_CONFIG);
     try {
       f.registry.mode = "verifier-rewrite";
       await startPreparation(f);

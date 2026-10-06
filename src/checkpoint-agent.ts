@@ -11,6 +11,7 @@ import {
   type Usage,
 } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { sanitizeForContext } from "./normalize.js";
 import type { CheckpointCoverage } from "./checkpoint.js";
 import type { ShadowCompactConfig } from "./config.js";
 import {
@@ -138,6 +139,8 @@ const SUBMIT_VERDICT_TOOL: Tool = {
 };
 
 export interface BuilderRequest {
+  /** User summary guidance, never transcript evidence. */
+  customInstructions?: string;
   signal?: AbortSignal;
   completion?: CompletionInterface;
   model?: Model<Api>;
@@ -354,6 +357,12 @@ Repair rules:
 - Be dense but readable. Call submit_verdict once: accept the draft, repair it with the complete corrected checkpoint, or reject it as unusable (with a reason) when the evidence cannot support a reliable checkpoint at all.`;
 }
 
+function summaryGuidance(instructions: string | undefined): string {
+  return instructions?.trim()
+    ? `\n\nUser summary guidance (not evidence; do not weaken inspection or verification requirements):\n${instructions.trim()}`
+    : "";
+}
+
 interface ToolLoopOptions {
   completion: CompletionInterface;
   model: Model<Api>;
@@ -405,10 +414,17 @@ async function runToolLoop(options: ToolLoopOptions): Promise<ToolLoopResult> {
   for (let round = 0; round < options.maxRounds; round++) {
     options.signal?.throwIfAborted();
     const context: Context = { systemPrompt: options.systemPrompt, messages, tools: options.tools };
-    const response = await options.completion.complete(options.model, context, requestOptions);
+    let response: AssistantMessage;
+    try {
+      response = await options.completion.complete(options.model, context, requestOptions);
+    } catch (error) {
+      const detail = sanitizeForContext(error instanceof Error ? error.message : String(error), "").slice(0, 1000);
+      throw new Error(`${options.responseLabel} (${options.model.provider}/${options.model.id}) request failed: ${detail}`);
+    }
     usages.push(response.usage);
     if (response.stopReason === "error" || response.stopReason === "aborted" || response.stopReason === "length") {
-      throw new Error(`${options.responseLabel} stopped with ${response.stopReason}`);
+      const detail = response.errorMessage ? `: ${sanitizeForContext(response.errorMessage, "").slice(0, 1000)}` : "";
+      throw new Error(`${options.responseLabel} (${options.model.provider}/${options.model.id}) stopped with ${response.stopReason}${detail}`);
     }
     messages.push(response);
     const toolCalls = response.content.filter((block): block is ToolCall => block.type === "toolCall");
@@ -480,7 +496,7 @@ export async function runCheckpointBuilderAgent(
     model,
     tools: [...READ_TOOLS, SUBMIT_CHECKPOINT_TOOL],
     systemPrompt: BUILDER_SYSTEM_PROMPT,
-    prompt: builderPrompt(index),
+    prompt: builderPrompt(index) + summaryGuidance(request.customInstructions),
     maxRounds: CHECKPOINT_BUILDER_MAX_ROUNDS,
     signal: request.signal,
     maxTokens: request.maxTokens,
@@ -545,7 +561,7 @@ export async function runCheckpointVerifierAgent(
     model,
     tools: [...READ_TOOLS, SUBMIT_VERDICT_TOOL],
     systemPrompt: VERIFIER_SYSTEM_PROMPT,
-    prompt: verifierPrompt(index, draft, draftCoverage),
+    prompt: verifierPrompt(index, draft, draftCoverage) + summaryGuidance(request.customInstructions),
     maxRounds: CHECKPOINT_VERIFIER_MAX_ROUNDS,
     signal: request.signal,
     maxTokens: request.maxTokens,

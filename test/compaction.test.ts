@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { buildSessionProjection, type ContextEvent, type SessionEntry } from "@earendil-works/pi-coding-agent";
-import { fixture, tick, USAGE, userEntry, waitFor, type Fixture } from "./helpers/index-fixture.js";
+import { fixtureWithHistory as fixture, tick, USAGE, userEntry, waitFor, type Fixture } from "./helpers/index-fixture.js";
 
 const CONFIG = { recentTurns: 1, idleCompact: { enabled: false } };
 
 async function prepare(f: Fixture): Promise<void> {
   await f.emit("turn_end");
-  await waitFor(() => f.notifications.some((message) => message.includes("summary ready")));
+  await waitFor(() => f.notifications.some((message) => message.includes("checkpoint ready")));
 }
 
 function conversation(branch: SessionEntry[]): ContextEvent["messages"] {
@@ -42,7 +42,7 @@ describe("Pi compaction interoperability", () => {
         const before = await f.emit("context", { type: "context", messages: conversation(f.branch) });
         assert.ok(before?.messages, "checkpoint is already serving");
         const calls = f.registry.calls;
-        const outcome = await f.emit("session_before_compact", f.compactEvent({ reason }));
+        const outcome = await f.emit("session_before_compact", f.compactEvent({ reason, firstKeptEntryId: "history-3" }));
         assert.equal(outcome, undefined, "Pi must summarize natively instead of committing the identical checkpoint and tail");
         assert.equal(f.registry.calls, calls, "do not rebuild a checkpoint that already covers Pi's cut");
       } finally {
@@ -59,13 +59,17 @@ describe("Pi compaction interoperability", () => {
         index === 0 ? null : `u${index}`,
         "large conversation turn ".repeat(200),
       )));
+      f.setBranch(f.branch.flatMap((entry) => [entry, {
+        type: "message", id: `reply-${entry.id}`, parentId: entry.id, timestamp: entry.timestamp,
+        message: { role: "assistant", content: [{ type: "text", text: "completed round" }], timestamp: 0 },
+      } as SessionEntry]).map((entry, i, entries) => ({ ...entry, parentId: i === 0 ? null : entries[i - 1]!.id })));
       await prepare(f);
       const before = await f.emit("context", { type: "context", messages: conversation(f.branch) });
       const outcome = await f.emit("session_before_compact", f.compactEvent({ firstKeptEntryId: "u13" }));
       assert.equal(outcome?.compaction?.firstKeptEntryId, "u13", "Pi's retained-token budget owns real compaction");
       const after = appendResult(f, outcome.compaction);
       assert.ok(after.length < before.messages.length, "canonical context must shrink relative to the already served working context");
-      assert.equal(after.length, 3);
+      assert.equal(after.length, 5);
       await f.emit("session_compact", { type: "session_compact", fromExtension: true });
       assert.equal(await f.emit("context", { type: "context", messages: after }), undefined);
     } finally {
@@ -155,7 +159,7 @@ describe("Pi compaction interoperability", () => {
       f.setPercent(60);
       await f.emit("turn_end");
       assert.ok(f.registry.calls > 1, "an aborted preparation must not leave the refresh gate latched after native failure");
-      await waitFor(() => f.notifications.some((message) => message.includes("summary ready")));
+      await waitFor(() => f.notifications.some((message) => message.includes("checkpoint ready")));
     } finally {
       await f.cleanup();
     }

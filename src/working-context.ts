@@ -24,6 +24,8 @@ export interface WorkingContextInput {
   messages: ContextEvent["messages"];
   minimumRecentTurns: number;
   contextTokensBefore?: number;
+  /** Frozen trigger-time overlap. Combines with coverage and recency; never replaces them. */
+  retainedAnchor?: string;
   /**
    * Explicit tail start replacing the coverage-derived one. Used for v1
    * checkpoints, whose cut is entry-granular (possibly mid-turn): starting
@@ -81,6 +83,7 @@ export function planSwap(
   coverageEndEntryId: string,
   minimumRecentTurns: number,
   coverageTailOverride?: string,
+  retainedAnchor?: string,
 ): SwapPlan | undefined {
   if (branch.length === 0) return undefined;
   const turns = continuityTurns(branch);
@@ -106,9 +109,15 @@ export function planSwap(
   }
   const recentCount = Math.max(1, Math.floor(minimumRecentTurns));
   const recentTailStart = turns[Math.max(0, turns.length - recentCount)]!.startEntryId;
-  const swapStartEntryId = (entryIndex.get(coverageTailStart) ?? 0) <= (entryIndex.get(recentTailStart) ?? 0)
+  let swapStartEntryId = (entryIndex.get(coverageTailStart) ?? 0) <= (entryIndex.get(recentTailStart) ?? 0)
     ? coverageTailStart
     : recentTailStart;
+
+  if (retainedAnchor !== undefined) {
+    const anchorIndex = entryIndex.get(retainedAnchor);
+    if (anchorIndex === undefined) return undefined;
+    if (anchorIndex < entryIndex.get(swapStartEntryId)!) swapStartEntryId = retainedAnchor;
+  }
 
   return {
     summaryCoverageEnd: coverageEndEntryId,
@@ -127,6 +136,7 @@ export function buildWorkingContext(
     checkpoint.coverage.coverageEndEntryId,
     input.minimumRecentTurns,
     input.coverageTailOverride,
+    input.retainedAnchor,
   );
   if (!plan) return { skipped: "stale-coverage" };
 
@@ -174,23 +184,55 @@ export function buildWorkingContext(
  * New input joins its following assistant response; parallel results stay
  * with their call. Omitted attempts and prompt/state entries do not count.
  */
-function continuityTurns(branch: SessionEntry[]): Array<{ startEntryId: string; endEntryId: string }> {
-  const turns: Array<{ startEntryId: string; endEntryId: string }> = [];
+function continuityTurns(branch: SessionEntry[]): Array<{ startEntryId: string; endEntryId: string; completed: boolean }> {
+  const turns: Array<{ startEntryId: string; endEntryId: string; completed: boolean }> = [];
   let hasAssistant = false;
+  let pendingCalls = new Set<string>();
   for (const entry of buildSessionProjection(branch).entries) {
     const messages = entry.messages.filter((message) => message.role !== "system" && message.role !== "compactionSummary");
     if (messages.length === 0) continue;
     const assistant = messages.some((message) => message.role === "assistant");
     const input = messages.some((message) => message.role !== "assistant" && message.role !== "toolResult");
     if (turns.length === 0 || input || (assistant && hasAssistant)) {
-      turns.push({ startEntryId: entry.sourceEntry.id, endEntryId: entry.sourceEntry.id });
+      turns.push({ startEntryId: entry.sourceEntry.id, endEntryId: entry.sourceEntry.id, completed: false });
       hasAssistant = false;
+      pendingCalls = new Set();
     } else {
       turns[turns.length - 1]!.endEntryId = entry.sourceEntry.id;
     }
-    if (assistant) hasAssistant = true;
+    for (const message of messages) {
+      if (message.role === "assistant") {
+        hasAssistant = true;
+        for (const block of message.content) if (block.type === "toolCall") pendingCalls.add(block.id);
+      } else if (message.role === "toolResult") {
+        pendingCalls.delete(message.toolCallId);
+      }
+    }
+    turns[turns.length - 1]!.completed = hasAssistant && pendingCalls.size === 0;
   }
   return turns;
+}
+
+/** Start of five complete preceding rounds plus the trigger/latest round. */
+export function triggerOverlapStart(branch: SessionEntry[]): string | undefined {
+  const turns = continuityTurns(branch);
+  if (!turns.length) return undefined;
+  let start = turns.length - 1;
+  let preceding = 0;
+  while (start > 0 && preceding < 5) {
+    start--;
+    if (turns[start]!.completed) preceding++;
+  }
+  return turns[start]!.startEntryId;
+}
+
+/** Context edits after the captured snapshot invalidate its evidence claim. */
+export function coverageIsUnchanged(branch: SessionEntry[], coverage: CheckpointCoverage): boolean {
+  const preparedIndex = branch.findIndex((entry) => entry.id === coverage.preparedAtLeafId);
+  const coverageIndex = branch.findIndex((entry) => entry.id === coverage.coverageEndEntryId);
+  if (preparedIndex < 0 || coverageIndex < 0) return false;
+  const coveredIds = new Set(branch.slice(0, coverageIndex + 1).map((entry) => entry.id));
+  return !branch.slice(preparedIndex + 1).some((entry) => entry.type === "context_edit" && coveredIds.has(entry.targetId));
 }
 
 /** Shared no-gap proof for request-local swaps and Pi compaction cuts. */

@@ -27,6 +27,8 @@ export type TraceEventType =
   | "prepare_completed"
   | "prepare_failed"
   | "checkpoint_published"
+  | "checkpoint_install_proposed"
+  | "checkpoint_installed"
   | "swap_applied"
   | "checkpoint_rearmed"
   | "checkpoint_persisted"

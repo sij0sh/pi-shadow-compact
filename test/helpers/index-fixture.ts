@@ -358,6 +358,7 @@ export interface Fixture {
     firstKeptEntryId?: string;
     signal?: AbortSignal;
   }): SessionBeforeCompactEvent;
+  command(name: string, args?: string): Promise<void>;
   cleanup(): Promise<void>;
 }
 
@@ -385,6 +386,19 @@ export async function fixture(globalConfig?: Record<string, unknown>): Promise<F
     failNextAppend: false,
   };
   return installInstance(shared);
+}
+
+/** Disposable prefix so retention tests can keep six rounds and still shrink. */
+export async function fixtureWithHistory(config?: Record<string, unknown>): Promise<Fixture> {
+  const f = await fixture(config);
+  const prefix = Array.from({ length: 8 }, (_, i) => ({
+    type: "message", id: `history-${i}`, parentId: i === 0 ? null : `history-${i - 1}`,
+    timestamp: TIMESTAMP,
+    message: { role: "assistant", content: [{ type: "text", text: "old history detail ".repeat(300) }],
+      api: "test", provider: "test", model: "test", usage: USAGE, stopReason: "stop", timestamp: 0 },
+  } as SessionEntry));
+  f.setBranch([...prefix, ...f.branch.map((entry, i) => i === 0 ? { ...entry, parentId: prefix.at(-1)!.id } : entry)]);
+  return f;
 }
 
 function installInstance(shared: SharedSession): Fixture {
@@ -560,6 +574,9 @@ function installInstance(shared: SharedSession): Fixture {
         willRetry: false,
         signal: options.signal ?? new AbortController().signal,
       };
+    },
+    command(name, args = "") {
+      return commands.get(name)!.handler(args, ctx);
     },
     async cleanup() {
       if (shared.cleaned) return;

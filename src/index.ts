@@ -3,6 +3,8 @@ import {
   estimateTokens as estimateMessageTokens,
   getLatestCompactionEntry,
   type ContextEvent,
+  type BoundaryState,
+  type BoundaryResult,
   type ExtensionAPI,
   type ExtensionContext,
   type SessionBeforeCompactEvent,
@@ -38,6 +40,7 @@ import {
   toPreparedResult,
   type PersistedShadowCheckpoint,
 } from "./persist.js";
+import { sanitizeForContext } from "./normalize.js";
 import { fileDetails } from "./prepare.js";
 import { SessionHistoryIndex } from "./session-reader.js";
 import { ShadowCompactStateController, type PreparedResult } from "./state.js";
@@ -52,15 +55,17 @@ import { estimateTokens } from "./turns.js";
 import { contextSwapDropCount, hasOrphanedToolResult } from "./swap.js";
 import {
   buildWorkingContext,
+  coverageIsUnchanged,
+  triggerOverlapStart,
   isCoveredPrefix,
   isWorkingContextSkipped,
   planSwap,
 } from "./working-context.js";
 import { randomUUID } from "node:crypto";
 
-const READY_MESSAGE = "shadow-compact: summary ready - swaps in at the next turn";
+const READY_MESSAGE = "shadow-compact: checkpoint ready; next safe request will use it";
 const DEFERRED_MESSAGE =
-  "shadow-compact: summary still preparing - swap deferred until the agent is idle";
+  "shadow-compact: checkpoint still preparing in background";
 const MANUAL_PREPARE_MESSAGE = "shadow-compact: preparing a fresh checkpoint for /compact";
 
 /**
@@ -137,15 +142,16 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       ctx.sessionManager.getSessionId() === result.sessionId &&
       branch.some((entry) => entry.id === result.leafId) &&
       latestCompactionId(branch) === result.latestCompactionId &&
-      effectiveCoverage(branch, result) !== undefined
+      branch.some((entry) => entry.id === result.firstKeptEntryId) &&
+      effectiveCoverage(branch, result) !== undefined &&
+      (!result.coverage || coverageIsUnchanged(branch, result.coverage))
     );
   };
 
   // Shared durability path: a published, still-current checkpoint is appended
   // as extension state (a CustomEntry, invisible to the model) once the agent
-  // is idle. Raw history stays on the branch; the serving checkpoint keeps
-  // swapping while and after it lands. There is no callback that must survive
-  // a session replacement, and no native compaction on the soft path.
+  // is idle when no boundary installation has landed. Raw history remains
+  // evidence; this CustomEntry does not change canonical context.
   const persistReadyCheckpoint = (ctx: ExtensionContext): void => {
     if (!ctx.isIdle()) return;
     const result = state.published;
@@ -203,7 +209,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         generation: state.generation,
         action: "failed",
         checkpointId: result.checkpointId,
-        error: error instanceof Error ? error.message : String(error),
+        error: sanitizeForContext(error instanceof Error ? error.message : String(error), "").slice(0, 1400),
       });
       return;
     }
@@ -295,7 +301,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
   };
 
   const reportError = (ctx: ExtensionContext, error: unknown) => {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = sanitizeForContext(error instanceof Error ? error.message : String(error), "").replace(/[\x00-\x1f\x7f]/g, " ").slice(0, 1400);
     if (reportedError === message) return;
     reportedError = message;
     ctx.ui.notify(`shadow-compact: ${message}`, "error");
@@ -326,6 +332,8 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     branch: SessionEntry[],
     controller: AbortController,
     generation: number,
+    retainedAnchor?: string,
+    customInstructions?: string,
   ): Promise<void> => {
     const startedWallMs = Date.now();
     // Releases a preparation whose session died underneath it (replacement or
@@ -359,7 +367,8 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     try {
       const contextUsage = ctx.getContextUsage();
       const tokensAtStart = contextUsage?.tokens ?? undefined;
-      const leafIdAtStart = ctx.sessionManager.getLeafId() ?? branch[branch.length - 1]?.id ?? "";
+      const leafIdAtStart = branch[branch.length - 1]?.id ?? "";
+      const sessionIdAtStart = ctx.sessionManager.getSessionId();
       // Degenerate branches carry nothing to summarize. Suppress without
       // queuing a native fallback instead of churning every turn; the
       // recorded size re-arms once the working set grows meaningfully.
@@ -414,6 +423,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       });
       const outcome = await runCheckpointBuilderAgent(ctx, index, config, {
         signal: controller.signal,
+        ...(customInstructions ? { customInstructions } : {}),
         model,
         ...(maxTokens !== undefined ? { maxTokens } : {}),
         ...(config.thinkingLevel ? { thinkingLevel: config.thinkingLevel } : {}),
@@ -441,6 +451,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       });
       const verified = await runCheckpointVerifierAgent(ctx, verifierIndex, outcome.checkpoint, draftCoverage, config, {
         signal: controller.signal,
+        ...(customInstructions ? { customInstructions } : {}),
         model: verifierModel,
         ...(maxTokens !== undefined ? { maxTokens } : {}),
         ...(verifierThinking ? { thinkingLevel: verifierThinking } : {}),
@@ -461,10 +472,10 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       const estimate = planSwap(branch, coverage.coverageEndEntryId, config.recentTurns);
       const result: PreparedResult = {
         checkpointId: randomUUID(),
-        sessionId: ctx.sessionManager.getSessionId(),
+        sessionId: sessionIdAtStart,
         leafId: publishedLeaf,
         latestCompactionId: latestCompactionId(branch),
-        firstKeptEntryId: estimate?.swapStartEntryId ?? branch[0]!.id,
+        firstKeptEntryId: retainedAnchor ?? estimate?.swapStartEntryId ?? branch[0]!.id,
         summary: verified.summary,
         usage,
         details: fileDetails(branch),
@@ -508,7 +519,9 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         ctx.sessionManager.getSessionId() === result.sessionId &&
         current.some((entry) => entry.id === result.leafId) &&
         current.some((entry) => entry.id === coverage.coverageEndEntryId) &&
-        latestCompactionId(current) === result.latestCompactionId;
+        latestCompactionId(current) === result.latestCompactionId &&
+        coverageIsUnchanged(current, coverage) &&
+        current.some((entry) => entry.id === result.firstKeptEntryId);
       // Ownership-checked: a superseded completion no-ops instead of aborting a newer prepare.
       const replaced = Boolean(state.published);
       if (!valid || !state.publish(generation, result)) {
@@ -531,6 +544,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       // The summary itself may throw the stale error (or anything after it
       // may run on a dead session): never notify/settle on a dead ctx.
       if (bailIfStale()) return;
+      if (state.preparing?.generation !== generation) return;
       if (!controller.signal.aborted) reportError(ctx, error);
       else {
         traceEvent("prepare_failed", {
@@ -539,7 +553,9 @@ export default function shadowCompact(pi: ExtensionAPI): void {
           reason: "aborted",
         });
       }
-      state.fail(generation);
+      if (state.fail(generation)) {
+        traceEvent("prepare_failed", { generation, reason: controller.signal.aborted ? "aborted" : "model-error", error: sanitizeForContext(error instanceof Error ? error.message : String(error), "").slice(0, 1400) });
+      }
       settle(ctx, false, config.nativeFallbackThresholdPercent);
     }
   };
@@ -554,11 +570,14 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     config: ShadowCompactConfig,
     branch: SessionEntry[],
     reason: string,
+    customInstructions?: string,
+    triggerEntryId?: string,
   ): boolean => {
-    if (!isRollingEnabled() && state.published) return false;
+    const manual = reason === "command";
+    if (!manual && !isRollingEnabled() && state.published) return false;
     if (state.preparing || state.pendingNativeFallback) return false;
     const usage = ctx.getContextUsage();
-    if (!state.refreshArmed) {
+    if (!manual && !state.refreshArmed) {
       // Still above the trigger after a refresh cycle without an observed
       // swap + shrink: the checkpoint/tail policy is not achieving the
       // target. Log, don't spin.
@@ -574,6 +593,8 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       });
       return false;
     }
+    branch = branch.slice();
+    const retainedAnchor = triggerOverlapStart(branch);
     const prepared = state.startPreparing();
     if (!prepared) return false;
     traceEvent("threshold_crossed", {
@@ -595,12 +616,35 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       prepareThreshold: config.prepareThresholdPercent,
       prepareThresholdTokens: config.softCompactThresholdTokens ?? null,
       branchEntries: branch.length,
-      leafId: ctx.sessionManager.getLeafId() ?? null,
+      leafId: branch.at(-1)?.id ?? null,
+      overlapStart: retainedAnchor ?? null,
+      triggerEntryId: triggerEntryId ?? branch.at(-1)?.id ?? null,
     });
+    if (manual) ctx.ui.notify("shadow-compact: checkpoint preparing in background", "info");
     // Fire and forget: the live agent run continues immediately.
-    void prepare(ctx, config, branch, prepared.controller, prepared.generation);
+    void prepare(ctx, config, branch, prepared.controller, prepared.generation, retainedAnchor, customInstructions);
     return true;
   };
+
+  pi.registerCommand("shadow-compact", {
+    description: "Prepare a verified checkpoint in background without interrupting acting work",
+    handler: async (args, ctx) => {
+      if (isObserveMode()) {
+        ctx.ui.notify("shadow-compact: disabled in observe mode", "info");
+        return;
+      }
+      const branch = ctx.sessionManager.getBranch().slice();
+      const config = await configFor(ctx).catch((error: unknown) => { reportError(ctx, error); return undefined; });
+      if (!config || isContextStale(ctx)) return;
+      if (state.preparing) {
+        ctx.ui.notify("shadow-compact: already preparing; existing attempt and instructions unchanged. Run /shadow-compact again after completion to refresh.", "info");
+        return;
+      }
+      if (!requestCheckpoint(ctx, config, branch, "command", args.trim())) {
+        ctx.ui.notify("shadow-compact: native recovery pending; checkpoint not started", "info");
+      }
+    },
+  });
 
   /**
    * Marks a ready checkpoint as the mandatory working context. Swaps apply
@@ -629,7 +673,8 @@ export default function shadowCompact(pi: ExtensionAPI): void {
 
   // Mid-run swap: a published, current summary replaces the stale prefix in the
   // next request. This touches only the request's message list, so the agent run
-  // never aborts. Durability lands separately as a CustomEntry at idle; the
+  // never aborts. A safe boundary can install canonical context; idle completion
+  // persists a CustomEntry instead. The
   // serving checkpoint keeps swapping before and after it lands, and while its
   // replacement prepares; publishing the replacement swaps future requests to it.
   const swapSummaryIntoContext = async (
@@ -655,7 +700,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       minimumRecentTurns: config?.recentTurns ?? DEFAULT_RECENT_TURNS,
       ...(result.contextTokensBefore !== undefined ? { contextTokensBefore: result.contextTokensBefore } : {}),
       // v1 checkpoints carry an entry-granular cut, not a coverage promise.
-      ...(result.coverage ? {} : { coverageTailOverride: result.firstKeptEntryId }),
+      ...(result.coverage ? { retainedAnchor: result.firstKeptEntryId } : { coverageTailOverride: result.firstKeptEntryId }),
     });
     if (isWorkingContextSkipped(built)) {
       traceEvent("swap_applied", {
@@ -711,7 +756,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       branch,
       messages,
       minimumRecentTurns: recentTurns,
-      ...(result.coverage ? {} : { coverageTailOverride: result.firstKeptEntryId }),
+      ...(result.coverage ? { retainedAnchor: result.firstKeptEntryId } : { coverageTailOverride: result.firstKeptEntryId }),
     });
     return isWorkingContextSkipped(built) ? messages : built.messages;
   };
@@ -773,6 +818,72 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     };
   };
 
+  // Boundary drafts do not emit session_compact in Pi 1.0.4. Only observed
+  // committed ancestry releases serving state; proposing a draft is not success.
+  const observeInstalledCheckpoint = (ctx: ExtensionContext): void => {
+    const result = state.published;
+    if (!result) return;
+    const latest = getLatestCompactionEntry(ctx.sessionManager.getBranch());
+    const details = latest?.details as { shadowCheckpoint?: { checkpointId?: string } } | undefined;
+    if (latest && details?.shadowCheckpoint?.checkpointId === result.checkpointId) {
+      traceEvent("checkpoint_installed", { checkpointId: result.checkpointId, compactionId: latest.id, firstKeptEntryId: latest.firstKeptEntryId });
+      state.reset();
+      nativeFallbackInFlight = false;
+      forceNativeOnce = false;
+      ctx.ui.notify("shadow-compact: checkpoint installed", "info");
+    }
+  };
+
+  const installAtBoundary = (
+    event: BoundaryState,
+    ctx: ExtensionContext,
+    recentTurns: number,
+  ): BoundaryResult | undefined => {
+    observeInstalledCheckpoint(ctx);
+    if (!event.context || event.outcome !== "completed") return;
+    const result = state.published;
+    if (!result || !resultIsCurrent(ctx, result)) return;
+    // Replay earlier handlers' drafts on a private branch. Never mutate Pi's
+    // manager, and never ignore an earlier handler's compaction/context edits.
+    const branch = ctx.sessionManager.getBranch().slice();
+    for (const draft of event.entries ?? []) {
+      branch.push({
+        ...draft,
+        id: randomUUID(),
+        parentId: branch.at(-1)?.id ?? null,
+        timestamp: new Date().toISOString(),
+        ...(draft.type === "compaction" ? { tokensBefore: 0 } : {}),
+      } as SessionEntry);
+    }
+    if (latestCompactionId(branch) !== result.latestCompactionId) return;
+    const coverage = effectiveCoverage(branch, result);
+    if (!coverage || (result.coverage && !coverageIsUnchanged(branch, result.coverage))) return;
+    const beforeMessages = event.context.contextMessages;
+    const before = beforeMessages.filter((message) => message.role !== "system");
+    const built = buildWorkingContext({
+      checkpoint: { summary: result.summary, coverage }, branch, messages: before,
+      minimumRecentTurns: recentTurns,
+      ...(result.coverage ? { retainedAnchor: result.firstKeptEntryId } : { coverageTailOverride: result.firstKeptEntryId }),
+    });
+    if (isWorkingContextSkipped(built)) return;
+    const firstKeptEntryId = built.plan.swapStartEntryId;
+    const candidate = buildSessionProjection([...branch, {
+      type: "compaction", id: randomUUID(), parentId: branch.at(-1)?.id ?? null,
+      timestamp: new Date().toISOString(), summary: result.summary,
+      firstKeptEntryId, tokensBefore: 0,
+    }]).messages.filter((message) => message.role !== "system");
+    const tokenCount = (messages: ContextEvent["messages"]) => messages.reduce((total, message) => total + estimateMessageTokens(message), 0);
+    // Compare canonical context, not the request-local context already served.
+    if (hasOrphanedToolResult(candidate) || tokenCount(candidate) >= tokenCount(before)) return;
+    // Pi's projector must produce precisely the proved summary + suffix.
+    if (JSON.stringify(candidate.slice(1)) !== JSON.stringify(built.messages.slice(1))) return;
+    traceEvent("checkpoint_install_proposed", { checkpointId: result.checkpointId, firstKeptEntryId, overlapStart: result.firstKeptEntryId, coverageEnd: coverage.coverageEndEntryId });
+    return { entries: [{
+      type: "compaction", summary: result.summary, firstKeptEntryId, usage: result.usage,
+      details: { ...result.details, shadowCheckpoint: { checkpointId: result.checkpointId, coverage, retainedAnchor: result.firstKeptEntryId } },
+    }] };
+  };
+
   pi.on("session_start", (_event, ctx) => {
     state.reset();
     configPromise = undefined;
@@ -785,8 +896,10 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     restorePersistedCheckpoint(ctx);
   });
 
-  pi.on("turn_end", async (_event, ctx) => {
+  pi.on("turn_end", async (event, ctx) => {
+    if (!isObserveMode()) observeInstalledCheckpoint(ctx);
     turnCount += 1;
+    const triggerBranch = ctx.sessionManager.getBranch().slice();
     const usage = ctx.getContextUsage();
     const percent = usage?.percent;
     // swapCount / firstSwapTurn / postSwapModelTurns make the useful served
@@ -811,22 +924,20 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     // Observe-only instrumented control: the turn_usage series above is the
     // whole point; summaries, swaps, and compactions stay disabled.
     if (isObserveMode()) return;
-    // Without any size signal there is nothing to compare against the
-    // triggers (percent or absolute tokens).
-    if ((percent === null || percent === undefined) && typeof usage?.tokens !== "number") return;
-
     const config = await configFor(ctx).catch((error: unknown) => {
       configErrorReported = true;
       reportError(ctx, error);
       return undefined;
     });
+    const installation = installAtBoundary(event, ctx, config?.recentTurns ?? DEFAULT_RECENT_TURNS);
+    if (installation) return installation;
+    if ((percent === null || percent === undefined) && typeof usage?.tokens !== "number") return;
     const nativeThreshold =
       config?.nativeFallbackThresholdPercent ?? DEFAULT_NATIVE_FALLBACK_THRESHOLD_PERCENT;
     const swapThreshold = config?.swapThresholdPercent ?? DEFAULT_SWAP_THRESHOLD_PERCENT;
 
-    // ctx.compact() is a manual compaction and aborts an active agent run, so
-    // this event only prepares. The context event swaps mid-run; agent_settled
-    // and the ready completion persist the CustomEntry checkpoint while idle.
+    // Never invoke manual compaction here. A ready checkpoint can install
+    // through the boundary draft above; otherwise this event only prepares.
     // Single-shot mode keeps one checkpoint per run: while anything is
     // published, no refresh starts (rolling replaces it instead).
     if (!isRollingEnabled() && state.published) return;
@@ -919,7 +1030,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       return;
     }
 
-    requestCheckpoint(ctx, config, ctx.sessionManager.getBranch(), "threshold");
+    requestCheckpoint(ctx, config, triggerBranch, "threshold", undefined, event.messageEntryId);
   });
 
   // Idle compaction: once the agent settles with enough context to matter,
@@ -946,8 +1057,19 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     requestCheckpoint(ctx, config, ctx.sessionManager.getBranch(), "idle");
   };
 
+  pi.on("agent_before_settle", async (event, ctx) => {
+    if (isObserveMode()) return;
+    const config = await configFor(ctx).catch(() => undefined);
+    return installAtBoundary(event, ctx, config?.recentTurns ?? DEFAULT_RECENT_TURNS);
+  });
+
+  pi.on("turn_start", (_event, ctx) => {
+    if (!isObserveMode()) observeInstalledCheckpoint(ctx);
+  });
+
   pi.on("agent_settled", async (_event, ctx) => {
     if (isObserveMode()) return;
+    observeInstalledCheckpoint(ctx);
     // A broken config must not block the idle path: fall back to the default
     // emergency threshold for the staleness recheck (turn_end already reports it).
     const config = await configFor(ctx).catch(() => undefined);
@@ -957,6 +1079,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
 
   pi.on("context", async (event, ctx) => {
     if (isObserveMode()) return undefined;
+    observeInstalledCheckpoint(ctx);
     const config = await configFor(ctx).catch(() => undefined);
     return swapSummaryIntoContext(ctx, event, config);
   });
@@ -1022,7 +1145,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       };
       event.signal.addEventListener("abort", onAbort, { once: true });
       try {
-        await prepare(ctx, config, branch, prepared.controller, prepared.generation);
+        await prepare(ctx, config, branch.slice(), prepared.controller, prepared.generation, undefined, event.customInstructions);
       } finally {
         event.signal.removeEventListener("abort", onAbort);
       }

@@ -13,6 +13,7 @@ export interface PreparedResult {
   sessionId: string;
   leafId: string;
   latestCompactionId: string | null;
+  /** Frozen trigger overlap for fresh checkpoints; legacy serving cut on older entries. */
   firstKeptEntryId: string;
   summary: string;
   usage: Usage;
@@ -50,9 +51,9 @@ export type PendingFallbackReason = "failure" | "emergency";
  * The checkpoint currently being served (`published`) is separate from the
  * checkpoint currently being built (`preparing`): a published summary keeps
  * swapping into requests while its replacement prepares, then the replacement
- * takes over. Durability is a persisted CustomEntry projection, not a native
- * compaction, so there is no commit phase: `published` keeps serving across
- * idle settles, and `persistedCheckpointId` records which checkpoint already
+ * takes over. Boundary installation is confirmed by committed ancestry, not
+ * by proposal. Idle completion persists a CustomEntry. `published` keeps
+ * serving across idle settles, and `persistedCheckpointId` records which checkpoint already
  * landed in the session file.
  *
  * `refreshArmed` gates new preparations so a refresh cannot spin while the

@@ -6,7 +6,7 @@ import { describe, it } from "node:test";
 import { isRollingEnabled } from "../src/config.js";
 import { TRACE_FILE_ENV_VAR } from "../src/trace.js";
 import {
-  fixture,
+  fixtureWithHistory as fixture,
   waitFor,
   tick,
 } from "./helpers/index-fixture.js";
@@ -109,7 +109,7 @@ describe("rolling two-refresh smoke (fix §9)", () => {
         const swapA = (await f.emit("context", { messages: f.contextMessages() })) as {
           messages: Array<Record<string, unknown>>;
         };
-        assert.equal(swapA?.messages.length, 2);
+        assert.equal(swapA?.messages.length, 10);
         assert.equal(swapA.messages[0]?.role, "compactionSummary");
         assert.equal(f.compactCalls.length, 0);
 
@@ -227,7 +227,7 @@ describe("rolling two-refresh smoke (fix §9)", () => {
       await waitFor(() => f.registry.settled === CALLS_PER_PREPARE + 1);
       await tick();
       f.registry.mode = "ok";
-      assert.match(f.notifications.at(-1) ?? "", /Summary model stopped with error/);
+      assert.match(f.notifications.at(-1) ?? "", /Summary model .*stopped with error/);
       const stillServing = await f.emit("context", { messages: f.contextMessages() });
       assert.ok(stillServing, "A continues serving after B fails");
       assert.equal(f.compactCalls.length, 0);

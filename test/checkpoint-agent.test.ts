@@ -116,6 +116,23 @@ function toolNames(context: Context): string[] {
 }
 
 describe("runCheckpointBuilderAgent", () => {
+  it("reports bounded sanitized provider failures with the model and builder stage", async () => {
+    const secret = "unrecognized-" + "q".repeat(40);
+    const failure = JSON.stringify({ api_key: secret, error: "gateway quota exceeded" }) + "x".repeat(2000);
+    const fake = scripted(() => ({ ...textResponse(""), stopReason: "error", errorMessage: failure }));
+    await assert.rejects(
+      runCheckpointBuilderAgent(ctx, new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" }), config, { completion: fake.completion, model }),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /Summary model \(test\/agent\) stopped with error/);
+        assert.match(error.message, /gateway quota exceeded/);
+        assert.ok(!error.message.includes(secret));
+        assert.ok(error.message.length < 1100);
+        return true;
+      },
+    );
+  });
+
   it("uses provider-neutral streaming for nested model calls", async () => {
     const index = new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" });
     const fake = scripted((context) => toolNames(context).includes("read_turn_range")

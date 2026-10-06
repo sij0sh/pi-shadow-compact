@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { fixture, waitFor, tick } from "./helpers/index-fixture.js";
+import { fixtureWithHistory as fixture, waitFor, tick } from "./helpers/index-fixture.js";
 
 /**
  * A background summary routinely outlives its session (replacement or reload

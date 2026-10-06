@@ -25,6 +25,7 @@ import { SessionHistoryIndex } from "../src/session-reader.js";
 import { TRACE_FILE_ENV_VAR } from "../src/trace.js";
 import {
   fixture,
+  fixtureWithHistory,
   userEntry,
   waitFor,
   tick,
@@ -530,7 +531,7 @@ describe("soft durability without compaction", () => {
         assert.ok(typeof data.checkpointId === "string" && data.checkpointId.length > 0);
         assert.equal(data.sessionId, "session-1");
         assert.match(data.summary, /Prepared continuation checkpoint/);
-        assert.equal(data.firstKeptEntryId, "e4");
+        assert.equal(data.firstKeptEntryId, "e1");
         assert.equal(data.leafId, "e4");
         assert.equal(data.latestCompactionId, null);
         assert.equal(data.contextTokensBefore, 600);
@@ -594,7 +595,7 @@ describe("soft durability without compaction", () => {
 describe("persistent two-turn lifecycle with reload", () => {
   it("turn 1 persists A, turn 2 replaces it with B, reload restores B serving", async () => {
     const { result, events } = await withTraceFile(async () => {
-      const f = await fixture(SWAP_CONFIG);
+      const f = await fixtureWithHistory(SWAP_CONFIG);
       try {
         // USER TURN 1: cross 60% -> prepare A -> publish -> swap -> settle -> persist A.
         await f.emit("turn_end");

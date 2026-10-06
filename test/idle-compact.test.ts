@@ -5,13 +5,13 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { TRACE_FILE_ENV_VAR } from "../src/trace.js";
 import {
-  fixture,
+  fixtureWithHistory as fixture,
   userEntry,
   waitFor,
   type Fixture,
 } from "./helpers/index-fixture.js";
 
-const READY_MESSAGE = "shadow-compact: summary ready - swaps in at the next turn";
+const READY_MESSAGE = "shadow-compact: checkpoint ready; next safe request will use it";
 
 const IDLE_CONFIG = {
   prepareThresholdPercent: 60,

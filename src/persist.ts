@@ -2,18 +2,15 @@ import type { Usage } from "@earendil-works/pi-ai";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { CHECKPOINT_SCHEMA_VERSION, type CheckpointCoverage, type PromptVersions } from "./checkpoint.js";
 import type { PreparedResult } from "./state.js";
+import { coverageIsUnchanged } from "./working-context.js";
 import type { Checkpoint } from "./summary.js";
 
 /**
  * Durable Shadow checkpoints as extension state.
  *
- * The normal soft path never rewrites canonical history: a published
- * checkpoint is appended as a CustomEntry (invisible to the model) once the
- * agent is idle, while the raw transcript stays untouched on the branch.
- * The checkpoint is therefore a persisted projection of the evidence, and a
- * future rolling checkpoint can rebuild from the raw history instead of
- * recursively inheriting the previous summary. Native Pi compaction remains
- * the emergency path (hard threshold / unsafe summarization) only.
+ * Ready checkpoints install through Pi boundary drafts when safe. Completion
+ * while idle persists a CustomEntry instead; it is invisible to the model.
+ * Both paths preserve raw history as evidence for future checkpoints.
  */
 export const CHECKPOINT_CUSTOM_TYPE = "shadow-compact.checkpoint";
 /** Pre-v2 namespace: still read for restore, never written. */
@@ -37,6 +34,7 @@ export interface PersistedShadowCheckpointV1 {
   checkpointId: string;
   sessionId: string;
   summary: string;
+  /** Entry-granular legacy serving cut. */
   firstKeptEntryId: string;
   leafId: string;
   latestCompactionId: string | null;
@@ -60,6 +58,7 @@ export interface PersistedShadowCheckpointV3 {
   checkpointId: string;
   sessionId: string;
   summary: string;
+  /** Frozen trigger overlap for fresh checkpoints; legacy serving cut on older entries. */
   firstKeptEntryId: string;
   leafId: string;
   latestCompactionId: string | null;
@@ -87,6 +86,7 @@ export interface PersistedShadowCheckpointV2Legacy {
   checkpointId: string;
   sessionId: string;
   summary: string;
+  /** Legacy estimated serving cut, retained conservatively on restore. */
   firstKeptEntryId: string;
   leafId: string;
   latestCompactionId: string | null;
@@ -307,6 +307,7 @@ export type CheckpointStalenessReason =
   | "missing-first-kept"
   | "missing-leaf"
   | "missing-coverage-end"
+  | "changed-coverage"
   | "compaction-mismatch";
 
 /**
@@ -329,6 +330,7 @@ export function checkpointStalenessReason(
   ) {
     return "missing-coverage-end";
   }
+  if (hasCoverage(checkpoint) && !coverageIsUnchanged(branch, checkpoint.coverage)) return "changed-coverage";
   if (latestCompactionId(branch) !== checkpoint.latestCompactionId) return "compaction-mismatch";
   return undefined;
 }
