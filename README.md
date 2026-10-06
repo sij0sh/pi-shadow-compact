@@ -285,7 +285,7 @@ Both agents must inspect all required history and cover everything Pi will disca
 
 Recovery uses the configured Shadow builder and verifier models.
 Its per-response allowance cannot exceed the failed native request, `summaryMaxTokens`, or either model's advertised output limit.
-Its rendered prose target uses half that token allowance with Shadow's existing four-characters-per-token estimate.
+Its rendered prose target is at most 16,000 characters and uses half that token allowance with Shadow's existing four-characters-per-token estimate.
 The character target is a concision rule, not an exact token count.
 Recovery uses `low` summary-only reasoning without changing the acting session's thinking level.
 Oversized submissions receive the existing bounded validation corrections rather than being sliced.
@@ -297,8 +297,36 @@ Pi's existing overflow omissions remain intact if they were already appended bef
 Wrapped native summaries are recorded as extension-supplied compactions (`fromHook: true`), even when no recovery was needed.
 File lists and successful recovery usage include the preceding native work.
 Observe-only mode, `/compact-native`, invalid Shadow configuration, and virtual acting models retain Pi's unwrapped behavior.
+An exception anywhere in the owned compaction hook cancels explicitly, even if error notification fails.
+Intentional unwrapped routes retain Pi's existing behavior.
 No installed Pi package or live settings file is patched.
 Recovery has offline real-Pi regression coverage but has not been tested against every remote gateway.
+
+### Compaction diagnostics
+
+Set `SHADOW_COMPACT_TRACE` to a local JSONL file path to enable diagnostics.
+Set `SHADOW_COMPACT_TRACE_STDERR=1` to emit the same records to stderr.
+Neither switch writes diagnostics into model context or session history.
+
+`compaction_route` records the loaded routing capability, attempt ID, session ID, trigger, and route.
+Routes distinguish checkpoint serving, preparation, wrapped native, pure-native escape, invalid configuration, observe mode, virtual model, missing model, and empty native preparation.
+`compaction_outcome` distinguishes a ready result from installation, cancellation, failure, and failed notification.
+`/compact-native` warns that token-cap recovery is disabled.
+Unavailable configuration warns before passing compaction to pure Pi.
+
+`summary_call` records each wrapped native history/prefix, builder, and verifier response.
+It reports requested output allowance, observed payload allowance, requested/payload/provider reasoning labels, HTTP status, allow-listed provider termination labels, token usage, and visible text size.
+Recovery lifecycle records include the same attempt ID and a fixed failure stage.
+Unknown provider labels become `other`.
+Missing adapter observations remain `null`.
+Payload reasoning may use provider-specific names and is not inferred when unavailable.
+Reasoning tokens are already included in output tokens and must not be added again.
+
+Instrumentation preserves supplied callbacks and is absent when both sinks are disabled.
+These new records never include draft text, tool submissions, payloads, headers, URLs, credentials, or raw provider errors.
+Existing lifecycle events retain their bounded, sanitized error reporting.
+An observed request allowance does not establish a gateway's hidden effective limit.
+Pure-Pi requests are route-observable but are not instrumented by Shadow.
 
 ## Persistence and resume
 
@@ -477,13 +505,24 @@ Either way, `/compact-native` runs one purely native compaction.
 
 ### `summaryMaxTokens`
 
-Optionally caps the generated checkpoint size. When omitted, Shadow does not impose its own output cap and lets the model/provider use its registered output limit.
+Optionally caps each builder/verifier generation response.
+When omitted, Shadow does not impose its own generation cap and lets the model/provider use its registered output limit.
+
+Rendered checkpoints have a separate 16,000-character maximum, including headings.
+The target is reduced to half the smaller builder/verifier output allowance using the four-characters-per-token estimate.
+Both agents must rewrite oversized submissions within their existing bounded correction limits.
+They consolidate historical decisions and completed work while retaining current constraints, unresolved issues, identifiers, and verification state.
+They never truncate prose or publish an oversized checkpoint.
 
 Set this only when you intentionally want a smaller response. A low value can stop checkpoint generation before its strict JSON output is complete.
 
 ### Summarizer and verification reasoning
 
 Reasoning levels can be configured separately.
+Drafting, verification, and wrapped native summaries default to `low` without changing acting-session reasoning.
+Explicit `thinkingLevel` and `verificationThinkingLevel` settings override ordinary checkpoint defaults.
+Wrapped native summaries honor `thinkingLevel`; token-cap recovery still uses `low`.
+`/compact-native` retains Pi's native reasoning policy.
 
 For example:
 
