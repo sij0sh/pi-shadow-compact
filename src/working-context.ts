@@ -130,10 +130,11 @@ export function buildWorkingContext(
   );
   if (!plan) return { skipped: "stale-coverage" };
 
-  // §24D coverage assertion: no complete turn may sit between the coverage
-  // boundary and the tail start. planSwap constructs this via min(), but the
-  // invariant is load-bearing, so prove it structurally instead of trusting it.
-  if (!assertNoGap(branch, plan)) return { skipped: "stale-coverage" };
+  // Prove coverage entry-by-entry, including the uncovered end of a round
+  // whose call or input is already covered by the checkpoint.
+  if (!isCoveredPrefix(branch, plan.summaryCoverageEnd, plan.swapStartEntryId)) {
+    return { skipped: "stale-coverage" };
+  }
 
   // A swap at the branch head drops nothing: skip the projection lookup,
   // which cannot resolve a cut on a state-only leading entry.
@@ -192,11 +193,16 @@ function continuityTurns(branch: SessionEntry[]): Array<{ startEntryId: string; 
   return turns;
 }
 
-function assertNoGap(branch: SessionEntry[], plan: SwapPlan): boolean {
+/** Shared no-gap proof for request-local swaps and Pi compaction cuts. */
+export function isCoveredPrefix(
+  branch: SessionEntry[],
+  coverageEndEntryId: string,
+  firstKeptEntryId: string,
+): boolean {
   const entryIndex = new Map(branch.map((entry, index) => [entry.id, index]));
-  const coverageIdx = plan.summaryCoverageEnd === "" ? -1 : (entryIndex.get(plan.summaryCoverageEnd) ?? -2);
+  const coverageIdx = coverageEndEntryId === "" ? -1 : (entryIndex.get(coverageEndEntryId) ?? -2);
   if (coverageIdx < -1) return false;
-  const swapIdx = entryIndex.get(plan.swapStartEntryId) ?? -2;
+  const swapIdx = entryIndex.get(firstKeptEntryId) ?? -2;
   if (swapIdx < 0) return false;
   // Check entries, not just turn starts: a partly covered round can contain
   // uncovered tool outputs even when its assistant call is already covered.

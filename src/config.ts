@@ -128,7 +128,7 @@ export interface ShadowCompactConfig {
     enabled: boolean;
     minimumTokens: number;
   };
-  /** Minimum complete recent turns retained verbatim past any checkpoint. */
+  /** Minimum recent assistant/tool rounds retained by request-local checkpoints. */
   recentTurns: number;
   manualCompactMode: ManualCompactMode;
 }

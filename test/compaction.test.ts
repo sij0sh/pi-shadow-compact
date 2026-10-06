@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { buildSessionProjection, type ContextEvent, type SessionEntry } from "@earendil-works/pi-coding-agent";
-import { fixture, tick, userEntry, waitFor, type Fixture } from "./helpers/index-fixture.js";
+import { fixture, tick, USAGE, userEntry, waitFor, type Fixture } from "./helpers/index-fixture.js";
 
 const CONFIG = { recentTurns: 1, idleCompact: { enabled: false } };
 
@@ -89,6 +89,25 @@ describe("Pi compaction interoperability", () => {
     });
   }
 
+  it("honors recovery cuts on invisible omission entries without discarding uncovered input", async () => {
+    const f = await fixture({ ...CONFIG, recentTurns: 2 });
+    try {
+      await prepare(f);
+      f.setBranch([...f.branch, {
+        type: "message", id: "failed-attempt", parentId: "e4", timestamp: new Date().toISOString(),
+        message: { role: "assistant", content: [], api: "test", provider: "test", model: "test", usage: { ...USAGE, totalTokens: 0 }, stopReason: "error", timestamp: 0 },
+      }, {
+        type: "context_edit", id: "omit-attempt", parentId: "failed-attempt", timestamp: new Date().toISOString(),
+        targetId: "failed-attempt", replacement: null,
+      }]);
+      const outcome = await f.emit("session_before_compact", f.compactEvent({ reason: "overflow", firstKeptEntryId: "omit-attempt" }));
+      assert.equal(outcome?.compaction?.firstKeptEntryId, "omit-attempt");
+      assert.deepEqual(appendResult(f, outcome.compaction).map((message) => message.role), ["compactionSummary"]);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
   it("refreshes stale coverage for manual compaction and serves Pi's smaller tail", async () => {
     const f = await fixture(CONFIG);
     try {
@@ -120,6 +139,28 @@ describe("Pi compaction interoperability", () => {
     }
   });
 
+  it("rearms checkpoint preparation after an emergency native compaction fails with nothing serving", async () => {
+    const f = await fixture(CONFIG);
+    try {
+      f.gate();
+      await f.emit("turn_end");
+      assert.equal(f.registry.calls, 1);
+      f.setPercent(92);
+      await f.emit("turn_end");
+      await f.emit("agent_settled");
+      await f.emit("session_before_compact", f.compactEvent({ reason: "manual" }));
+      await f.emit("session_compact_failed", { type: "session_compact_failed", fromExtension: false });
+      f.release();
+      await tick();
+      f.setPercent(60);
+      await f.emit("turn_end");
+      assert.ok(f.registry.calls > 1, "an aborted preparation must not leave the refresh gate latched after native failure");
+      await waitFor(() => f.notifications.some((message) => message.includes("summary ready")));
+    } finally {
+      await f.cleanup();
+    }
+  });
+
   it("keeps a valid serving checkpoint when compaction fails", async () => {
     const f = await fixture(CONFIG);
     try {
@@ -135,7 +176,7 @@ describe("Pi compaction interoperability", () => {
   });
 
   it("releases the native escape when compaction fails before its hook", async () => {
-    const f = await fixture(CONFIG);
+    const f = await fixture({ ...CONFIG, recentTurns: 2 });
     try {
       await prepare(f);
       await f.commands.get("compact-native")!.handler("", { compact: () => {} });

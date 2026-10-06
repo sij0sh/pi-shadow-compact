@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import {
   compactionEntry,
   fixture,
+  tick,
   userEntry,
   waitFor,
   type Fixture,
@@ -193,6 +194,23 @@ describe("idle swap, emergency hatch, and terminal empty-snapshot failure", () =
       await f.emit("turn_end");
       await f.emit("agent_settled");
       assert.deepEqual(f.compactCalls, [{}]);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it("suppresses no-drop preparation with a leading Pi prompt or model entry", async () => {
+    const f = await fixture();
+    try {
+      f.setBranch([{
+        type: "model_change", id: "model", parentId: null,
+        timestamp: "2026-01-01T00:00:00.000Z", provider: "test", modelId: "test",
+      }, userEntry("e1", "model", "a single user prompt")]);
+      await f.emit("turn_end");
+      await tick();
+      await f.emit("agent_settled");
+      assert.equal(f.registry.calls, 0, "invisible preamble entries are not a disposable conversation prefix");
+      assert.deepEqual(f.compactCalls, []);
     } finally {
       await f.cleanup();
     }

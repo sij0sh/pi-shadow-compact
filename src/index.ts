@@ -52,6 +52,7 @@ import { estimateTokens } from "./turns.js";
 import { contextSwapDropCount, hasOrphanedToolResult } from "./swap.js";
 import {
   buildWorkingContext,
+  isCoveredPrefix,
   isWorkingContextSkipped,
   planSwap,
 } from "./working-context.js";
@@ -370,7 +371,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         branch.length === 0 ||
         lastEntry?.type === "compaction" ||
         !hypothetical ||
-        hypothetical.swapStartEntryId === branch[0]!.id
+        (contextSwapDropCount(branch, hypothetical.swapStartEntryId) ?? 0) === 0
       ) {
         if (state.skipPreparation(generation, tokensAtStart)) {
           traceEvent("prepare_failed", {
@@ -726,16 +727,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     const branch = ctx.sessionManager.getBranch();
     const coverage = effectiveCoverage(branch, result);
     if (!coverage) return false;
-    const cut = branch.findIndex((entry) => entry.id === firstKeptEntryId);
-    const covered = branch.findIndex((entry) => entry.id === coverage.coverageEndEntryId);
-    if (cut < 0) return false;
-    const positions = new Map(branch.map((entry, index) => [entry.id, index]));
-    return buildSessionProjection(branch).entries.every((entry) => {
-      const index = positions.get(entry.sourceEntry.id) ?? -1;
-      return index <= covered || index >= cut || entry.messages.every(
-        (message) => message.role === "system" || message.role === "compactionSummary",
-      );
-    });
+    return isCoveredPrefix(branch, coverage.coverageEndEntryId, firstKeptEntryId);
   };
 
   const serveCompaction = (
@@ -747,15 +739,18 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     const firstKeptEntryId = event.preparation.firstKeptEntryId;
     if (!coversCompactionPrefix(ctx, result, firstKeptEntryId)) return undefined;
     const branch = ctx.sessionManager.getBranch();
-    const drop = contextSwapDropCount(branch, firstKeptEntryId);
-    if (drop === undefined || drop === 0) return undefined;
-    const messages = buildSessionProjection(branch).messages.filter((message) => message.role !== "system");
-    const candidate: ContextEvent["messages"] = [{
-      role: "compactionSummary",
+    // Preview with Pi's own projector. Recovery can put the cut on an
+    // invisible omission/state entry, so slicing at a visible message would
+    // reject a valid cut or accidentally retain the abandoned attempt.
+    const candidate = buildSessionProjection([...branch, {
+      type: "compaction",
+      id: randomUUID(),
+      parentId: branch[branch.length - 1]?.id ?? null,
+      timestamp: new Date().toISOString(),
       summary: result.summary,
+      firstKeptEntryId,
       tokensBefore: event.preparation.tokensBefore,
-      timestamp: Date.now(),
-    }, ...messages.slice(drop)];
+    }]).messages.filter((message) => message.role !== "system");
     if (hasOrphanedToolResult(candidate)) return undefined;
     const before = messagesBefore.reduce((total, message) => total + estimateMessageTokens(message), 0);
     const after = candidate.reduce((total, message) => total + estimateMessageTokens(message), 0);
@@ -1055,13 +1050,19 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     clearNativeCompactMarkers();
     state.reset();
   });
-  pi.on("session_compact_failed", clearNativeCompactMarkers);
+  pi.on("session_compact_failed", () => {
+    const hadNativeFallback = nativeFallbackInFlight;
+    clearNativeCompactMarkers();
+    // The emergency hatch aborted a prepare. With nothing left to serve,
+    // failure must release its disarmed refresh gate for a later attempt.
+    if (hadNativeFallback && !state.published) state.reset();
+  });
   pi.on("session_tree", () => {
-    nativeFallbackInFlight = false;
+    clearNativeCompactMarkers();
     state.reset();
   });
   pi.on("session_shutdown", () => {
-    nativeFallbackInFlight = false;
+    clearNativeCompactMarkers();
     state.reset();
   });
 }

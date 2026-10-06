@@ -202,35 +202,21 @@ describe("shadowCompact extension orchestration", () => {
     }
   });
 
-  it("serves threshold compaction from cache with the earliest cut on mismatch", async () => {
+  it("declines cached compactions that would not reduce the working context", async () => {
     const f = await fixture(SWAP_CONFIG);
     try {
       await startPreparation(f);
-      const exact = await f.emit("session_before_compact", f.compactEvent({ firstKeptEntryId: "e4" }));
-      assert.equal(exact.compaction.firstKeptEntryId, "e4");
-      const mismatch = await f.emit(
-        "session_before_compact",
-        f.compactEvent({ firstKeptEntryId: "e3" }),
-      );
-      assert.equal(mismatch.compaction.firstKeptEntryId, "e3");
-      const unknown = await f.emit(
-        "session_before_compact",
-        f.compactEvent({ firstKeptEntryId: "nope" }),
-      );
-      assert.equal(unknown.compaction.firstKeptEntryId, "e4");
-      assert.equal(unknown.compaction.tokensBefore, 777);
-      assert.ok(unknown.compaction.summary.includes("Prepared continuation checkpoint"));
-      assert.deepEqual(unknown.compaction.details, {
-        readFiles: ["src/read.ts"],
-        modifiedFiles: ["src/edited.ts"],
-      });
+      for (const firstKeptEntryId of ["e4", "e3", "nope"]) {
+        const outcome = await f.emit("session_before_compact", f.compactEvent({ firstKeptEntryId }));
+        assert.equal(outcome, undefined);
+      }
       assert.deepEqual(f.compactCalls, []);
     } finally {
       await f.cleanup();
     }
   });
 
-  it("serves manual compaction from a ready checkpoint without preparing again", async () => {
+  it("uses native manual compaction when the ready checkpoint cannot shrink further", async () => {
     const f = await fixture(SWAP_CONFIG);
     try {
       await startPreparation(f);
@@ -239,8 +225,7 @@ describe("shadowCompact extension orchestration", () => {
         "session_before_compact",
         f.compactEvent({ reason: "manual", customInstructions: "[shadow-compact:commit:dead]" }),
       );
-      assert.equal(outcome.compaction.firstKeptEntryId, "e4");
-      assert.ok(outcome.compaction.summary.includes("Prepared continuation checkpoint"));
+      assert.equal(outcome, undefined);
       assert.equal(f.registry.calls, callsBefore);
     } finally {
       await f.cleanup();
@@ -250,6 +235,8 @@ describe("shadowCompact extension orchestration", () => {
   it("prepares fresh for manual compaction when nothing is ready, then serves", async () => {
     const f = await fixture(SWAP_CONFIG);
     try {
+      // The checkpoint must be smaller than the context it replaces.
+      f.setBranch([userEntry("e1", null, "old conversation detail ".repeat(1000)), ...f.branch.slice(1)]);
       const outcome = await f.emit("session_before_compact", f.compactEvent({ reason: "manual" }));
       assert.ok(outcome.compaction.summary.includes("Prepared continuation checkpoint"));
       assert.equal(outcome.compaction.firstKeptEntryId, "e4");
@@ -299,7 +286,7 @@ describe("shadowCompact extension orchestration", () => {
   });
 
   it("compact-native runs one native compaction bypassing Shadow", async () => {
-    const f = await fixture(SWAP_CONFIG);
+    const f = await fixture({ ...SWAP_CONFIG, recentTurns: 2 });
     try {
       await startPreparation(f);
       const command = f.commands.get("compact-native");
@@ -320,6 +307,7 @@ describe("shadowCompact extension orchestration", () => {
   it("keeps a newer preparation alive when a superseded summary completes", async () => {
     const f = await fixture(SWAP_CONFIG);
     try {
+      f.setBranch([userEntry("e1", null, "old conversation detail ".repeat(1000)), ...f.branch.slice(1)]);
       f.gate();
       await f.emit("turn_end");
       assert.equal(f.registry.calls, 1);

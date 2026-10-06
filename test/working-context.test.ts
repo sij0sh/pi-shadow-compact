@@ -70,7 +70,7 @@ describe("planSwap", () => {
     assert.equal(plan!.swapStartEntryId, "e11");
   });
 
-  it("starts the tail at the next complete turn after mid-turn coverage", () => {
+  it("keeps the partly uncovered turn at mid-turn coverage", () => {
     const branch = [
       userEntry("u1", null, "first user task with enough words here"),
       assistantEntry("a1", "u1", "first assistant reply with enough words here"),
@@ -81,11 +81,11 @@ describe("planSwap", () => {
       userEntry("u4", "a3", "fourth user task with enough words here"),
       assistantEntry("a4", "u4", "fourth assistant reply with enough words"),
     ];
-    // Coverage ends mid-turn-2: the tail must start at turn-3, not mid-turn.
+    // Coverage ends at the user input: turn 2 still has an uncovered reply.
     const plan = planSwap(branch, "u2", 1);
-    assert.equal(plan!.coverageTailStart, "u3");
+    assert.equal(plan!.coverageTailStart, "u2");
     assert.equal(plan!.recentTailStart, "u4");
-    assert.equal(plan!.swapStartEntryId, "u3");
+    assert.equal(plan!.swapStartEntryId, "u2");
   });
 
   it("rejects unknown coverage anchors and treats empty coverage as nothing covered", () => {
