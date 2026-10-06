@@ -234,6 +234,14 @@ describe("runCheckpointBuilderAgent", () => {
     );
   });
 
+  it("rejects token-limited checkpoint output even when it contains a submit call", async () => {
+    const index = new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" });
+    const fake = scripted((context) => toolNames(context).includes("read_turn_range")
+      ? { ...toolResponse([{ id: "c2", name: "submit_checkpoint", args: { checkpoint: checkpointPayload(), coverageEndEntryId: "e2" } }]), stopReason: "length" }
+      : toolResponse([{ id: "c1", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]));
+    await assert.rejects(runCheckpointBuilderAgent(ctx, index, config, { completion: fake.completion, model }), /stopped with length/);
+  });
+
   it("throws when the model never calls tools", async () => {
     const index = new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" });
     const fake = scripted(() => textResponse("here is my summary prose"));
