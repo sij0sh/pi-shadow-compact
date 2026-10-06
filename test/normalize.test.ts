@@ -104,6 +104,15 @@ describe("sanitizeForContext secrets", () => {
     assert.ok(!text.includes("sk-ant"), text);
   });
 
+  it("redacts unfamiliar credentials in quoted JSON keys", () => {
+    const secret = "provider-" + "m".repeat(20);
+    for (const key of ["api_key", "credentials", "authorization", "access_token"]) {
+      const text = sanitizeForContext(JSON.stringify({ [key]: secret, error: "quota exceeded" }), "");
+      assert.ok(!text.includes(secret), text);
+      assert.match(text, /quota exceeded/);
+    }
+  });
+
   it("is idempotent", () => {
     const input = `${bearerLine()}\n${upperAssign("SECRET_KEY", "hunter2-" + "w".repeat(8))}\njwt: ${jwt()}`;
     const once = sanitizeForContext(input, "");

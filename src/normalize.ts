@@ -54,6 +54,10 @@ export function sanitizeForContext(value: string, cwd: string): string {
     /\b([A-Za-z0-9_]*(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|password|passwd|secret|token)[A-Za-z0-9_]*)(\s*[=:]\s*)(?:["'][^\r\n]*?["']|[^\s,;]+)/gi,
     "$1$2[REDACTED]",
   );
+  result = result.replace(
+    /(["'][A-Za-z0-9_-]*(?:api[_-]?key|access[_-]?token|authorization|client[_-]?secret|password|passwd|secret|token|credential)[A-Za-z0-9_-]*["']\s*:\s*)"(?:\\.|[^"\\])*"/gi,
+    '$1"[REDACTED]"',
+  );
   const normalizedCwd = cwd.replace(/\\/g, "/").replace(/\/$/, "");
   if (normalizedCwd) {
     result = result.replace(/\\/g, "/");
