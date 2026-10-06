@@ -259,6 +259,29 @@ describe("runCheckpointBuilderAgent", () => {
     await assert.rejects(runCheckpointBuilderAgent(ctx, index, config, { completion: fake.completion, model }), /stopped with length/);
   });
 
+  it("rewrites oversized recovery prose instead of slicing off the handoff", async () => {
+    const index = new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" });
+    const fake = scripted((context) => {
+      if (!toolNames(context).includes("read_turn_range")) {
+        return toolResponse([{ id: "read", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]);
+      }
+      const rewritten = toolNames(context).includes("submit_checkpoint");
+      return toolResponse([{ id: "submit", name: "submit_checkpoint", args: {
+        checkpoint: checkpointPayload(rewritten ? "Concise goal" : "Repeated historical detail ".repeat(100)),
+        coverageEndEntryId: "e2",
+      } }]);
+    });
+    const result = await runCheckpointBuilderAgent(ctx, index, config, {
+      completion: fake.completion, model, incompleteDraft: "unfinished historical prose",
+      targetSummaryChars: 1000,
+    });
+    assert.equal(fake.calls.length, 3);
+    assert.ok(result.summary.length <= 1000);
+    assert.equal(result.checkpoint.continuationState.immediateNextStep, "continue");
+    assert.ok(fake.calls.at(-1)!.messages.some((message) => message.role === "toolResult" &&
+      JSON.stringify(message.content).includes("Rewrite the complete checkpoint")));
+  });
+
   it("throws when the model never calls tools", async () => {
     const index = new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" });
     const fake = scripted(() => textResponse("here is my summary prose"));
@@ -320,6 +343,38 @@ describe("runCheckpointVerifierAgent", () => {
     });
     assert.equal(outcome.verdict, "repair");
     assert.ok(outcome.summary.includes("Repaired goal"));
+  });
+
+  it("requires full independent coverage before accepting a compressed recovery checkpoint", async () => {
+    const index = new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" });
+    const fake = scripted((context) => {
+      if (!toolNames(context).includes("read_session_turn")) {
+        return toolResponse([{ id: "read", name: "read_session_turn", args: { turnId: "turn-2" } }]);
+      }
+      return toolResponse([{ id: "accept", name: "submit_verdict", args: { verdict: "accept" } }]);
+    });
+    await assert.rejects(runCheckpointVerifierAgent(ctx, index, draft, draftCoverage, config, {
+      completion: fake.completion, model, targetSummaryChars: 1000,
+    }), /inspection requirements unmet/);
+  });
+
+  it("rejects oversized compressed repairs and repeated token-limited verdicts", async () => {
+    const oversized = scripted((context) => toolNames(context).includes("read_turn_range")
+      ? toolResponse([{ id: "repair", name: "submit_verdict", args: {
+          verdict: "repair", checkpoint: checkpointPayload("old prose ".repeat(500)), coverageEndEntryId: "e2",
+        } }])
+      : toolResponse([{ id: "read", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]));
+    await assert.rejects(runCheckpointVerifierAgent(ctx, new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" }), draft, draftCoverage, config, {
+      completion: oversized.completion, model, targetSummaryChars: 1000,
+    }), /Rewrite the complete checkpoint/);
+    const capped = scripted(() => ({
+      ...toolResponse([{ id: "accept", name: "submit_verdict", args: { verdict: "accept" } }]),
+      stopReason: "length",
+    }));
+    await assert.rejects(runCheckpointVerifierAgent(ctx, new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" }), draft, draftCoverage, config, {
+      completion: capped.completion, model, targetSummaryChars: 1000,
+    }), /stopped with length/);
+    assert.equal(capped.calls.length, 1, "a recovery cap is terminal even with a parsed submit call");
   });
 
   it("requires inspection and surfaces unusable verdicts", async () => {
