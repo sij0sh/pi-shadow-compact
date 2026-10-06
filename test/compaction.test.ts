@@ -248,7 +248,7 @@ describe("Pi compaction interoperability", () => {
     const f = await fixture({ ...CONFIG, recentTurns: 2 });
     try {
       await prepare(f);
-      await f.commands.get("compact-native")!.handler("", { compact: () => {} });
+      await f.commands.get("compact-native")!.handler("", { ...f.ctx, compact: () => {} });
       await f.emit("session_compact_failed", { type: "session_compact_failed", fromExtension: false });
       const outcome = await f.emit("session_before_compact", f.compactEvent());
       assert.ok(outcome?.compaction, "a failed escape must not bypass the next compaction");

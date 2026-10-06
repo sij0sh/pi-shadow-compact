@@ -2,6 +2,7 @@ import {
   buildSessionProjection,
   estimateTokens as estimateMessageTokens,
   getLatestCompactionEntry,
+  SettingsManager,
   type ContextEvent,
   type BoundaryState,
   type BoundaryResult,
@@ -44,7 +45,7 @@ import {
 } from "./persist.js";
 import { compactWithRecovery } from "./native-compaction.js";
 import { sanitizeForContext } from "./normalize.js";
-import { fileDetails } from "./prepare.js";
+import { fileDetails, hasCompactableHistory } from "./prepare.js";
 import { SessionHistoryIndex } from "./session-reader.js";
 import { ShadowCompactStateController, type PreparedResult } from "./state.js";
 import {
@@ -101,9 +102,20 @@ export default function shadowCompact(pi: ExtensionAPI): void {
   let activationTracedFor: string | undefined;
   let turnCount = 0;
 
+  const canCompact = (ctx: ExtensionContext): boolean => {
+    if (!ctx.model) return false;
+    // Use Pi's live effective settings, including SDK overrides and project trust.
+    const settings = SettingsManager.inMemory(pi.getSettings()).getCompactionSettings(ctx.model);
+    return hasCompactableHistory(ctx.sessionManager.getBranch(), settings.keepRecentTokens);
+  };
+
   pi.registerCommand("compact-native", {
     description: "Run pure Pi compaction; Shadow token-cap recovery is disabled",
     handler: async (_args, cmdCtx) => {
+      if (!canCompact(cmdCtx)) {
+        cmdCtx.ui.notify("shadow-compact: nothing to compact; recent history is still within Pi's retained tail", "info");
+        return;
+      }
       forceNativeOnce = true;
       cmdCtx.compact({});
     },
@@ -267,8 +279,8 @@ export default function shadowCompact(pi: ExtensionAPI): void {
   };
 
   // Idle-point actions shared by agent_settled and post-settle preparation outcomes.
-  // A failure-queued fallback always compacts: with nothing serving it is the
-  // only safe recovery. An emergency-queued fallback recompacts only while
+  // A failure-queued fallback compacts when Pi has a disposable prefix.
+  // An emergency-queued fallback recompacts only while
   // the spike is still present: context may have recovered while the run
   // drained, and a stale hatch must not compact a healthy working set.
   const settle = (ctx: ExtensionContext, deferredNotice: boolean, nativeThreshold?: number): void => {
@@ -297,6 +309,17 @@ export default function shadowCompact(pi: ExtensionAPI): void {
           persistReadyCheckpoint(ctx);
           return;
         }
+      }
+      if (!canCompact(ctx)) {
+        traceEvent("native_fallback", {
+          turn: turnCount, generation: state.generation, reason: pendingReason,
+          action: "skipped-no-prefix",
+        });
+        // Skipping replaces the failure event that would otherwise re-arm an
+        // aborted preparation. Preserve a valid checkpoint if one is serving.
+        if (!state.published) state.reset();
+        persistReadyCheckpoint(ctx);
+        return;
       }
       if (!runNativeFallback(ctx)) state.requestNativeFallback(pendingReason);
       return;

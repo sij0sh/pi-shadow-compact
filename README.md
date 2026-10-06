@@ -234,6 +234,13 @@ Shadow supplies a verified summary only when its coverage includes everything Pi
 Manual `/compact` prepares a fresh checkpoint when cached coverage does not reach Pi's cut.
 Automatic threshold and overflow compactions fall back to Pi's native summarizer when coverage is insufficient.
 A checkpoint that would recommit the same summary and tail also falls back to native compaction.
+Shadow checks the finalized conversation and Pi's effective per-model `keepRecentTokens` before starting an idle native fallback.
+A large prompt or previous summary does not make a small recent tail compactable.
+If no older visible prefix can be discarded, Shadow skips the fallback without starting compaction.
+It checks again on later triggers as history grows.
+`/compact-native` reports an informational no-op for the same condition.
+Built-in `/compact` and RPC `compact` retain Pi's own small-session error because Pi checks preparation before calling extension hooks.
+
 Emergency fallbacks bypass the cached checkpoint and run Pi's original summarization method first.
 `manualCompactMode: "native"` does the same for every manual request.
 `/compact-native` remains a pure-Pi escape without Shadow recovery.

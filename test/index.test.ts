@@ -304,6 +304,7 @@ describe("shadowCompact extension orchestration", () => {
       const command = f.commands.get("compact-native");
       assert.ok(command, "compact-native command is registered");
       await command.handler("", {
+        ...f.ctx,
         compact: (options: unknown) => void f.compactCalls.push(options as never),
       });
       const outcome = await f.emit("session_before_compact", f.compactEvent({ reason: "manual" }));
@@ -341,7 +342,7 @@ describe("shadowCompact extension orchestration", () => {
     }
   });
 
-  it("schedules the one-shot native fallback when a completed summary is invalid while current", async () => {
+  it("skips fallback when an intervening compaction leaves no disposable history", async () => {
     const f = await fixture(SWAP_CONFIG);
     try {
       f.gate();
@@ -353,7 +354,9 @@ describe("shadowCompact extension orchestration", () => {
       await tick();
       assert.deepEqual(f.compactCalls, []);
       await f.emit("agent_settled");
-      assert.deepEqual(f.compactCalls, [{}]);
+      assert.deepEqual(f.compactCalls, []);
+      await f.emit("agent_settled");
+      assert.deepEqual(f.compactCalls, []);
     } finally {
       await f.cleanup();
     }

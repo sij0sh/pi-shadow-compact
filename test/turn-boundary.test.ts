@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { writeFile } from "node:fs/promises";
 import { describe, it } from "node:test";
 import {
   compactionEntry,
@@ -135,7 +136,6 @@ describe("idle swap, emergency hatch, and terminal empty-snapshot failure", () =
     const f = await fixture();
     try {
       const configPath = `${f.agentDir}/shadow-compact.json`;
-      const { writeFile } = await import("node:fs/promises");
       await writeFile(configPath, "{ not json");
       f.setPercent(92);
       await f.emit("turn_end");
@@ -164,7 +164,7 @@ describe("idle swap, emergency hatch, and terminal empty-snapshot failure", () =
     }
   });
 
-  it("suppresses empty-snapshot preparations without native fallback while the emergency hatch stays live", async () => {
+  it("suppresses empty-snapshot preparations and skips emergency compaction without a disposable prefix", async () => {
     const f = await fixture();
     try {
       // A single greeting turn cannot produce a checkpoint that drops
@@ -188,15 +188,55 @@ describe("idle swap, emergency hatch, and terminal empty-snapshot failure", () =
       await f.emit("agent_settled");
       assert.deepEqual(f.compactCalls, []);
 
-      // The emergency hatch above stays independent of the suppression: a
-      // usage spike still compacts natively at idle.
+      // A usage spike does not manufacture a prefix outside Pi's retained tail.
+      f.setPercent(92);
+      await f.emit("turn_end");
+      await f.emit("agent_settled");
+      assert.deepEqual(f.compactCalls, []);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it("keeps a valid checkpoint serving when native retention leaves no disposable prefix", async () => {
+    const f = await fixture(SWAP_CONFIG);
+    try {
+      await startPreparation(f);
+      const before = await f.emit("context", { messages: f.contextMessages() });
+      await writeFile(`${f.agentDir}/settings.json`, JSON.stringify({ compaction: { keepRecentTokens: 1000000 } }));
+      f.setPercent(92);
+      await f.emit("turn_end");
+      await f.emit("agent_settled");
+      assert.deepEqual(f.compactCalls, []);
+      const after = await f.emit("context", { messages: f.contextMessages() });
+      assert.equal(after.messages[0].summary, before.messages[0].summary);
+    } finally { await f.cleanup(); }
+  });
+
+  it("rechecks skipped fallbacks after growth without leaving native markers or a latched preparation", async () => {
+    const f = await fixture(SWAP_CONFIG);
+    try {
+      f.gate();
+      await f.emit("turn_end");
+      await waitFor(() => f.registry.calls === 1);
+      const largeBranch = f.branch.slice();
+      f.setBranch([userEntry("small", null, "hi")]);
+      f.setPercent(92);
+      await f.emit("turn_end");
+      await f.emit("agent_settled");
+      await f.emit("agent_settled");
+      assert.deepEqual(f.compactCalls, []);
+      f.release();
+      await tick();
+      f.setBranch(largeBranch);
+      f.setPercent(60);
+      await f.emit("turn_end");
+      await waitFor(() => f.notifications.includes(READY_MESSAGE));
       f.setPercent(92);
       await f.emit("turn_end");
       await f.emit("agent_settled");
       assert.deepEqual(f.compactCalls, [{}]);
-    } finally {
-      await f.cleanup();
-    }
+    } finally { await f.cleanup(); }
   });
 
   it("suppresses no-drop preparation with a leading Pi prompt or model entry", async () => {

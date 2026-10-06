@@ -142,6 +142,77 @@ const assertPromptAndTools = (messages: TranscriptContext["messages"]) => {
 };
 
 describe("Pi 1.0.4 integration", () => {
+  it("skips an emergency fallback when Pi has no prefix to compact", async () => {
+    let hookCalls = 0;
+    const f = await integrationFixture([(pi) => { pi.on("session_before_compact", () => { hookCalls++; }); }]);
+    f.session.getContextUsage = () => ({ tokens: 190000, contextWindow: 200000, percent: 95 });
+    const ends: Array<{ errorMessage?: string }> = [];
+    const off = f.session.subscribe((event) => { if (event.type === "compaction_end") ends.push(event); });
+    try {
+      f.manager.newSession();
+      f.manager.appendMessage({ role: "user", content: "hi", timestamp: 0 });
+      const projection = f.manager.buildSessionProjection();
+      await assert.rejects(f.session.compact(), /Nothing to compact \(session too small\)/);
+      assert.match(ends.pop()?.errorMessage ?? "", /Compaction failed: Nothing to compact \(session too small\)/);
+      await f.session.prompt("continue");
+      await tick();
+      assert.deepEqual([...ends], [], "Shadow must not start a doomed compaction from an inflated usage reading");
+      assert.equal(f.nativeCalls, 0);
+      assert.equal(hookCalls, 0, "Pi rejects small sessions before emitting the hook");
+      assert.equal(f.manager.getBranch().filter((entry) => entry.type === "compaction").length, 0);
+      assert.ok(f.manager.buildSessionProjection().messages.length >= projection.messages.length);
+    } finally { off(); await f.cleanup(); }
+  });
+
+  it("uses live per-model retention overrides before starting an emergency fallback", async () => {
+    const f = await integrationFixture();
+    const ends: Array<{ errorMessage?: string }> = [];
+    const off = f.session.subscribe((event) => { if (event.type === "compaction_end") ends.push(event); });
+    try {
+      const model = f.provider.getModel();
+      f.settingsManager.applyOverrides({ compaction: {
+        enabled: false, keepRecentTokens: 1, reserveTokens: 1000,
+        modelOverrides: { [`${model.provider}/${model.id}`]: { keepRecentTokens: 1000000 } },
+      } });
+      f.session.getContextUsage = () => ({ tokens: 190000, contextWindow: 200000, percent: 95 });
+      await f.session.prompt("continue without discarding retained history");
+      await tick();
+      assert.deepEqual([...ends], []);
+      assert.equal(f.nativeCalls, 0);
+      f.settingsManager.applyOverrides({ compaction: { modelOverrides: {
+        [`${model.provider}/${model.id}`]: { keepRecentTokens: 2000 },
+      } } });
+      await f.session.prompt("now there is disposable history");
+      await waitFor(() => ends.length === 1);
+      assert.equal(ends[0]?.errorMessage, undefined);
+      assert.equal(f.nativeCalls, 1);
+    } finally { off(); await f.cleanup(); }
+  });
+
+  it("makes compact-native a no-op for small history without changing the next request's route", async () => {
+    const f = await integrationFixture();
+    const ends: Array<{ errorMessage?: string }> = [];
+    const off = f.session.subscribe((event) => { if (event.type === "compaction_end") ends.push(event); });
+    try {
+      f.manager.newSession();
+      f.manager.appendMessage({ role: "user", content: "hi", timestamp: 0 });
+      const projection = f.manager.buildSessionProjection();
+      await f.session.prompt("/compact-native");
+      await tick();
+      assert.deepEqual([...ends], []);
+      assert.deepEqual(f.manager.buildSessionProjection(), projection);
+      for (let i = 0; i < 3; i++) {
+        f.manager.appendMessage({ role: "user", content: "new detail ".repeat(1000), timestamp: i });
+        f.manager.appendMessage(fauxAssistantMessage("done"));
+      }
+      f.nativeReplies.push(fauxAssistantMessage("Partial native draft", { stopReason: "length" }));
+      await f.session.compact();
+      assert.equal(f.nativeCalls, 1);
+      assert.equal(f.registry.calls, 4, "the skipped escape must not bypass the next request's recovery");
+      assert.equal(f.manager.getBranch().at(-1)?.type, "compaction");
+    } finally { off(); await f.cleanup(); }
+  });
+
   it("compresses an incomplete native draft against original evidence and verifies before committing", async () => {
     const f = await integrationFixture([], { manualCompactMode: "native" });
     try {

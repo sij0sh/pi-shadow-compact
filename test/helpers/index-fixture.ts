@@ -20,7 +20,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { CHECKPOINT_CUSTOM_TYPE } from "../../src/persist.js";
 import shadowCompact from "../../src/index.js";
-import { buildSessionProjection } from "@earendil-works/pi-coding-agent";
+import { buildSessionProjection, SettingsManager } from "@earendil-works/pi-coding-agent";
 
 
 
@@ -428,6 +428,7 @@ function installInstance(shared: SharedSession): Fixture {
       list.push(handler);
       handlers.set(name, list);
     },
+    getSettings: () => SettingsManager.create(shared.cwd).getSettings(),
     appendEntry: appendCustomEntry,
     registerCommand(name: string, options: RegisteredCommand) {
       commands.set(name, options);
