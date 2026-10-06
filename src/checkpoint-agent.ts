@@ -33,7 +33,7 @@ import {
  * Instead of a bounded evidence packet, the summarizer and verifier run as
  * tool-calling agents over the whole durable session: they page and search
  * history through read-only session tools and terminate by calling a typed
- * submit tool. The loop executes locally on `modelRegistry.complete()` with
+ * submit tool. The loop executes locally on `modelRegistry.streamSimple()` with
  * the same completion interface as the legacy packet path, so tests can
  * drive it with scripted completions.
  */
@@ -395,6 +395,7 @@ async function runToolLoop(options: ToolLoopOptions): Promise<ToolLoopResult> {
     ...(options.model.reasoning && options.thinkingLevel && options.thinkingLevel !== "off"
       ? { reasoning: options.thinkingLevel }
       : {}),
+    toolChoice: "auto" as const,
     cacheRetention: "none" as const,
     sessionId: uuidv7(),
   };
@@ -406,7 +407,7 @@ async function runToolLoop(options: ToolLoopOptions): Promise<ToolLoopResult> {
     const context: Context = { systemPrompt: options.systemPrompt, messages, tools: options.tools };
     const response = await options.completion.complete(options.model, context, requestOptions);
     usages.push(response.usage);
-    if (response.stopReason === "error" || response.stopReason === "aborted") {
+    if (response.stopReason === "error" || response.stopReason === "aborted" || response.stopReason === "length") {
       throw new Error(`${options.responseLabel} stopped with ${response.stopReason}`);
     }
     messages.push(response);
@@ -469,7 +470,7 @@ export async function runCheckpointBuilderAgent(
 ): Promise<BuilderOutcome> {
   const model = request.model ?? resolveSummarizerModel(ctx, config);
   const completion: CompletionInterface = request.completion ?? {
-    complete: (completedModel, context, options) => ctx.modelRegistry.complete(completedModel, context, options),
+    complete: (completedModel, context, options) => ctx.modelRegistry.streamSimple(completedModel, context, options).result(),
   };
   const state: RunState = { index, servedRefs: new Set(), submitAttempts: 0, readCalls: 0 };
   let accepted: { checkpoint: Checkpoint; coverageEndEntryId: string } | undefined;
@@ -534,7 +535,7 @@ export async function runCheckpointVerifierAgent(
 ): Promise<VerifierOutcome> {
   const model = request.model ?? resolveVerificationModel(ctx, config);
   const completion: CompletionInterface = request.completion ?? {
-    complete: (completedModel, context, options) => ctx.modelRegistry.complete(completedModel, context, options),
+    complete: (completedModel, context, options) => ctx.modelRegistry.streamSimple(completedModel, context, options).result(),
   };
   const state: RunState = { index, servedRefs: new Set(), submitAttempts: 0, readCalls: 0 };
   let accepted: { checkpoint: Checkpoint; coverageEndEntryId: string; verdict: "accept" | "repair" } | undefined;

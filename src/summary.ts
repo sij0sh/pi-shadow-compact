@@ -8,7 +8,7 @@ import {
   type AssistantMessage,
   type Context,
   type Model,
-  type ModelsApiStreamOptions,
+  type ModelsSimpleStreamOptions,
   type Usage,
 } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -121,7 +121,7 @@ export interface CompletionInterface {
   complete(
     model: Model<Api>,
     context: Context,
-    options?: ModelsApiStreamOptions<Api>,
+    options?: ModelsSimpleStreamOptions,
   ): Promise<AssistantMessage>;
 }
 export function resolveSummarizerModel(

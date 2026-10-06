@@ -8,7 +8,8 @@ import type {
   AssistantMessage,
   Context,
   Model,
-  ModelsApiStreamOptions,
+  ModelsSimpleStreamOptions,
+  AssistantMessageEventStream,
   Usage,
 } from "@earendil-works/pi-ai";
 import type {
@@ -19,6 +20,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { CHECKPOINT_CUSTOM_TYPE } from "../../src/persist.js";
 import shadowCompact from "../../src/index.js";
+import { buildSessionProjection } from "@earendil-works/pi-coding-agent";
 
 
 
@@ -87,7 +89,7 @@ export class FakeRegistry {
   readonly prompts: string[] = [];
   readonly models: Model<Api>[] = [];
   readonly signals: Array<AbortSignal | undefined> = [];
-  readonly optionsList: Array<ModelsApiStreamOptions<Api> | undefined> = [];
+  readonly optionsList: Array<ModelsSimpleStreamOptions | undefined> = [];
   readonly toolsUsed: boolean[] = [];
   readonly finds: Array<[string, string]> = [];
   readonly summaryModel = {
@@ -105,10 +107,14 @@ export class FakeRegistry {
     return undefined;
   }
 
+  streamSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): AssistantMessageEventStream {
+    return { result: () => this.complete(model, context, options) } as AssistantMessageEventStream;
+  }
+
   async complete(
     model: Model<Api>,
     context: Context,
-    options?: ModelsApiStreamOptions<Api>,
+    options?: ModelsSimpleStreamOptions,
   ): Promise<AssistantMessage> {
     this.calls++;
     this.models.push(model);
@@ -527,20 +533,7 @@ function installInstance(shared: SharedSession): Fixture {
       return installInstance(shared);
     },
     contextMessages(): unknown[] {
-      return shared.branch.flatMap((entry) => {
-        // Mirrors Pi 0.87+: context handlers see the conversation without
-        // system messages; Pi restores the prompt and tool state afterward.
-        if (entry.type === "message") return entry.message.role === "system" ? [] : [entry.message];
-        if (entry.type === "compaction") {
-          return [{
-            role: "compactionSummary" as const,
-            summary: entry.summary,
-            tokensBefore: entry.tokensBefore,
-            timestamp: 0,
-          }];
-        }
-        return [];
-      });
+      return buildSessionProjection(shared.branch).messages.filter((message) => message.role !== "system");
     },
     async emit(name, event = { type: name }) {
       if (name === "turn_end") idle = false;

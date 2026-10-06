@@ -5,7 +5,7 @@ import type {
   AssistantMessage,
   Context,
   Model,
-  ModelsApiStreamOptions,
+  ModelsSimpleStreamOptions,
   Usage,
 } from "@earendil-works/pi-ai";
 import type { ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
@@ -101,7 +101,7 @@ function scripted(handler: Handler) {
   return {
     calls,
     completion: {
-      async complete(_model: Model<Api>, context: Context, _options?: ModelsApiStreamOptions<Api>) {
+      async complete(_model: Model<Api>, context: Context, _options?: ModelsSimpleStreamOptions) {
         calls.push(context);
         return handler(context);
       },
@@ -116,6 +116,28 @@ function toolNames(context: Context): string[] {
 }
 
 describe("runCheckpointBuilderAgent", () => {
+  it("uses provider-neutral streaming for nested model calls", async () => {
+    const index = new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" });
+    const fake = scripted((context) => toolNames(context).includes("read_turn_range")
+      ? toolResponse([{ id: "c2", name: "submit_checkpoint", args: { checkpoint: checkpointPayload(), coverageEndEntryId: "e2" } }])
+      : toolResponse([{ id: "c1", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]));
+    let simpleCalls = 0;
+    const streamCtx = {
+      model,
+      modelRegistry: {
+        complete: () => { throw new Error("provider-neutral requests must use streamSimple"); },
+        streamSimple: (requestModel: Model<Api>, context: Context, options: unknown) => {
+          simpleCalls++;
+          assert.equal((options as { toolChoice: string }).toolChoice, "auto");
+          return { result: () => fake.completion.complete(requestModel, context) };
+        },
+      },
+    } as unknown as Pick<ExtensionContext, "model" | "modelRegistry">;
+    const outcome = await runCheckpointBuilderAgent(streamCtx, index, config, { model });
+    assert.equal(outcome.coverageEndEntryId, "e2");
+    assert.equal(simpleCalls, 2);
+  });
+
   it("reads the session and submits a validated checkpoint", async () => {
     const index = new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" });
     const fake = scripted((context) => {
