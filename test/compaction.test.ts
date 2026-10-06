@@ -190,6 +190,23 @@ describe("Pi compaction interoperability", () => {
     }
   });
 
+  it("cancels before native generation when projection fails, even if notification also fails", async () => {
+    const f = await fixture(CONFIG);
+    try {
+      const event = f.compactEvent({ reason: "threshold" });
+      event.preparation.messagesToSummarize = f.branch.flatMap((entry) => entry.type === "message" ? [entry.message] : []);
+      const ctx = f.ctx;
+      const getBranch = ctx.sessionManager.getBranch;
+      ctx.sessionManager.getBranch = () => { throw new Error("projection failed"); };
+      ctx.ui.notify = () => { throw new Error("notification failed"); };
+      assert.deepEqual(await f.emit("session_before_compact", event), { cancel: true });
+      assert.equal(f.registry.calls, 0, "no native fall-through after taking ownership");
+      ctx.sessionManager.getBranch = getBranch;
+    } finally {
+      await f.cleanup();
+    }
+  });
+
   it("stands down quietly when the session is replaced during native draft recovery", async () => {
     const f = await fixture(CONFIG);
     try {

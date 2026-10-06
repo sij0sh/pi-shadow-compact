@@ -1,4 +1,4 @@
-import { contentText, type Usage } from "@earendil-works/pi-ai";
+import { contentText, uuidv7, type Usage } from "@earendil-works/pi-ai";
 import {
   compact,
   SettingsManager,
@@ -8,13 +8,14 @@ import {
   type SessionBeforeCompactEvent,
 } from "@earendil-works/pi-coding-agent";
 import { buildCoverage } from "./checkpoint.js";
-import { runCheckpointBuilderAgent, runCheckpointVerifierAgent } from "./checkpoint-agent.js";
+import { checkpointSummaryTarget, runCheckpointBuilderAgent, runCheckpointVerifierAgent } from "./checkpoint-agent.js";
 import type { ShadowCompactConfig } from "./config.js";
-import { sanitizeForContext, tokensToChars } from "./normalize.js";
+import { sanitizeForContext } from "./normalize.js";
 import { SessionHistoryIndex } from "./session-reader.js";
 import { combineUsage, resolveSummarizerModel, resolveVerificationModel } from "./summary.js";
 import { coverageIsUnchanged, isCoveredPrefix } from "./working-context.js";
 import { latestCompactionId } from "./persist.js";
+import { completeWithSummaryTrace } from "./summary-trace.js";
 import { traceEvent } from "./trace.js";
 
 class IncompleteNativeSummary extends Error {
@@ -28,6 +29,7 @@ export async function compactWithRecovery(
   ctx: ExtensionContext,
   event: SessionBeforeCompactEvent,
   config: ShadowCompactConfig,
+  attemptId = uuidv7(),
 ): Promise<CompactionResult | undefined> {
   const model = ctx.model;
   const { preparation, signal } = event;
@@ -40,6 +42,7 @@ export async function compactWithRecovery(
   const sessionId = ctx.sessionManager.getSessionId();
   const settings = SettingsManager.create(ctx.cwd, undefined, { projectTrusted: ctx.isProjectTrusted() });
   const nativeUsages: Usage[] = [];
+  let nativeStage: "native-history" | "native-prefix" = preparation.messagesToSummarize.length ? "native-history" : "native-prefix";
   // Pi skips extension-owned details on the next compaction. Carry our file
   // lists explicitly so wrapping a successful native call does not lose them.
   const previous = getLatestCompactionEntry(branch);
@@ -60,14 +63,16 @@ export async function compactWithRecovery(
   try {
     return await compact(
       { ...preparation, fileOps }, model, undefined, undefined, event.customInstructions, signal,
-      ctx.thinkingLevel,
+      config.thinkingLevel ?? "low",
       async (requestModel, context, options) => {
         signal.throwIfAborted();
-        const stream = ctx.modelRegistry.streamSimple(requestModel, context, {
-          ...settings.getProviderRetrySettings(),
-          ...options,
+        let stream!: ReturnType<typeof ctx.modelRegistry.streamSimple>;
+        const response = await completeWithSummaryTrace({ complete: (model, context, options) => {
+          stream = ctx.modelRegistry.streamSimple(model, context, options);
+          return stream.result();
+        } }, requestModel, context, { ...settings.getProviderRetrySettings(), ...options }, {
+          attemptId, stage: nativeStage, round: nativeUsages.length + 1,
         });
-        const response = await stream.result();
         nativeUsages.push(response.usage);
         signal.throwIfAborted();
         if (response.stopReason === "length") {
@@ -77,6 +82,7 @@ export async function compactWithRecovery(
             sanitizeForContext(contentText(response.content), ctx.cwd), options?.maxTokens ?? 0,
           );
         }
+        if (response.stopReason === "stop" && preparation.isSplitTurn) nativeStage = "native-prefix";
         return stream;
       },
       undefined, settings.getRetrySettings(),
@@ -92,46 +98,54 @@ export async function compactWithRecovery(
       verifierModel.maxTokens > 0 ? verifierModel.maxTokens : Infinity,
     );
     if (maxTokens < 1) throw new Error("Native summary recovery has no output allowance");
-    const targetSummaryChars = tokensToChars(Math.floor(maxTokens / 2));
+    const targetSummaryChars = checkpointSummaryTarget(summaryModel, maxTokens);
     const previousSummary = preparation.previousSummary;
     const makeIndex = () => new SessionHistoryIndex({
       branch, cwd: ctx.cwd,
       ...(previousSummary ? { previousCheckpointSummary: previousSummary } : {}),
     });
     const request = {
-      signal, maxTokens, targetSummaryChars,
+      signal, maxTokens, targetSummaryChars, attemptId,
       // Lower only private summary reasoning; do not mutate acting settings.
       thinkingLevel: "low" as const,
       ...(event.customInstructions ? { customInstructions: event.customInstructions } : {}),
     };
-    traceEvent("summary_recovery", { stage: "started", reason: "length", maxTokens, targetSummaryChars });
-    const built = await runCheckpointBuilderAgent(ctx, makeIndex(), config, {
-      ...request, model: summaryModel, incompleteDraft: error.draft,
-    });
-    const coverage = buildCoverage({
-      sourceStartEntryId: null, coverageEndEntryId: built.coverageEndEntryId,
-      preparedAtLeafId: leafId, publishedAtLeafId: leafId,
-    });
-    const verified = await runCheckpointVerifierAgent(ctx, makeIndex(), built.checkpoint, coverage, config, {
-      ...request, model: verifierModel,
-    });
-    signal.throwIfAborted();
-    const current = ctx.sessionManager.getBranch();
-    const finalCoverage = { ...coverage, coverageEndEntryId: verified.coverageEndEntryId };
-    if (ctx.sessionManager.getSessionId() !== sessionId ||
-        !current.some((entry) => entry.id === leafId) ||
-        latestCompactionId(current) !== latestCompactionId(branch) ||
-        !coverageIsUnchanged(current, finalCoverage) ||
-        !isCoveredPrefix(current, verified.coverageEndEntryId, preparation.firstKeptEntryId)) {
-      throw new Error("Native summary recovery does not cover the current compaction prefix");
+    traceEvent("summary_recovery", { attemptId, stage: "started", reason: "length", maxTokens, targetSummaryChars });
+    let stage = "builder";
+    try {
+      const built = await runCheckpointBuilderAgent(ctx, makeIndex(), config, {
+        ...request, model: summaryModel, incompleteDraft: error.draft,
+      });
+      const coverage = buildCoverage({
+        sourceStartEntryId: null, coverageEndEntryId: built.coverageEndEntryId,
+        preparedAtLeafId: leafId, publishedAtLeafId: leafId,
+      });
+      stage = "verifier";
+      const verified = await runCheckpointVerifierAgent(ctx, makeIndex(), built.checkpoint, coverage, config, {
+        ...request, model: verifierModel,
+      });
+      stage = "freshness";
+      signal.throwIfAborted();
+      const current = ctx.sessionManager.getBranch();
+      const finalCoverage = { ...coverage, coverageEndEntryId: verified.coverageEndEntryId };
+      if (ctx.sessionManager.getSessionId() !== sessionId ||
+          !current.some((entry) => entry.id === leafId) ||
+          latestCompactionId(current) !== latestCompactionId(branch) ||
+          !coverageIsUnchanged(current, finalCoverage) ||
+          !isCoveredPrefix(current, verified.coverageEndEntryId, preparation.firstKeptEntryId)) {
+        throw new Error("Native summary recovery does not cover the current compaction prefix");
+      }
+      const modifiedFiles = [...new Set([...fileOps.written, ...fileOps.edited])].sort();
+      const readFiles = [...fileOps.read].filter((path) => !modifiedFiles.includes(path)).sort();
+      const usage = nativeUsages.reduce((total, item) => combineUsage(total, item), combineUsage(built.usage, verified.usage));
+      traceEvent("summary_recovery", { attemptId, stage: "completed", reason: "length", maxTokens, summaryChars: verified.summary.length });
+      return {
+        summary: verified.summary, firstKeptEntryId: preparation.firstKeptEntryId,
+        tokensBefore: preparation.tokensBefore, usage, details: { readFiles, modifiedFiles },
+      };
+    } catch (failure) {
+      traceEvent("summary_recovery", { attemptId, stage: "failed", reason: signal.aborted ? "cancelled" : stage, maxTokens });
+      throw failure;
     }
-    const modifiedFiles = [...new Set([...fileOps.written, ...fileOps.edited])].sort();
-    const readFiles = [...fileOps.read].filter((path) => !modifiedFiles.includes(path)).sort();
-    const usage = nativeUsages.reduce((total, item) => combineUsage(total, item), combineUsage(built.usage, verified.usage));
-    traceEvent("summary_recovery", { stage: "completed", reason: "length", maxTokens, summaryChars: verified.summary.length });
-    return {
-      summary: verified.summary, firstKeptEntryId: preparation.firstKeptEntryId,
-      tokensBefore: preparation.tokensBefore, usage, details: { readFiles, modifiedFiles },
-    };
   }
 }

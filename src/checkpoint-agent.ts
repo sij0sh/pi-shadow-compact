@@ -11,7 +11,8 @@ import {
   type Usage,
 } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { sanitizeForContext } from "./normalize.js";
+import { completeWithSummaryTrace, type SummaryCallTrace } from "./summary-trace.js";
+import { sanitizeForContext, tokensToChars } from "./normalize.js";
 import type { CheckpointCoverage } from "./checkpoint.js";
 import type { ShadowCompactConfig } from "./config.js";
 import {
@@ -42,6 +43,15 @@ import {
 export const CHECKPOINT_BUILDER_MAX_ROUNDS = 40;
 export const CHECKPOINT_VERIFIER_MAX_ROUNDS = 20;
 const MAX_SUBMIT_ATTEMPTS = 3;
+const DEFAULT_SUMMARY_CHARS = 16_000;
+
+/** A prose budget, not a tokenizer or a provider generation limit. */
+export function checkpointSummaryTarget(model: Model<Api>, maxTokens?: number): number {
+  const allowance = Math.min(maxTokens ?? Infinity, model.maxTokens > 0 ? model.maxTokens : Infinity);
+  return Number.isFinite(allowance)
+    ? Math.min(DEFAULT_SUMMARY_CHARS, tokensToChars(Math.floor(allowance / 2)))
+    : DEFAULT_SUMMARY_CHARS;
+}
 
 type ToolParameters = Tool["parameters"];
 const params = (schema: unknown): ToolParameters => schema as ToolParameters;
@@ -148,8 +158,10 @@ export interface BuilderRequest {
   thinkingLevel?: ModelThinkingLevel;
   /** Incomplete native prose, used only as an untrusted writing aid. */
   incompleteDraft?: string;
-  /** Concise recovery target; oversized submissions must be rewritten, not sliced. */
+  /** Concise prose target; oversized submissions must be rewritten, not sliced. */
   targetSummaryChars?: number;
+  /** Correlates nested requests with their preparation or compaction. */
+  attemptId?: string;
 }
 
 export interface BuilderOutcome {
@@ -313,7 +325,7 @@ Completion requirements — before submit_checkpoint you MUST have:
 
 Rules:
 - Preserve exact identifiers when continuation depends on them: file paths, symbols, commands, flags, versions, URLs, error text, literal values, and API names.
-- Keep current facts; supersede stale ones instead of repeating them.
+- Keep current continuation state, not a cumulative decision journal. Consolidate completed work and supersede stale decisions instead of repeating them. Retain active constraints, unresolved issues, verification distinctions, and exact continuation identifiers.
 - Distinguish facts from assumptions. Do not invent details. Do not continue the task.
 - Record what the evidence actually verified vs explicitly left unverified in verificationState; never mark unresolved work complete.
 - Fill continuationState with the current goal, the approach in progress, and the immediate next step.
@@ -399,6 +411,7 @@ interface ToolLoopOptions {
   maxTokens?: number | undefined;
   thinkingLevel?: ModelThinkingLevel | undefined;
   responseLabel: string;
+  trace: Omit<SummaryCallTrace, "round">;
   /**
    * Executes one tool call. Read tools return their JSON payload as `text`;
    * submit validation failures return `error` (the agent can retry); only
@@ -441,7 +454,7 @@ async function runToolLoop(options: ToolLoopOptions): Promise<ToolLoopResult> {
     const context: Context = { systemPrompt: options.systemPrompt, messages, tools: options.tools };
     let response: AssistantMessage;
     try {
-      response = await options.completion.complete(options.model, context, requestOptions);
+      response = await completeWithSummaryTrace(options.completion, options.model, context, requestOptions, { ...options.trace, round: round + 1 });
     } catch (error) {
       const detail = sanitizeForContext(error instanceof Error ? error.message : String(error), "").slice(0, 1000);
       throw new Error(`${options.responseLabel} (${options.model.provider}/${options.model.id}) request failed: ${detail}`);
@@ -513,6 +526,7 @@ export async function runCheckpointBuilderAgent(
   const completion: CompletionInterface = request.completion ?? {
     complete: (completedModel, context, options) => ctx.modelRegistry.streamSimple(completedModel, context, options).result(),
   };
+  const target = request.targetSummaryChars ?? checkpointSummaryTarget(model, request.maxTokens ?? config.summaryMaxTokens);
   const state: RunState = { index, servedRefs: new Set(), submitAttempts: 0, readCalls: 0 };
   let accepted: { checkpoint: Checkpoint; coverageEndEntryId: string } | undefined;
 
@@ -521,12 +535,13 @@ export async function runCheckpointBuilderAgent(
     model,
     tools: [...READ_TOOLS, SUBMIT_CHECKPOINT_TOOL],
     systemPrompt: BUILDER_SYSTEM_PROMPT,
-    prompt: builderPrompt(index) + summaryGuidance(request.customInstructions) + compressionGuidance(request),
+    prompt: builderPrompt(index) + summaryGuidance(request.customInstructions) + compressionGuidance({ ...request, targetSummaryChars: target }),
     maxRounds: CHECKPOINT_BUILDER_MAX_ROUNDS,
     signal: request.signal,
     maxTokens: request.maxTokens,
-    thinkingLevel: request.thinkingLevel,
+    thinkingLevel: request.thinkingLevel ?? config.thinkingLevel ?? "low",
     responseLabel: "Summary model",
+    trace: { attemptId: request.attemptId ?? uuidv7(), stage: "builder" },
     execute: async (name, args) => {
       if (name === SUBMIT_CHECKPOINT_TOOL.name) {
         state.submitAttempts++;
@@ -538,7 +553,7 @@ export async function runCheckpointBuilderAgent(
           const { entryId } = validateCoverage(index, args.coverageEndEntryId);
           const checkpoint = validateCheckpointObject(args.checkpoint, state.servedRefs);
           requireContinuation(checkpoint);
-          requireConciseSummary(checkpoint, request.targetSummaryChars);
+          requireConciseSummary(checkpoint, target);
           accepted = { checkpoint, coverageEndEntryId: entryId };
           return { done: true };
         } catch (error) {
@@ -579,6 +594,7 @@ export async function runCheckpointVerifierAgent(
   const completion: CompletionInterface = request.completion ?? {
     complete: (completedModel, context, options) => ctx.modelRegistry.streamSimple(completedModel, context, options).result(),
   };
+  const target = request.targetSummaryChars ?? checkpointSummaryTarget(model, request.maxTokens ?? config.summaryMaxTokens);
   const state: RunState = { index, servedRefs: new Set(), submitAttempts: 0, readCalls: 0 };
   let accepted: { checkpoint: Checkpoint; coverageEndEntryId: string; verdict: "accept" | "repair" } | undefined;
 
@@ -587,12 +603,13 @@ export async function runCheckpointVerifierAgent(
     model,
     tools: [...READ_TOOLS, SUBMIT_VERDICT_TOOL],
     systemPrompt: VERIFIER_SYSTEM_PROMPT,
-    prompt: verifierPrompt(index, draft, draftCoverage) + summaryGuidance(request.customInstructions) + compressionGuidance(request),
+    prompt: verifierPrompt(index, draft, draftCoverage) + summaryGuidance(request.customInstructions) + compressionGuidance({ ...request, targetSummaryChars: target }),
     maxRounds: CHECKPOINT_VERIFIER_MAX_ROUNDS,
     signal: request.signal,
     maxTokens: request.maxTokens,
-    thinkingLevel: request.thinkingLevel,
+    thinkingLevel: request.thinkingLevel ?? config.verificationThinkingLevel ?? config.thinkingLevel ?? "low",
     responseLabel: "Verification model",
+    trace: { attemptId: request.attemptId ?? uuidv7(), stage: "verifier" },
     execute: async (name, args) => {
       if (name === SUBMIT_VERDICT_TOOL.name) {
         state.submitAttempts++;
@@ -613,7 +630,7 @@ export async function runCheckpointVerifierAgent(
               requireCompletion(state);
               validateCoverage(index, draftCoverage.coverageEndEntryId);
             }
-            requireConciseSummary(draft, request.targetSummaryChars);
+            requireConciseSummary(draft, target);
             accepted = { checkpoint: draft, coverageEndEntryId: draftCoverage.coverageEndEntryId, verdict: "accept" };
             return { done: true };
           }
@@ -622,7 +639,7 @@ export async function runCheckpointVerifierAgent(
             const { entryId } = validateCoverage(index, args.coverageEndEntryId);
             const checkpoint = validateCheckpointObject(args.checkpoint, state.servedRefs);
             requireContinuation(checkpoint);
-            requireConciseSummary(checkpoint, request.targetSummaryChars);
+            requireConciseSummary(checkpoint, target);
             accepted = { checkpoint, coverageEndEntryId: entryId, verdict: "repair" };
             return { done: true };
           }

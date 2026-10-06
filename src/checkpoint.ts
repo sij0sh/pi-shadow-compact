@@ -19,8 +19,8 @@ import type { Checkpoint } from "./summary.js";
 export const CHECKPOINT_SCHEMA_VERSION = 3;
 
 /** Prompt versions carried by every checkpoint. */
-export const SUMMARY_PROMPT_VERSION = 2;
-export const VERIFIER_PROMPT_VERSION = 2;
+export const SUMMARY_PROMPT_VERSION = 3;
+export const VERIFIER_PROMPT_VERSION = 3;
 
 export interface PromptVersions {
   summaryPromptVersion: number;

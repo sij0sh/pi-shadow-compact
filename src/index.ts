@@ -12,6 +12,7 @@ import {
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import {
+  checkpointSummaryTarget,
   runCheckpointBuilderAgent,
   runCheckpointVerifierAgent,
 } from "./checkpoint-agent.js";
@@ -52,7 +53,7 @@ import {
   resolveSummarizerModel,
   resolveVerificationModel,
 } from "./summary.js";
-import { traceEvent } from "./trace.js";
+import { COMPACTION_CAPABILITY, traceEvent } from "./trace.js";
 import { estimateTokens } from "./turns.js";
 import { contextSwapDropCount, hasOrphanedToolResult } from "./swap.js";
 import {
@@ -96,11 +97,12 @@ export default function shadowCompact(pi: ExtensionAPI): void {
   let configErrorReported = false;
   let nativeFallbackInFlight = false;
   let forceNativeOnce = false;
+  let compactTrace: { attemptId: string; sessionId: string | null; route: string } | undefined;
   let activationTracedFor: string | undefined;
   let turnCount = 0;
 
   pi.registerCommand("compact-native", {
-    description: "Run Pi native compaction, bypassing the Shadow checkpoint",
+    description: "Run pure Pi compaction; Shadow token-cap recovery is disabled",
     handler: async (_args, cmdCtx) => {
       forceNativeOnce = true;
       cmdCtx.compact({});
@@ -336,6 +338,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     generation: number,
     retainedAnchor?: string,
     customInstructions?: string,
+    attemptId = randomUUID(),
   ): Promise<void> => {
     const startedWallMs = Date.now();
     // Releases a preparation whose session died underneath it (replacement or
@@ -417,6 +420,8 @@ export default function shadowCompact(pi: ExtensionAPI): void {
 
       const model = resolveSummarizerModel(ctx, config);
       const maxTokens = config.summaryMaxTokens;
+      const verifierModel = resolveVerificationModel(ctx, config);
+      const targetSummaryChars = Math.min(checkpointSummaryTarget(model, maxTokens), checkpointSummaryTarget(verifierModel, maxTokens));
       const index = new SessionHistoryIndex({
         branch,
         cwd: ctx.cwd,
@@ -428,7 +433,8 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         ...(customInstructions ? { customInstructions } : {}),
         model,
         ...(maxTokens !== undefined ? { maxTokens } : {}),
-        ...(config.thinkingLevel ? { thinkingLevel: config.thinkingLevel } : {}),
+        targetSummaryChars, attemptId,
+        thinkingLevel: config.thinkingLevel ?? "low",
       });
       if (bailIfStale()) return;
       const summaryWallMs = Date.now() - startedWallMs;
@@ -436,8 +442,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       // Second-pass verification gate with independent history access: the
       // verifier audits the draft against the session it reads itself, so a
       // shared blind spot cannot hide an omission from both passes.
-      const verifierModel = resolveVerificationModel(ctx, config);
-      const verifierThinking = config.verificationThinkingLevel ?? config.thinkingLevel;
+      const verifierThinking = config.verificationThinkingLevel ?? config.thinkingLevel ?? "low";
       const verifierStartedWallMs = Date.now();
       const draftCoverage = buildCoverage({
         sourceStartEntryId: null,
@@ -456,7 +461,8 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         ...(customInstructions ? { customInstructions } : {}),
         model: verifierModel,
         ...(maxTokens !== undefined ? { maxTokens } : {}),
-        ...(verifierThinking ? { thinkingLevel: verifierThinking } : {}),
+        targetSummaryChars, attemptId,
+        thinkingLevel: verifierThinking,
       });
       if (bailIfStale()) return;
       const verifierWallMs = Date.now() - verifierStartedWallMs;
@@ -488,6 +494,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         prompts: currentPromptVersions(),
       };
       traceEvent("prepare_completed", {
+        attemptId, targetSummaryChars,
         turn: turnCount,
         generation,
         summaryChars: verified.summary.length,
@@ -496,7 +503,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         summaryCacheRead: outcome.usage.cacheRead,
         summaryCacheWrite: outcome.usage.cacheWrite,
         summaryModel: `${model.provider}/${model.id}`,
-        summaryThinking: config.thinkingLevel ?? null,
+        summaryThinking: config.thinkingLevel ?? "low",
         verifierInput: verified.usage.input,
         verifierOutput: verified.usage.output,
         verifierCacheRead: verified.usage.cacheRead,
@@ -1086,102 +1093,140 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     return swapSummaryIntoContext(ctx, event, config);
   });
 
-  const nativeCompaction = async (
-    ctx: ExtensionContext, event: SessionBeforeCompactEvent, config: ShadowCompactConfig | undefined,
-  ): Promise<SessionBeforeCompactResult | undefined> => {
-    if (!config) return undefined;
+  pi.on("session_before_compact", async (event: SessionBeforeCompactEvent, ctx) => {
+    const attemptId = randomUUID();
+    let sessionId: string | null = null;
+    let route = "entered";
+    let ownedPreparation = false;
+    const trigger = nativeFallbackInFlight ? "emergency" : forceNativeOnce ? "escape" : event.reason;
+    const recordRoute = (selected: string): void => {
+      route = selected;
+      compactTrace = { attemptId, sessionId, route };
+      traceEvent("compaction_route", { capability: COMPACTION_CAPABILITY, attemptId, sessionId, reason: event.reason, trigger, route });
+    };
+    // Diagnostics and notification failures must never release an owned request
+    // to Pi's ignored-hook-exception fall-through.
+    const notify = (message: string): void => {
+      try { ctx.ui.notify(message, "warning"); }
+      catch { traceEvent("compaction_outcome", { attemptId, sessionId, stage: "notification", outcome: "failed" }); }
+    };
+    recordRoute("entered");
     try {
-      const compaction = await compactWithRecovery(ctx, event, config);
-      return compaction ? { compaction } : undefined;
+      sessionId = ctx.sessionManager.getSessionId();
+      if (isObserveMode()) { recordRoute("observe"); return; }
+      const forced = forceNativeOnce;
+      forceNativeOnce = false;
+      if (forced && !nativeFallbackInFlight) {
+        recordRoute("pure-native");
+        notify("shadow-compact: pure Pi compaction; token-cap recovery is disabled");
+        return;
+      }
+      const config = await configFor(ctx).catch(() => undefined);
+      if (!config) {
+        recordRoute("invalid-config");
+        notify("shadow-compact: configuration unavailable; using pure Pi compaction without token-cap recovery");
+        return;
+      }
+      if (!ctx.model || ctx.model.api === "pi-virtual") {
+        recordRoute(ctx.model ? "virtual-model" : "no-model");
+        return;
+      }
+      const nativeCompaction = async (): Promise<SessionBeforeCompactResult | undefined> => {
+        if (!event.preparation.messagesToSummarize.length && !event.preparation.turnPrefixMessages.length) {
+          recordRoute("no-evidence");
+          return;
+        }
+        recordRoute("wrapped-native");
+        const compaction = await compactWithRecovery(ctx, event, config, attemptId);
+        traceEvent("compaction_outcome", { attemptId, sessionId, route, outcome: "ready", summaryChars: compaction?.summary.length ?? 0 });
+        return compaction ? { compaction } : undefined;
+      };
+      const servedResult = (served: SessionBeforeCompactResult): SessionBeforeCompactResult => {
+        recordRoute("checkpoint");
+        traceEvent("compaction_outcome", { attemptId, sessionId, route, outcome: "ready", summaryChars: served.compaction?.summary.length ?? 0 });
+        return served;
+      };
+      if (forced || (event.reason === "manual" && config.manualCompactMode === "native")) {
+        state.abortPreparing();
+        return await nativeCompaction();
+      }
+      const recentTurns = config.recentTurns;
+      const messagesBefore = workingMessagesBeforeCompaction(ctx, recentTurns);
+      const published = state.published;
+      if (published && resultIsCurrent(ctx, published)) {
+        if (coversCompactionPrefix(ctx, published, event.preparation.firstKeptEntryId)) {
+          const served = serveCompaction(ctx, event, published, messagesBefore);
+          return served ? servedResult(served) : await nativeCompaction();
+        }
+        traceEvent("compaction_fallback", { reason: "uncovered-prefix", firstKeptEntryId: event.preparation.firstKeptEntryId, coverageEnd: published.coverage?.coverageEndEntryId ?? null });
+      }
+
+      // Manual /compact with nothing ready: Shadow becomes the compaction
+      // provider. Prepare fresh, await it (a hook signal abort cancels the
+      // preparation), and serve the result; on failure fall through to native.
+      if (event.reason === "manual") {
+        recordRoute("preparing");
+        ctx.ui.notify(MANUAL_PREPARE_MESSAGE, "info");
+        state.abortPreparing();
+        const prepared = state.startPreparing();
+        if (!prepared) return await nativeCompaction();
+        ownedPreparation = true;
+        const branch = ctx.sessionManager.getBranch();
+        traceEvent("threshold_crossed", {
+          turn: turnCount,
+          generation: prepared.generation,
+          action: "started",
+          reason: "manual",
+          contextTokens: ctx.getContextUsage()?.tokens ?? null,
+          contextPercent: ctx.getContextUsage()?.percent ?? null,
+          prepareThreshold: config.prepareThresholdPercent,
+          prepareThresholdTokens: config.softCompactThresholdTokens ?? null,
+        });
+        traceEvent("prepare_started", {
+          turn: turnCount,
+          generation: prepared.generation,
+          reason: "manual",
+          contextTokens: ctx.getContextUsage()?.tokens ?? null,
+          contextPercent: ctx.getContextUsage()?.percent ?? null,
+          prepareThreshold: config.prepareThresholdPercent,
+          prepareThresholdTokens: config.softCompactThresholdTokens ?? null,
+          branchEntries: branch.length,
+          leafId: ctx.sessionManager.getLeafId() ?? null,
+        });
+        // A hook abort releases the preparation like a takeover: the aborted
+        // completion no-ops on its stale generation instead of failing.
+        const onAbort = (): void => {
+          state.abortPreparing();
+        };
+        event.signal.addEventListener("abort", onAbort, { once: true });
+        try {
+          await prepare(ctx, config, branch.slice(), prepared.controller, prepared.generation, undefined, event.customInstructions, attemptId);
+        } finally {
+          event.signal.removeEventListener("abort", onAbort);
+        }
+        ownedPreparation = false;
+        const fresh = state.published;
+        if (fresh && resultIsCurrent(ctx, fresh)) {
+          const served = serveCompaction(ctx, event, fresh, messagesBefore);
+          return served ? servedResult(served) : await nativeCompaction();
+        }
+        return await nativeCompaction();
+      }
+
+      // A native compaction moots the preparation, but keep a valid serving
+      // checkpoint until success: failure does not change compaction ancestry.
+      state.abortPreparing();
+      return await nativeCompaction();
     } catch (error) {
-      // Hook exceptions are otherwise reported and ignored by Pi, which would
-      // repeat the original native request. Cancel explicitly after failure.
-      if (!event.signal.aborted && !isContextStale(ctx)) reportError(ctx, error);
+      if (ownedPreparation) state.abortPreparing();
+      traceEvent("compaction_outcome", { attemptId, sessionId, route, outcome: event.signal.aborted ? "cancelled" : "failed" });
+      try {
+        if (!event.signal.aborted && !isContextStale(ctx)) reportError(ctx, error);
+      } catch {
+        traceEvent("compaction_outcome", { attemptId, sessionId, stage: "notification", outcome: "failed" });
+      }
       return { cancel: true };
     }
-  };
-
-  pi.on("session_before_compact", async (event: SessionBeforeCompactEvent, ctx) => {
-    if (isObserveMode()) return;
-    // /compact-native remains a pure-Pi escape. Ordinary emergency fallback
-    // bypasses the cached checkpoint, but can recover a token-limited draft.
-    if (forceNativeOnce) {
-      forceNativeOnce = false;
-      if (!nativeFallbackInFlight) return;
-      const config = await configFor(ctx).catch(() => undefined);
-      return nativeCompaction(ctx, event, config);
-    }
-    const config = await configFor(ctx).catch(() => undefined);
-    // Native mode uses Pi's original method first. Keep the old checkpoint
-    // until success; abort only the preparation that compaction would moot.
-    if (event.reason === "manual" && config && config.manualCompactMode === "native") {
-      state.abortPreparing();
-      return nativeCompaction(ctx, event, config);
-    }
-    const recentTurns = config?.recentTurns ?? DEFAULT_RECENT_TURNS;
-    const messagesBefore = workingMessagesBeforeCompaction(ctx, recentTurns);
-    const published = state.published;
-    if (published && resultIsCurrent(ctx, published)) {
-      if (coversCompactionPrefix(ctx, published, event.preparation.firstKeptEntryId)) {
-        const served = serveCompaction(ctx, event, published, messagesBefore);
-        return served ?? nativeCompaction(ctx, event, config);
-      }
-      traceEvent("compaction_fallback", { reason: "uncovered-prefix", firstKeptEntryId: event.preparation.firstKeptEntryId, coverageEnd: published.coverage?.coverageEndEntryId ?? null });
-    }
-
-    // Manual /compact with nothing ready: Shadow becomes the compaction
-    // provider. Prepare fresh, await it (a hook signal abort cancels the
-    // preparation), and serve the result; on failure fall through to native.
-    if (event.reason === "manual" && config) {
-      ctx.ui.notify(MANUAL_PREPARE_MESSAGE, "info");
-      state.abortPreparing();
-      const prepared = state.startPreparing();
-      if (!prepared) return;
-      const branch = ctx.sessionManager.getBranch();
-      traceEvent("threshold_crossed", {
-        turn: turnCount,
-        generation: prepared.generation,
-        action: "started",
-        reason: "manual",
-        contextTokens: ctx.getContextUsage()?.tokens ?? null,
-        contextPercent: ctx.getContextUsage()?.percent ?? null,
-        prepareThreshold: config.prepareThresholdPercent,
-        prepareThresholdTokens: config.softCompactThresholdTokens ?? null,
-      });
-      traceEvent("prepare_started", {
-        turn: turnCount,
-        generation: prepared.generation,
-        reason: "manual",
-        contextTokens: ctx.getContextUsage()?.tokens ?? null,
-        contextPercent: ctx.getContextUsage()?.percent ?? null,
-        prepareThreshold: config.prepareThresholdPercent,
-        prepareThresholdTokens: config.softCompactThresholdTokens ?? null,
-        branchEntries: branch.length,
-        leafId: ctx.sessionManager.getLeafId() ?? null,
-      });
-      // A hook abort releases the preparation like a takeover: the aborted
-      // completion no-ops on its stale generation instead of failing.
-      const onAbort = (): void => {
-        state.abortPreparing();
-      };
-      event.signal.addEventListener("abort", onAbort, { once: true });
-      try {
-        await prepare(ctx, config, branch.slice(), prepared.controller, prepared.generation, undefined, event.customInstructions);
-      } finally {
-        event.signal.removeEventListener("abort", onAbort);
-      }
-      const fresh = state.published;
-      if (fresh && resultIsCurrent(ctx, fresh)) {
-        const served = serveCompaction(ctx, event, fresh, messagesBefore);
-        return served ?? nativeCompaction(ctx, event, config);
-      }
-      return nativeCompaction(ctx, event, config);
-    }
-
-    // A native compaction moots the preparation, but keep a valid serving
-    // checkpoint until success: failure does not change compaction ancestry.
-    state.abortPreparing();
-    return nativeCompaction(ctx, event, config);
   });
 
   // Every successful compaction changes ancestry, regardless of its source.
@@ -1192,10 +1237,14 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     forceNativeOnce = false;
   };
   pi.on("session_compact", () => {
+    traceEvent("compaction_outcome", { ...compactTrace, outcome: "installed" });
+    compactTrace = undefined;
     clearNativeCompactMarkers();
     state.reset();
   });
-  pi.on("session_compact_failed", () => {
+  pi.on("session_compact_failed", (event) => {
+    traceEvent("compaction_outcome", { ...compactTrace, outcome: event.aborted ? "cancelled" : "failed" });
+    compactTrace = undefined;
     const hadNativeFallback = nativeFallbackInFlight;
     clearNativeCompactMarkers();
     // The emergency hatch aborted a prepare. With nothing left to serve,
@@ -1203,10 +1252,12 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     if (hadNativeFallback && !state.published) state.reset();
   });
   pi.on("session_tree", () => {
+    compactTrace = undefined;
     clearNativeCompactMarkers();
     state.reset();
   });
   pi.on("session_shutdown", () => {
+    compactTrace = undefined;
     clearNativeCompactMarkers();
     state.reset();
   });

@@ -51,8 +51,8 @@ describe("observe mode (instrumented control)", () => {
         .map((line) => JSON.parse(line) as { event: string });
       assert.ok(events.length > 0, "observe mode emits telemetry");
       assert.ok(
-        events.every((event) => event.event === "turn_usage"),
-        "observe mode emits only turn_usage",
+        events.every((event) => event.event === "turn_usage" || event.event === "compaction_route"),
+        "observe mode emits usage and route diagnostics without taking ownership",
       );
     } finally {
       if (previousMode === undefined) delete process.env[MODE_ENV_VAR];

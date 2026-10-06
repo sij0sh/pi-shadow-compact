@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -121,7 +121,7 @@ async function integrationFixture(extraExtensions: ExtensionFactory[] = [], conf
   assert.deepEqual(extensionsResult.errors, []);
   await session.bindExtensions({ onError: (error) => errors.push(error.error) });
   return {
-    session, manager, provider, settingsManager, registry, checkpointReplies, checkpointRequests, nativeReplies, nativeRequests, nativeOptions, actingReplies, actingRequests, actingGates, errors,
+    cwd, session, manager, provider, settingsManager, registry, checkpointReplies, checkpointRequests, nativeReplies, nativeRequests, nativeOptions, actingReplies, actingRequests, actingGates, errors,
     get nativeCalls() { return nativeCalls; },
     async cleanup() {
       session.dispose();
@@ -184,7 +184,7 @@ describe("Pi 1.0.4 integration", () => {
       assert.equal(f.nativeCalls, 2, "history completes once; prefix cap selects one recovery");
       assert.equal(f.nativeOptions[0]?.maxTokens, 800);
       assert.equal(f.nativeOptions[1]?.maxTokens, 500);
-      assert.equal(f.nativeOptions[1]?.reasoning, "high");
+      assert.equal(f.nativeOptions[1]?.reasoning, "low");
       assert.match(f.registry.prompts[0]!, /Partial prefix draft/);
       const recoveryTranscript = JSON.stringify(f.checkpointRequests);
       assert.ok(!recoveryTranscript.includes(secret));
@@ -199,6 +199,24 @@ describe("Pi 1.0.4 integration", () => {
     } finally {
       await f.cleanup();
     }
+  });
+
+  it("honors explicit wrapped summary reasoning without changing pure-Pi policy", async () => {
+    const f = await integrationFixture([], { manualCompactMode: "native", thinkingLevel: "high" });
+    try {
+      f.session.setThinkingLevel("medium");
+      await f.session.compact();
+      assert.equal(f.nativeOptions[0]?.reasoning, "high");
+      assert.equal(f.session.thinkingLevel, "medium");
+      f.manager.appendMessage({ role: "user", content: "new detail ".repeat(1000), timestamp: Date.now() });
+      f.manager.appendMessage(fauxAssistantMessage("latest completed work"));
+      const ended = new Promise<void>((resolve) => {
+        const off = f.session.subscribe((event) => { if (event.type === "compaction_end") { off(); resolve(); } });
+      });
+      await f.session.prompt("/compact-native"); await ended;
+      assert.equal(f.nativeOptions[1]?.reasoning, "medium", "escape keeps Pi's acting-session policy");
+      assert.equal(f.nativeCalls, 2);
+    } finally { await f.cleanup(); }
   });
 
   it("recovers a native threshold cap and resumes the acting request with smaller context", async () => {
@@ -242,6 +260,66 @@ describe("Pi 1.0.4 integration", () => {
       assert.equal(f.nativeCalls, 2);
       assert.deepEqual(f.errors, []);
     } finally {
+      await f.cleanup();
+    }
+  });
+
+  it("cancels an owned pre-generation hook failure even when Pi notification throws", async () => {
+    let restoreUI = () => {};
+    const f = await integrationFixture([(pi) => {
+      pi.on("session_start", (_event, ctx) => {
+        const originalNotify = ctx.ui.notify;
+        restoreUI = () => { ctx.ui.notify = originalNotify; };
+        const original = ctx.sessionManager.getBranch.bind(ctx.sessionManager);
+        let reads = 0;
+        ctx.sessionManager.getBranch = (...args) => {
+          // Pi reads the branch to prepare; Shadow reads it again to project.
+          if (++reads === 2) {
+            ctx.ui.notify = () => { throw new Error("UI unavailable"); };
+            throw new Error("Projection unavailable");
+          }
+          return original(...args);
+        };
+      });
+    }]);
+    try {
+      const leaf = f.manager.getLeafId();
+      const projection = f.manager.buildSessionProjection();
+      await assert.rejects(f.session.compact(), /Compaction cancelled/);
+      assert.equal(f.nativeCalls, 0);
+      assert.equal(f.manager.getLeafId(), leaf);
+      assert.deepEqual(f.manager.buildSessionProjection(), projection);
+      assert.deepEqual(f.errors, [], "no ignored hook exception reaches Pi");
+    } finally { restoreUI(); await f.cleanup(); }
+  });
+
+  it("correlates split-prefix and failed verifier telemetry without exposing drafts", async () => {
+    const f = await integrationFixture([], { manualCompactMode: "native" });
+    const previous = process.env.SHADOW_COMPACT_TRACE;
+    const path = join(f.cwd, "summary-trace.jsonl");
+    process.env.SHADOW_COMPACT_TRACE = path;
+    try {
+      f.manager.appendMessage({ role: "user", content: "current constraint", timestamp: Date.now() });
+      f.manager.appendMessage(fauxAssistantMessage("pending detail ".repeat(1500)));
+      f.manager.appendMessage(fauxAssistantMessage("recent detail ".repeat(1500)));
+      f.nativeReplies.push(fauxAssistantMessage("private complete history"), fauxAssistantMessage("private incomplete draft", { stopReason: "length" }));
+      const original = f.registry.complete.bind(f.registry);
+      f.registry.complete = async (model, context, options) => context.tools?.some((tool) => tool.name === "submit_verdict")
+        ? fauxAssistantMessage("private verifier failure", { stopReason: "length" }) : original(model, context, options);
+      await assert.rejects(f.session.compact(), /Compaction cancelled/);
+      const text = await readFile(path, "utf8");
+      assert.ok(!text.includes("private"));
+      const records = text.trim().split("\n").map((line) => JSON.parse(line));
+      const calls = records.filter((record) => record.event === "summary_call");
+      assert.deepEqual(calls.map((record) => record.stage), ["native-history", "native-prefix", "builder", "builder", "verifier"]);
+      assert.deepEqual(calls.slice(0, 2).map((record) => record.requestedMaxTokens), [800, 500]);
+      const route = records.find((record) => record.route === "wrapped-native");
+      assert.ok(calls.every((record) => record.attemptId === route.attemptId));
+      const failed = records.find((record) => record.event === "summary_recovery" && record.stage === "failed");
+      assert.equal(failed.reason, "verifier"); assert.equal(failed.attemptId, route.attemptId);
+      assert.equal(f.nativeCalls, 2, "no repeated native generation after failed recovery");
+    } finally {
+      if (previous === undefined) delete process.env.SHADOW_COMPACT_TRACE; else process.env.SHADOW_COMPACT_TRACE = previous;
       await f.cleanup();
     }
   });

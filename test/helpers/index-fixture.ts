@@ -325,6 +325,7 @@ export interface RegisteredCommand {
 }
 
 export interface Fixture {
+  readonly ctx: ExtensionContext;
   readonly registry: FakeRegistry;
   readonly compactCalls: CompactCall[];
   readonly notifications: string[];
@@ -496,6 +497,7 @@ function installInstance(shared: SharedSession): Fixture {
   } as unknown as ExtensionContext;
 
   return {
+    ctx,
     registry,
     compactCalls,
     notifications,

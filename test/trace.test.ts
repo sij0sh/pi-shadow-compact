@@ -91,6 +91,35 @@ describe("trace sinks", () => {
 });
 
 describe("trace lifecycle flow", () => {
+  it("records checkpoint, virtual-model, and empty-native routes with one attempt identity", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "shadow-routes-"));
+    const path = join(dir, "trace.jsonl");
+    const previous = process.env[TRACE_FILE_ENV_VAR];
+    process.env[TRACE_FILE_ENV_VAR] = path;
+    const f = await fixture({ ...SWAP_CONFIG, recentTurns: 2, idleCompact: { enabled: false } });
+    try {
+      await f.emit("turn_end");
+      await waitFor(() => f.notifications.some((message) => message.includes("checkpoint ready")));
+      assert.ok((await f.emit("session_before_compact", f.compactEvent())).compaction);
+      const model = f.ctx.model;
+      Object.defineProperty(f.ctx, "model", { configurable: true, value: { ...model, api: "pi-virtual" } });
+      assert.equal(await f.emit("session_before_compact", f.compactEvent()), undefined);
+      Object.defineProperty(f.ctx, "model", { configurable: true, value: model });
+      // The cut exceeds cached coverage, and the synthetic native preparation
+      // contains no messages. Keep the intentional unwrapped route explicit.
+      f.setBranch([...f.branch, { ...f.branch.at(-1)!, id: "uncovered", parentId: f.branch.at(-1)!.id }, { ...f.branch.at(-1)!, id: "new-leaf", parentId: "uncovered" }]);
+      assert.equal(await f.emit("session_before_compact", f.compactEvent({ reason: "threshold", firstKeptEntryId: "new-leaf" })), undefined);
+      const records = await readEvents(path);
+      const routes = records.filter((record) => record.event === "compaction_route" && record.route !== "entered");
+      assert.deepEqual(routes.map((record) => record.route), ["checkpoint", "virtual-model", "no-evidence"]);
+      assert.ok(routes.every((record) => record.sessionId === "session-1" && record.capability === "bounded-recovery-v2"));
+      assert.equal(new Set(routes.map((record) => record.attemptId)).size, 3);
+    } finally {
+      await f.cleanup(); restoreEnv(TRACE_FILE_ENV_VAR, previous);
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("records turn usage, preparation cost, swap shape, and persist", async () => {
     const dir = await mkdtemp(join(tmpdir(), "shadow-trace-"));
     const path = join(dir, "trace.jsonl");

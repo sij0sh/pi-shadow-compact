@@ -545,8 +545,8 @@ describe("soft durability without compaction", () => {
         assert.equal(data.coverage.preparedAtLeafId, "e4");
         assert.equal(data.coverage.publishedAtLeafId, "e4");
         assert.deepEqual(data.prompts, {
-          summaryPromptVersion: 2,
-          verifierPromptVersion: 2,
+          summaryPromptVersion: 3,
+          verifierPromptVersion: 3,
         });
         assert.match(data.structured.objective[0]?.text ?? "", /Prepared continuation checkpoint/);
         assert.ok(!("historicTurns" in data), "v3 carries no historic-turn payload");

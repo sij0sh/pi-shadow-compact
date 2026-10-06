@@ -60,7 +60,7 @@ async function startPreparation(fixture: Fixture): Promise<void> {
 }
 
 describe("shadowCompact extension orchestration", () => {
-  it("does not impose a summary token cap by default", async () => {
+  it("bounds default prose and lowers private reasoning without imposing a generation cap", async () => {
     const f = await fixture(SWAP_CONFIG);
     try {
       await startPreparation(f);
@@ -69,6 +69,8 @@ describe("shadowCompact extension orchestration", () => {
       const agentCalls = f.registry.optionsList.filter((_, index) => f.registry.toolsUsed[index]);
       assert.equal(agentCalls.length, 4);
       assert.ok(agentCalls.every((options) => options?.maxTokens === undefined));
+      assert.ok(agentCalls.every((options) => options?.reasoning === "low"));
+      assert.match(f.registry.prompts[0]!, /within 16000 characters/);
     } finally {
       await f.cleanup();
     }
@@ -93,6 +95,15 @@ describe("shadowCompact extension orchestration", () => {
     } finally {
       await f.cleanup();
     }
+  });
+
+  it("derives the shared rendered target from the configured response allowance", async () => {
+    const f = await fixture({ ...SWAP_CONFIG, summaryMaxTokens: 1000 });
+    try {
+      await startPreparation(f);
+      assert.match(f.registry.prompts[0]!, /within 2000 characters/);
+      assert.match(f.registry.prompts[2]!, /within 2000 characters/);
+    } finally { await f.cleanup(); }
   });
 
   it("prompts the checkpoint agent with the session manifest and read-only tools", async () => {
