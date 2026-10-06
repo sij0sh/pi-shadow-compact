@@ -91,7 +91,14 @@ This makes the full session **readable rather than merely truncated**.
 
 ### No-gap continuity tail
 
-A checkpoint states exactly how far its evidence grounding extends (its coverage boundary). The working context keeps every complete turn after that boundary, plus at least the last `recentTurns` turns verbatim — whichever retains more. Overlap between the checkpoint and the tail is harmless; a gap would silently lose history, so the swap proves gap-freedom structurally and fails closed to full context when it cannot.
+A checkpoint states exactly how far its evidence grounding extends (its coverage boundary).
+The working context keeps every uncovered message and at least the last `recentTurns` response/tool rounds verbatim.
+A round contains one assistant response and its tool results, including parallel results.
+New user input stays with its following response.
+This does not retain ten entire spans between user prompts, which can contain hundreds of tool rounds.
+A partly covered round stays verbatim so its uncovered reply or tool output cannot disappear.
+Overlap is harmless.
+The swap proves gap-freedom against Pi's projected context and fails closed when it cannot.
 
 ## Evidence-grounded checkpoints
 
@@ -201,7 +208,26 @@ Three thresholds plus an idle rule (defaults):
 
 Once a verified checkpoint is ready, future model requests use it in place of the older conversation prefix plus the no-gap continuity tail.
 
-Manual `/compact` is served by Shadow whenever a current checkpoint exists; otherwise Shadow prepares one fresh and serves it. `/compact-native` runs one purely native compaction as an escape hatch (`manualCompactMode: "native"` restores the legacy behavior of always compacting natively on manual request).
+Real compactions use Pi's prepared cut and its `compaction.keepRecentTokens` budget, including per-model overrides.
+Shadow supplies a verified summary only when its coverage includes everything Pi will discard and the result reduces the working context already in use.
+Manual `/compact` prepares a fresh checkpoint when cached coverage does not reach Pi's cut.
+Automatic threshold and overflow compactions fall back to Pi's native summarizer when coverage is insufficient.
+A checkpoint that would recommit the same summary and tail also falls back to native compaction.
+`/compact-native` and emergency fallbacks always bypass Shadow for that compaction.
+`manualCompactMode: "native"` makes every manual request native.
+
+### What the UI reports
+
+Checkpoint preparation creates extension state, not a Pi compaction entry.
+The ready notice means future requests can use that checkpoint.
+It does not mean Pi has already reduced its canonical session context.
+
+Pi's "compacted from X tokens" notice reports the pre-compaction size.
+The raw transcript remains visible and stored after compaction.
+Pi temporarily reports unknown context usage until the first post-compaction response.
+Use that response's usage to confirm the new working size.
+A successful native or Shadow compaction invalidates the previous request-local checkpoint.
+A failed compaction leaves a still-valid checkpoint available.
 
 ## Failure behavior
 
@@ -247,7 +273,8 @@ pi update git:github.com/sij0sh/pi-shadow-compact
 pi remove git:github.com/sij0sh/pi-shadow-compact
 ```
 
-Requires Node 22.19+ and a compatible Pi version.
+Requires Node 22.19+.
+Development and integration tests target Pi 1.0.4.
 
 ## Configuration
 
@@ -373,7 +400,11 @@ Default:
 10
 ```
 
-Minimum complete recent turns retained verbatim past any checkpoint, even when the checkpoint already covers them. The continuity tail starts at whichever point retains more: the first complete turn after the coverage boundary, or the first of the last `recentTurns` turns.
+Minimum recent response/tool rounds retained verbatim past a request-local checkpoint.
+One round contains an assistant response and its tool results, not an entire user-message span.
+The continuity tail also retains every message after the evidence boundary.
+A partially covered round stays intact.
+Real `/compact` and automatic compactions use Pi's `compaction.keepRecentTokens` instead of this minimum.
 
 ### `manualCompactMode`
 
@@ -383,7 +414,11 @@ Default:
 "shadow"
 ```
 
-`"shadow"` serves manual `/compact` from the Shadow checkpoint (preparing fresh when none is ready). `"native"` restores the legacy behavior of always compacting natively on manual request. Either way, `/compact-native` runs one purely native compaction.
+`"shadow"` serves manual `/compact` with a verified checkpoint when it safely reduces context at Pi's cut.
+It prepares fresh when cached coverage is insufficient.
+It falls back to native compaction on failure or no reduction.
+`"native"` always uses Pi's native summarizer on manual request.
+Either way, `/compact-native` runs one purely native compaction.
 
 ### `summaryMaxTokens`
 
@@ -469,10 +504,12 @@ Shadow handles context maintenance separately.
 
 ```bash
 npm ci
-npm run check
+./scripts/verify
 ```
 
-`npm run check` runs the TypeScript typecheck and test suite.
+`./scripts/verify` runs the TypeScript typecheck, test suite, and bundle build.
+The tests include Pi 1.0.4 SDK compaction and resumed tool calls without remote inference.
+`npm run check` runs only the typecheck and test suite.
 
 ## License
 
