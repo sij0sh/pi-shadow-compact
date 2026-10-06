@@ -32,7 +32,9 @@ export type TraceEventType =
   | "checkpoint_persisted"
   | "checkpoint_restored"
   | "checkpoint_restore_rejected"
-  | "native_fallback";
+  | "native_fallback"
+  | "compaction_served"
+  | "compaction_fallback";
 
 export function isStderrTraceEnabled(): boolean {
   // Local read: trace stays dependency-free so telemetry never pulls in

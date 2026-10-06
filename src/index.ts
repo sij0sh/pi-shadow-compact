@@ -1,4 +1,6 @@
 import {
+  buildSessionProjection,
+  estimateTokens as estimateMessageTokens,
   getLatestCompactionEntry,
   type ContextEvent,
   type ExtensionAPI,
@@ -47,6 +49,7 @@ import {
 } from "./summary.js";
 import { traceEvent } from "./trace.js";
 import { estimateTokens } from "./turns.js";
+import { contextSwapDropCount, hasOrphanedToolResult } from "./swap.js";
 import {
   buildWorkingContext,
   isWorkingContextSkipped,
@@ -100,6 +103,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     // Manual compaction aborts an active agent run, so only start it while Pi is idle.
     if (nativeFallbackInFlight || !ctx.isIdle()) return false;
     nativeFallbackInFlight = true;
+    forceNativeOnce = true;
     ctx.compact({});
     return true;
   };
@@ -539,15 +543,6 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     }
   };
 
-  const earliestCut = (ctx: ExtensionContext, ours: string, theirs: string): string => {
-    const branch = ctx.sessionManager.getBranch();
-    const ourIndex = branch.findIndex((entry) => entry.id === ours);
-    const theirIndex = branch.findIndex((entry) => entry.id === theirs);
-    if (ourIndex < 0) return theirs;
-    if (theirIndex < 0) return ours;
-    return ourIndex <= theirIndex ? ours : theirs;
-  };
-
   /**
    * The single preparation entry point (spec §24E): threshold crossings,
    * idle settles, and manual requests all funnel through here instead of
@@ -700,35 +695,78 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     return { messages: built.messages };
   };
 
-  // Serves a verified checkpoint to Pi compaction (threshold, overflow, or
-  // manual): Shadow's audited summary with whichever cut drops less. Shadow
-  // serves only when its cut drops something; otherwise Pi's own boundary
-  // compacts better (small sessions) and native proceeds.
+  const workingMessagesBeforeCompaction = (
+    ctx: ExtensionContext,
+    recentTurns: number,
+  ): ContextEvent["messages"] => {
+    const branch = ctx.sessionManager.getBranch();
+    const messages = buildSessionProjection(branch).messages.filter((message) => message.role !== "system");
+    const result = state.published;
+    if (!result || !resultIsCurrent(ctx, result)) return messages;
+    const coverage = effectiveCoverage(branch, result);
+    if (!coverage) return messages;
+    const built = buildWorkingContext({
+      checkpoint: { summary: result.summary, coverage },
+      branch,
+      messages,
+      minimumRecentTurns: recentTurns,
+      ...(result.coverage ? {} : { coverageTailOverride: result.firstKeptEntryId }),
+    });
+    return isWorkingContextSkipped(built) ? messages : built.messages;
+  };
+
+  // Pi's prepared cut owns real compaction. A checkpoint may replace its
+  // prefix only when it covers every visible entry Pi will discard. Ignore
+  // recovery omissions and state-only suffixes when proving coverage.
+  const coversCompactionPrefix = (
+    ctx: ExtensionContext,
+    result: PreparedResult,
+    firstKeptEntryId: string,
+  ): boolean => {
+    const branch = ctx.sessionManager.getBranch();
+    const coverage = effectiveCoverage(branch, result);
+    if (!coverage) return false;
+    const cut = branch.findIndex((entry) => entry.id === firstKeptEntryId);
+    const covered = branch.findIndex((entry) => entry.id === coverage.coverageEndEntryId);
+    if (cut < 0) return false;
+    const positions = new Map(branch.map((entry, index) => [entry.id, index]));
+    return buildSessionProjection(branch).entries.every((entry) => {
+      const index = positions.get(entry.sourceEntry.id) ?? -1;
+      return index <= covered || index >= cut || entry.messages.every(
+        (message) => message.role === "system" || message.role === "compactionSummary",
+      );
+    });
+  };
+
   const serveCompaction = (
     ctx: ExtensionContext,
     event: SessionBeforeCompactEvent,
     result: PreparedResult,
-    recentTurns: number,
+    messagesBefore: ContextEvent["messages"],
   ) => {
+    const firstKeptEntryId = event.preparation.firstKeptEntryId;
+    if (!coversCompactionPrefix(ctx, result, firstKeptEntryId)) return undefined;
     const branch = ctx.sessionManager.getBranch();
-    const coverage = effectiveCoverage(branch, result);
-    const ours = coverage
-      ? planSwap(
-          branch,
-          coverage.coverageEndEntryId,
-          recentTurns,
-          result.coverage ? undefined : result.firstKeptEntryId,
-        )?.swapStartEntryId
-      : undefined;
-    if (!ours || ours === branch[0]?.id) return undefined;
-    const exact = ours === event.preparation.firstKeptEntryId;
-    // On a mismatch keep whichever cut drops less: the earliest cut on the
-    // branch. Shadow's summary covers everything before its own cut, so an
-    // earlier cut only overlaps verbatim context — coverage is never lost
-    // from either side.
-    const firstKeptEntryId = exact
-      ? ours
-      : earliestCut(ctx, ours, event.preparation.firstKeptEntryId);
+    const drop = contextSwapDropCount(branch, firstKeptEntryId);
+    if (drop === undefined || drop === 0) return undefined;
+    const messages = buildSessionProjection(branch).messages.filter((message) => message.role !== "system");
+    const candidate: ContextEvent["messages"] = [{
+      role: "compactionSummary",
+      summary: result.summary,
+      tokensBefore: event.preparation.tokensBefore,
+      timestamp: Date.now(),
+    }, ...messages.slice(drop)];
+    if (hasOrphanedToolResult(candidate)) return undefined;
+    const before = messagesBefore.reduce((total, message) => total + estimateMessageTokens(message), 0);
+    const after = candidate.reduce((total, message) => total + estimateMessageTokens(message), 0);
+    // Committing the checkpoint and tail already being served is a no-op,
+    // even when it drops entries from canonical history. Let Pi summarize
+    // natively rather than reporting another successful non-reduction.
+    if (after >= before) {
+      traceEvent("compaction_fallback", { reason: "no-reduction", firstKeptEntryId, estimatedTokensBefore: before, estimatedTokensAfter: after });
+      return undefined;
+    }
+    traceEvent("compaction_served", { reason: event.reason, firstKeptEntryId, estimatedTokensBefore: before, estimatedTokensAfter: after });
     return {
       compaction: {
         summary: result.summary,
@@ -942,15 +980,14 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       state.reset();
       return;
     }
-    // Shadow never compacts proactively; but when Pi compacts anyway, the
-    // verified checkpoint covers strictly more than a fresh native summary:
-    // it was audited against the raw history. Offer it whenever it is still
-    // current, even when Pi's cut lands elsewhere — the hook's summary and
-    // cut are honored verbatim, so a boundary mismatch no longer silently
-    // supersedes Shadow coverage.
+    const recentTurns = config?.recentTurns ?? DEFAULT_RECENT_TURNS;
+    const messagesBefore = workingMessagesBeforeCompaction(ctx, recentTurns);
     const published = state.published;
     if (published && resultIsCurrent(ctx, published)) {
-      return serveCompaction(ctx, event, published, config?.recentTurns ?? DEFAULT_RECENT_TURNS);
+      if (coversCompactionPrefix(ctx, published, event.preparation.firstKeptEntryId)) {
+        return serveCompaction(ctx, event, published, messagesBefore);
+      }
+      traceEvent("compaction_fallback", { reason: "uncovered-prefix", firstKeptEntryId: event.preparation.firstKeptEntryId, coverageEnd: published.coverage?.coverageEndEntryId ?? null });
     }
 
     // Manual /compact with nothing ready: Shadow becomes the compaction
@@ -996,26 +1033,29 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       }
       const fresh = state.published;
       if (fresh && resultIsCurrent(ctx, fresh)) {
-        return serveCompaction(ctx, event, fresh, config.recentTurns);
+        return serveCompaction(ctx, event, fresh, messagesBefore);
       }
       return;
     }
 
-    // A native compaction starting while we prepare moots the in-flight work:
-    // reset so the post-compaction session starts cold.
-    if (state.preparing) state.reset();
+    // A native compaction moots the preparation, but keep a valid serving
+    // checkpoint until success: failure does not change compaction ancestry.
+    state.abortPreparing();
     return;
   });
 
-  // Native compaction (or its failure) observed after the fact carries no
-  // usable checkpoint either way: clear any in-flight fallback marker, and
-  // drop the serving checkpoint only when the compaction came from us.
-  const handleNativeCompactEvent = (event: { fromExtension: boolean }): void => {
+  // Every successful compaction changes ancestry, regardless of its source.
+  // Failure only releases the native escape/fallback markers; the old working
+  // checkpoint remains valid and can keep serving.
+  const clearNativeCompactMarkers = (): void => {
     nativeFallbackInFlight = false;
-    if (event.fromExtension) state.reset();
+    forceNativeOnce = false;
   };
-  pi.on("session_compact", handleNativeCompactEvent);
-  pi.on("session_compact_failed", handleNativeCompactEvent);
+  pi.on("session_compact", () => {
+    clearNativeCompactMarkers();
+    state.reset();
+  });
+  pi.on("session_compact_failed", clearNativeCompactMarkers);
   pi.on("session_tree", () => {
     nativeFallbackInFlight = false;
     state.reset();
