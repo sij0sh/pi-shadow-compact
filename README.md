@@ -234,8 +234,9 @@ Shadow supplies a verified summary only when its coverage includes everything Pi
 Manual `/compact` prepares a fresh checkpoint when cached coverage does not reach Pi's cut.
 Automatic threshold and overflow compactions fall back to Pi's native summarizer when coverage is insufficient.
 A checkpoint that would recommit the same summary and tail also falls back to native compaction.
-`/compact-native` and emergency fallbacks always bypass Shadow for that compaction.
-`manualCompactMode: "native"` makes every manual request native.
+Emergency fallbacks bypass the cached checkpoint and run Pi's original summarization method first.
+`manualCompactMode: "native"` does the same for every manual request.
+`/compact-native` remains a pure-Pi escape without Shadow recovery.
 
 ### What the UI reports
 
@@ -272,6 +273,32 @@ Examples:
 * an emergency context threshold provides a last-resort native-compaction path
 
 A failed optimization should leave you with Pi's normal behavior rather than a corrupted working state.
+
+### Token-cap recovery
+
+When an ordinary native fallback hits its output cap, Shadow allows one "compress and complete" recovery.
+It does not repeat the original native request or install partial prose.
+The recovery builder receives only the sanitized visible draft as an explicitly incomplete writing aid.
+It reads the original frozen session history and can fetch the previous checkpoint to recover omitted essentials.
+An independent verifier checks the replacement against its own history reads before installation.
+Both agents must inspect all required history and cover everything Pi will discard.
+
+Recovery uses the configured Shadow builder and verifier models.
+Its per-response allowance cannot exceed the failed native request, `summaryMaxTokens`, or either model's advertised output limit.
+Its rendered prose target uses half that token allowance with Shadow's existing four-characters-per-token estimate.
+The character target is a concision rule, not an exact token count.
+Recovery uses `low` summary-only reasoning without changing the acting session's thinking level.
+Oversized submissions receive the existing bounded validation corrections rather than being sliced.
+The existing builder/verifier tool-round limits still apply.
+A second token cap, provider failure, failed verification, cancellation, or incompatible evidence change cancels compaction.
+The previous finalized context and any valid serving checkpoint remain intact.
+Pi's existing overflow omissions remain intact if they were already appended before the attempt.
+
+Wrapped native summaries are recorded as extension-supplied compactions (`fromHook: true`), even when no recovery was needed.
+File lists and successful recovery usage include the preceding native work.
+Observe-only mode, `/compact-native`, invalid Shadow configuration, and virtual acting models retain Pi's unwrapped behavior.
+No installed Pi package or live settings file is patched.
+Recovery has offline real-Pi regression coverage but has not been tested against every remote gateway.
 
 ## Persistence and resume
 
@@ -445,7 +472,7 @@ Default:
 `"shadow"` serves manual `/compact` with a verified checkpoint when it safely reduces context at Pi's cut.
 It prepares fresh when cached coverage is insufficient.
 It falls back to native compaction on failure or no reduction.
-`"native"` always uses Pi's native summarizer on manual request.
+`"native"` uses Pi's original summarizer first, with one evidence-backed token-cap recovery.
 Either way, `/compact-native` runs one purely native compaction.
 
 ### `summaryMaxTokens`
