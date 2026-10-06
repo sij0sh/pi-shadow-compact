@@ -1,3 +1,4 @@
+import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { buildSessionProjection, type ContextEvent, type SessionEntry } from "@earendil-works/pi-coding-agent";
@@ -160,6 +161,53 @@ describe("Pi compaction interoperability", () => {
       await f.emit("turn_end");
       assert.ok(f.registry.calls > 1, "an aborted preparation must not leave the refresh gate latched after native failure");
       await waitFor(() => f.notifications.some((message) => message.includes("checkpoint ready")));
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it("includes the incomplete draft and both recovery agents in compaction usage", async () => {
+    const f = await fixture(CONFIG);
+    try {
+      const stream = f.registry.streamSimple.bind(f.registry);
+      let nativeCalls = 0;
+      f.registry.streamSimple = (model, context, options) => {
+        if (context.tools?.length) return stream(model, context, options);
+        nativeCalls++;
+        return { result: async () => ({ ...fauxAssistantMessage("partial draft", { stopReason: "length" }), usage: { ...USAGE, output: 11 } }) } as ReturnType<typeof stream>;
+      };
+      const event = f.compactEvent({ reason: "threshold" });
+      event.preparation.messagesToSummarize = f.branch.flatMap((entry) => entry.type === "message" ? [entry.message] : []);
+      event.preparation.settings.reserveTokens = 1000;
+      const result = await f.emit("session_before_compact", event);
+      assert.equal(nativeCalls, 1);
+      assert.equal(f.registry.calls, 4);
+      assert.equal(result.compaction.usage.output, 39, "11 draft output tokens plus four seven-token agent rounds");
+      assert.equal(result.compaction.firstKeptEntryId, "e4");
+      assert.match(result.compaction.summary, /Continuation Checkpoint/);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it("stands down quietly when the session is replaced during native draft recovery", async () => {
+    const f = await fixture(CONFIG);
+    try {
+      const stream = f.registry.streamSimple.bind(f.registry);
+      f.registry.streamSimple = (model, context, options) => context.tools?.length
+        ? stream(model, context, options)
+        : { result: async () => fauxAssistantMessage("partial", { stopReason: "length" }) } as ReturnType<typeof stream>;
+      const event = f.compactEvent({ reason: "threshold" });
+      event.preparation.messagesToSummarize = f.branch.flatMap((entry) => entry.type === "message" ? [entry.message] : []);
+      event.preparation.settings.reserveTokens = 1000;
+      f.gate();
+      const attempt = f.emit("session_before_compact", event);
+      await waitFor(() => f.registry.calls === 1);
+      f.setStale();
+      f.release();
+      assert.deepEqual(await attempt, { cancel: true });
+      assert.deepEqual(f.notifications, []);
+      assert.equal(f.compactCalls.length, 0);
     } finally {
       await f.cleanup();
     }

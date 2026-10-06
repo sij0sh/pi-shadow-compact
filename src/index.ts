@@ -8,6 +8,7 @@ import {
   type ExtensionAPI,
   type ExtensionContext,
   type SessionBeforeCompactEvent,
+  type SessionBeforeCompactResult,
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import {
@@ -40,6 +41,7 @@ import {
   toPreparedResult,
   type PersistedShadowCheckpoint,
 } from "./persist.js";
+import { compactWithRecovery } from "./native-compaction.js";
 import { sanitizeForContext } from "./normalize.js";
 import { fileDetails } from "./prepare.js";
 import { SessionHistoryIndex } from "./session-reader.js";
@@ -1084,26 +1086,45 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     return swapSummaryIntoContext(ctx, event, config);
   });
 
+  const nativeCompaction = async (
+    ctx: ExtensionContext, event: SessionBeforeCompactEvent, config: ShadowCompactConfig | undefined,
+  ): Promise<SessionBeforeCompactResult | undefined> => {
+    if (!config) return undefined;
+    try {
+      const compaction = await compactWithRecovery(ctx, event, config);
+      return compaction ? { compaction } : undefined;
+    } catch (error) {
+      // Hook exceptions are otherwise reported and ignored by Pi, which would
+      // repeat the original native request. Cancel explicitly after failure.
+      if (!event.signal.aborted && !isContextStale(ctx)) reportError(ctx, error);
+      return { cancel: true };
+    }
+  };
+
   pi.on("session_before_compact", async (event: SessionBeforeCompactEvent, ctx) => {
     if (isObserveMode()) return;
-    // /compact-native escape: this one compaction runs purely natively.
+    // /compact-native remains a pure-Pi escape. Ordinary emergency fallback
+    // bypasses the cached checkpoint, but can recover a token-limited draft.
     if (forceNativeOnce) {
       forceNativeOnce = false;
-      return;
+      if (!nativeFallbackInFlight) return;
+      const config = await configFor(ctx).catch(() => undefined);
+      return nativeCompaction(ctx, event, config);
     }
     const config = await configFor(ctx).catch(() => undefined);
-    // Native manual mode preserves the legacy contract: a manual compaction
-    // invalidates the cached checkpoint and Pi compacts on its own.
+    // Native mode uses Pi's original method first. Keep the old checkpoint
+    // until success; abort only the preparation that compaction would moot.
     if (event.reason === "manual" && config && config.manualCompactMode === "native") {
-      state.reset();
-      return;
+      state.abortPreparing();
+      return nativeCompaction(ctx, event, config);
     }
     const recentTurns = config?.recentTurns ?? DEFAULT_RECENT_TURNS;
     const messagesBefore = workingMessagesBeforeCompaction(ctx, recentTurns);
     const published = state.published;
     if (published && resultIsCurrent(ctx, published)) {
       if (coversCompactionPrefix(ctx, published, event.preparation.firstKeptEntryId)) {
-        return serveCompaction(ctx, event, published, messagesBefore);
+        const served = serveCompaction(ctx, event, published, messagesBefore);
+        return served ?? nativeCompaction(ctx, event, config);
       }
       traceEvent("compaction_fallback", { reason: "uncovered-prefix", firstKeptEntryId: event.preparation.firstKeptEntryId, coverageEnd: published.coverage?.coverageEndEntryId ?? null });
     }
@@ -1151,15 +1172,16 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       }
       const fresh = state.published;
       if (fresh && resultIsCurrent(ctx, fresh)) {
-        return serveCompaction(ctx, event, fresh, messagesBefore);
+        const served = serveCompaction(ctx, event, fresh, messagesBefore);
+        return served ?? nativeCompaction(ctx, event, config);
       }
-      return;
+      return nativeCompaction(ctx, event, config);
     }
 
     // A native compaction moots the preparation, but keep a valid serving
     // checkpoint until success: failure does not change compaction ancestry.
     state.abortPreparing();
-    return;
+    return nativeCompaction(ctx, event, config);
   });
 
   // Every successful compaction changes ancestry, regardless of its source.

@@ -11,6 +11,8 @@ import {
   getCurrentTools,
   InMemoryCredentialStore,
   Type,
+  fauxThinking,
+  type ModelsSimpleStreamOptions,
   type AssistantMessage,
   type TranscriptContext,
 } from "@earendil-works/pi-ai";
@@ -48,9 +50,14 @@ async function integrationFixture(extraExtensions: ExtensionFactory[] = [], conf
     modelsPath: null,
     refreshOnCreate: false,
   });
-  const provider = fauxProvider({ provider: "shadow-integration", models: [{ id: "model", contextWindow: 200_000, maxTokens: 8192 }] });
+  const provider = fauxProvider({ provider: "shadow-integration", models: [{ id: "model", contextWindow: 200_000, maxTokens: 8192, reasoning: true }] });
   modelRuntime.registerNativeProvider(provider.provider);
   const registry = new FakeRegistry();
+  const checkpointReplies: AssistantMessage[] = [];
+  const checkpointRequests: TranscriptContext[] = [];
+  const nativeReplies: AssistantMessage[] = [];
+  const nativeRequests: TranscriptContext[] = [];
+  const nativeOptions: Array<ModelsSimpleStreamOptions | undefined> = [];
   const actingReplies: AssistantMessage[] = [];
   const actingRequests: TranscriptContext[] = [];
   const actingGates: Promise<void>[] = [];
@@ -61,14 +68,17 @@ async function integrationFixture(extraExtensions: ExtensionFactory[] = [], conf
   provider.setResponses(Array.from({ length: 100 }, () => async (context, options, _state, model) => {
     const tools = getCurrentTools(context.messages);
     if (tools.some((tool) => tool.name === "submit_checkpoint" || tool.name === "submit_verdict")) {
-      return registry.complete(model, {
+      checkpointRequests.push(context);
+      return checkpointReplies.shift() ?? registry.complete(model, {
         messages: context.messages.filter((message) => message.role !== "system"),
         tools,
       }, options);
     }
     if (tools.length === 0) {
       nativeCalls++;
-      return fauxAssistantMessage("Native continuation summary for newly summarized history.");
+      nativeRequests.push(context);
+      nativeOptions.push(options);
+      return nativeReplies.shift() ?? fauxAssistantMessage("Native continuation summary for newly summarized history.");
     }
     actingRequests.push(context);
     if (actingGates.length) await actingGates.shift();
@@ -111,7 +121,7 @@ async function integrationFixture(extraExtensions: ExtensionFactory[] = [], conf
   assert.deepEqual(extensionsResult.errors, []);
   await session.bindExtensions({ onError: (error) => errors.push(error.error) });
   return {
-    session, manager, provider, settingsManager, registry, actingReplies, actingRequests, actingGates, errors,
+    session, manager, provider, settingsManager, registry, checkpointReplies, checkpointRequests, nativeReplies, nativeRequests, nativeOptions, actingReplies, actingRequests, actingGates, errors,
     get nativeCalls() { return nativeCalls; },
     async cleanup() {
       session.dispose();
@@ -132,6 +142,234 @@ const assertPromptAndTools = (messages: TranscriptContext["messages"]) => {
 };
 
 describe("Pi 1.0.4 integration", () => {
+  it("compresses an incomplete native draft against original evidence and verifies before committing", async () => {
+    const f = await integrationFixture([], { manualCompactMode: "native" });
+    try {
+      await f.session.prompt("establish prompt and tool baseline");
+      f.nativeReplies.push(fauxAssistantMessage("Partial draft: preserve the migration goal", { stopReason: "length" }));
+      const result = await f.session.compact("Preserve migration state");
+      assert.equal(f.nativeCalls, 1, "do not regenerate the original native request");
+      assert.equal(f.registry.calls, 4, "one compression builder followed by independent verification");
+      assert.ok(f.registry.prompts.some((prompt) => prompt.includes("Partial draft: preserve the migration goal")));
+      assert.ok(f.registry.prompts.every((prompt) => prompt.includes("Preserve migration state")));
+      assert.match(result.summary, /Continuation Checkpoint/);
+      assert.ok(!result.summary.includes("Partial draft:"));
+      const compaction = f.manager.getLeafEntry() as CompactionEntry;
+      assert.equal(compaction.fromHook, true);
+      assert.ok(compaction.systemMessage);
+      assert.ok(result.usage!.output > 0, "include usage for the draft and recovery agents");
+      assert.deepEqual(f.errors, []);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it("recovers a capped split-turn prefix using the original cut and sanitized visible draft", async () => {
+    const f = await integrationFixture([], { manualCompactMode: "native" });
+    try {
+      const secret = "sk-" + "s".repeat(40);
+      f.session.setThinkingLevel("high");
+      f.manager.appendMessage({ role: "user", content: "Current migration constraint: preserve pending queue", timestamp: Date.now() });
+      f.manager.appendMessage(fauxAssistantMessage("pending migration details ".repeat(1000)));
+      f.manager.appendMessage(fauxAssistantMessage("recent reply ".repeat(1000)));
+      f.nativeReplies.push(
+        fauxAssistantMessage("Complete earlier history"),
+        fauxAssistantMessage([
+          { type: "text", text: `Partial prefix draft: preserve queue. api_key=${secret}` },
+          fauxThinking("PRIVATE REASONING MUST NOT BE FORWARDED"),
+          fauxToolCall("submit_checkpoint", { partial: "PARTIAL CALL MUST NOT EXECUTE" }),
+        ], { stopReason: "length" }),
+      );
+      const result = await f.session.compact();
+      assert.equal(f.nativeCalls, 2, "history completes once; prefix cap selects one recovery");
+      assert.equal(f.nativeOptions[0]?.maxTokens, 800);
+      assert.equal(f.nativeOptions[1]?.maxTokens, 500);
+      assert.equal(f.nativeOptions[1]?.reasoning, "high");
+      assert.match(f.registry.prompts[0]!, /Partial prefix draft/);
+      const recoveryTranscript = JSON.stringify(f.checkpointRequests);
+      assert.ok(!recoveryTranscript.includes(secret));
+      assert.ok(!recoveryTranscript.includes("PRIVATE REASONING"));
+      assert.ok(!recoveryTranscript.includes("PARTIAL CALL MUST"));
+      assert.match(recoveryTranscript, /preserve pending queue/);
+      assert.ok(f.registry.optionsList.every((options) => options?.maxTokens === 500 && options.reasoning === "low"));
+      assert.equal(f.session.thinkingLevel, "high", "summary-only reasoning does not change acting settings");
+      assert.ok(result.summary.length <= 1000, "shorter prose target leaves output headroom");
+      assert.ok(f.manager.getBranch().some((entry) => entry.id === result.firstKeptEntryId));
+      assert.deepEqual(f.errors, []);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it("recovers a native threshold cap and resumes the acting request with smaller context", async () => {
+    const f = await integrationFixture();
+    try {
+      const rawId = f.manager.appendMessage({ role: "user", content: "uncovered historical work ".repeat(40_000), timestamp: Date.now() });
+      f.manager.appendMessage(fauxAssistantMessage("recent completed round ".repeat(500)));
+      const tokensBefore = estimatedConversationTokens(f.manager);
+      f.settingsManager.setCompactionEnabled(true);
+      f.nativeReplies.push(fauxAssistantMessage("incomplete threshold draft", { stopReason: "length" }));
+      await f.session.prompt("continue after threshold recovery");
+      assert.equal(f.nativeCalls, 1);
+      assert.ok(f.registry.calls >= 4);
+      const compaction = f.manager.getBranch().find((entry) => entry.type === "compaction") as CompactionEntry;
+      assert.match(compaction.summary, /Continuation Checkpoint/);
+      assert.ok(estimatedConversationTokens(f.manager) < tokensBefore / 2);
+      assert.ok(f.manager.getBranch().some((entry) => entry.id === rawId));
+      assert.match(JSON.stringify(f.actingRequests.at(-1)), /continue after threshold recovery/);
+      assert.deepEqual(f.errors, []);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it("keeps cumulative file lists and previous context across wrapped native compactions", async () => {
+    const f = await integrationFixture([], { manualCompactMode: "native" });
+    try {
+      const first = f.manager.getBranch().find((entry) => entry.type === "message")!.id;
+      f.manager.appendCompaction("Previous constraint: wire format must stay unchanged", first, 0, {
+        readFiles: ["src/protocol.ts"], modifiedFiles: ["src/client.ts"],
+      }, true);
+      f.manager.appendMessage({ role: "user", content: "continue the migration", timestamp: Date.now() });
+      const ordinary = await f.session.compact();
+      assert.deepEqual(ordinary.details, { readFiles: ["src/protocol.ts"], modifiedFiles: ["src/client.ts"] });
+      f.manager.appendMessage({ role: "user", content: "new migration findings ".repeat(2000), timestamp: Date.now() });
+      f.manager.appendMessage(fauxAssistantMessage("current migration state ".repeat(2000)));
+      f.nativeReplies.push(fauxAssistantMessage("incomplete current draft", { stopReason: "length" }));
+      const recovered = await f.session.compact();
+      assert.deepEqual(recovered.details, ordinary.details);
+      assert.match(JSON.stringify(f.checkpointRequests), /Native continuation summary/);
+      assert.equal(f.nativeCalls, 2);
+      assert.deepEqual(f.errors, []);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it("rejects a concise draft that does not cover the discarded prefix", async () => {
+    const f = await integrationFixture([], { manualCompactMode: "native" });
+    try {
+      const leaf = f.manager.getLeafId();
+      const projection = f.manager.buildSessionProjection();
+      f.nativeReplies.push(fauxAssistantMessage("partial", { stopReason: "length" }));
+      const original = f.registry.complete.bind(f.registry);
+      const insufficientCoverage = f.manager.getBranch().find((entry) => entry.type === "message")!.id;
+      f.registry.complete = async (model, context, options) => {
+        const response = await original(model, context, options);
+        const submission = response.content.find((block) => block.type === "toolCall" && block.name === "submit_checkpoint");
+        if (submission?.type === "toolCall") submission.arguments.coverageEndEntryId = insufficientCoverage;
+        return response;
+      };
+      await assert.rejects(f.session.compact(), /Compaction cancelled/);
+      assert.equal(f.nativeCalls, 1);
+      assert.equal(f.manager.getLeafId(), leaf);
+      assert.deepEqual(f.manager.buildSessionProjection(), projection);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it("preserves context when the evidence changes during recovery", async () => {
+    const f = await integrationFixture([], { manualCompactMode: "native" });
+    let release!: () => void;
+    try {
+      f.nativeReplies.push(fauxAssistantMessage("partial", { stopReason: "length" }));
+      f.registry.pendingGates.push(new Promise<void>((resolve) => { release = resolve; }));
+      const rejected = assert.rejects(f.session.compact(), /Compaction cancelled/);
+      await waitFor(() => f.registry.calls === 1);
+      const target = f.manager.getBranch().find((entry) => entry.type === "message")!.id;
+      f.manager.appendContextEdit(target, null);
+      const leaf = f.manager.getLeafId();
+      const projection = f.manager.buildSessionProjection();
+      release();
+      await rejected;
+      assert.equal(f.nativeCalls, 1);
+      assert.equal(f.manager.getLeafId(), leaf);
+      assert.deepEqual(f.manager.buildSessionProjection(), projection);
+      assert.ok(!f.manager.getBranch().some((entry) => entry.type === "compaction"));
+    } finally {
+      release?.();
+      await f.cleanup();
+    }
+  });
+
+  for (const stage of ["builder", "verifier"] as const) {
+    it(`rejects truncated recovery ${stage} output without repeating native generation or changing context`, async () => {
+      const f = await integrationFixture([], { manualCompactMode: "native" });
+      try {
+        const leaf = f.manager.getLeafId();
+        const projection = f.manager.buildSessionProjection();
+        f.nativeReplies.push(fauxAssistantMessage("Incomplete original draft", { stopReason: "length" }));
+        if (stage === "builder") {
+          f.checkpointReplies.push(fauxAssistantMessage("Incomplete rewrite", { stopReason: "length" }));
+        } else {
+          // Inject a token-limited verdict after the normal builder completes.
+          const original = f.registry.complete.bind(f.registry);
+          f.registry.complete = async (model, context, options) => {
+            if (context.tools?.some((tool) => tool.name === "submit_verdict")) {
+              return fauxAssistantMessage([fauxToolCall("submit_verdict", { verdict: "accept" })], { stopReason: "length" });
+            }
+            return original(model, context, options);
+          };
+        }
+        await assert.rejects(f.session.compact(), /Compaction cancelled/);
+        assert.equal(f.nativeCalls, 1, "no repeat of the cap-limited native request");
+        assert.equal(f.manager.getLeafId(), leaf);
+        assert.deepEqual(f.manager.buildSessionProjection(), projection);
+        assert.equal(f.checkpointRequests.length, stage === "builder" ? 1 : 3);
+        assert.deepEqual(f.errors, [], "failure is handled, not an ignored hook exception");
+      } finally {
+        await f.cleanup();
+      }
+    });
+  }
+
+  it("cancels recovery while reading evidence and leaves finalized context unchanged", async () => {
+    const f = await integrationFixture([], { manualCompactMode: "native" });
+    let release!: () => void;
+    try {
+      const leaf = f.manager.getLeafId();
+      const projection = f.manager.buildSessionProjection();
+      f.nativeReplies.push(fauxAssistantMessage("partial", { stopReason: "length" }));
+      f.registry.pendingGates.push(new Promise<void>((resolve) => { release = resolve; }));
+      const rejected = assert.rejects(f.session.compact(), /Compaction cancelled/);
+      await waitFor(() => f.registry.calls === 1);
+      f.session.abortCompaction();
+      release();
+      await rejected;
+      assert.equal(f.nativeCalls, 1);
+      assert.equal(f.manager.getLeafId(), leaf);
+      assert.deepEqual(f.manager.buildSessionProjection(), projection);
+      assert.equal(f.checkpointRequests.length, 1);
+    } finally {
+      release?.();
+      await f.cleanup();
+    }
+  });
+
+  it("does not run compression for provider errors or for the pure-Pi escape", async () => {
+    const f = await integrationFixture([], { manualCompactMode: "native" });
+    try {
+      const leaf = f.manager.getLeafId();
+      f.nativeReplies.push(fauxAssistantMessage("", { stopReason: "error", errorMessage: "invalid request" }));
+      await assert.rejects(f.session.compact(), /Compaction cancelled/);
+      assert.equal(f.checkpointRequests.length, 0);
+      assert.equal(f.nativeCalls, 1);
+      assert.equal(f.manager.getLeafId(), leaf);
+      f.nativeReplies.push(fauxAssistantMessage("partial escape", { stopReason: "length" }));
+      let finished = false;
+      const unsubscribe = f.session.subscribe((event) => { if (event.type === "compaction_end") finished = true; });
+      await f.session.prompt("/compact-native");
+      await waitFor(() => finished);
+      unsubscribe();
+      assert.equal(f.nativeCalls, 2);
+      assert.equal(f.checkpointRequests.length, 0);
+      assert.equal(f.manager.getLeafId(), leaf);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
   it("continues tools and steering during command generation, then installs before the next request", async () => {
     const f = await integrationFixture();
     let releaseSummary!: () => void;
@@ -316,7 +554,7 @@ describe("Pi 1.0.4 integration", () => {
       );
       await f.session.prompt("execute probe, then continue");
       const compaction = f.manager.getBranch().reverse().find((entry) => entry.type === "compaction") as CompactionEntry;
-      assert.equal(compaction.fromHook, false, "uncovered cached history must use Pi's native summary");
+      assert.equal(compaction.fromHook, true, "Shadow wraps Pi's native summary for cap recovery");
       assert.ok(f.nativeCalls >= 1, "Pi can summarize history and a split-turn prefix separately");
       assert.equal(f.registry.calls, baselineCalls, "automatic compaction must not block on a fresh background audit");
       assert.ok(estimatedConversationTokens(f.manager) < tokensBefore / 2);

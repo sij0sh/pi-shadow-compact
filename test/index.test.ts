@@ -273,14 +273,14 @@ describe("shadowCompact extension orchestration", () => {
     }
   });
 
-  it("manual compaction in native mode resets and returns undefined", async () => {
-    const f = await fixture({ ...SWAP_CONFIG, manualCompactMode: "native" });
+  it("manual compaction in native mode keeps the valid checkpoint until success", async () => {
+    const f = await fixtureWithHistory({ ...SWAP_CONFIG, manualCompactMode: "native" });
     try {
       await startPreparation(f);
       const outcome = await f.emit("session_before_compact", f.compactEvent({ reason: "manual" }));
       assert.equal(outcome, undefined);
       const swapped = await f.emit("context", { messages: f.contextMessages() });
-      assert.equal(swapped, undefined);
+      assert.ok(swapped, "native failure must not preemptively discard a valid checkpoint");
     } finally {
       await f.cleanup();
     }
