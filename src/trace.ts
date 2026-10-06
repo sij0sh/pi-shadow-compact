@@ -37,7 +37,13 @@ export type TraceEventType =
   | "native_fallback"
   | "compaction_served"
   | "compaction_fallback"
-  | "summary_recovery";
+  | "summary_recovery"
+  | "compaction_route"
+  | "compaction_outcome"
+  | "summary_call";
+
+/** Change when the deployed compaction routing contract changes. */
+export const COMPACTION_CAPABILITY = "bounded-recovery-v2";
 
 export function isStderrTraceEnabled(): boolean {
   // Local read: trace stays dependency-free so telemetry never pulls in
