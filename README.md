@@ -93,6 +93,10 @@ This makes the full session **readable rather than merely truncated**.
 
 A checkpoint states exactly how far its evidence grounding extends (its coverage boundary).
 The working context keeps every uncovered message and at least the last `recentTurns` response/tool rounds verbatim.
+It also freezes five completed rounds before the trigger round, the trigger round, and every later message.
+Five is minimum overlap, not a cap.
+For a trigger at round 60 and publication at round 75, rounds 55-75 remain verbatim.
+Entry IDs and active-branch order prove coverage; generation timestamps do not.
 A round contains one assistant response and its tool results, including parallel results.
 New user input stays with its following response.
 This does not retain ten entire spans between user prompts, which can contain hundreds of tool rounds.
@@ -202,13 +206,30 @@ Shadow begins preparing a checkpoint before the context window becomes critical.
 Three thresholds plus an idle rule (defaults):
 
 * **prepare (60%)** — checkpoint construction begins without interrupting the active agent run.
-* **swap (80%)** — a ready checkpoint becomes the mandatory working context on the next request. A preparation in flight is never aborted here: it is the path to a smaller working set.
+* **swap (80%)** — a compatibility/telemetry threshold, not a readiness gate. A ready checkpoint serves the next safe request even below this threshold.
 * **emergency native fallback (92%)** — near the provider limit, one native compaction is queued at the next safe idle point.
 * **idle** — when the agent settles with at least `idleCompact.minimumTokens` (default 20,000) and the branch moved past the checkpoint's coverage, Shadow prepares a fresh checkpoint so `/compact` and reloads start from current state.
 
 Once a verified checkpoint is ready, future model requests use it in place of the older conversation prefix plus the no-gap continuity tail.
 
-Real compactions use Pi's prepared cut and its `compaction.keepRecentTokens` budget, including per-model overrides.
+Use `/shadow-compact [instructions]` to request background preparation without aborting acting work or waiting for generation.
+Optional instructions guide only the private builder and verifier; they do not enter the acting conversation or count as evidence.
+A duplicate command keeps the current attempt and its instructions unchanged.
+Run the command again after completion to deliberately refresh without waiting for another threshold crossing.
+
+A ready checkpoint can install into canonical context at the next `turn_end` or `agent_before_settle` boundary.
+Installation uses Pi's entry drafts and the same frozen, gap-free tail.
+It requests no extra assistant response and never calls manual compaction to force installation.
+Completion while entirely idle persists extension state and waits for the next request/boundary.
+Raw session evidence remains stored in either case.
+
+A request already sent to a provider cannot change retroactively.
+Pi can check its canonical threshold before the request-local context hook.
+A late checkpoint may therefore not prevent native compaction.
+Built-in `/compact`, RPC `compact`, `/compact-native`, and true overflow recovery remain explicit blocking exceptions.
+Pi's built-in manual compaction aborts active work before the extension hook runs.
+
+Explicit manual and native threshold/overflow compactions use Pi's prepared cut and its `compaction.keepRecentTokens` budget, including per-model overrides.
 Shadow supplies a verified summary only when its coverage includes everything Pi will discard and the result reduces the working context already in use.
 Manual `/compact` prepares a fresh checkpoint when cached coverage does not reach Pi's cut.
 Automatic threshold and overflow compactions fall back to Pi's native summarizer when coverage is insufficient.
@@ -218,7 +239,7 @@ A checkpoint that would recommit the same summary and tail also falls back to na
 
 ### What the UI reports
 
-Checkpoint preparation creates extension state, not a Pi compaction entry.
+Checkpoint preparation alone creates extension state, not a Pi compaction entry.
 The ready notice means future requests can use that checkpoint.
 It does not mean Pi has already reduced its canonical session context.
 
@@ -226,6 +247,8 @@ Pi's "compacted from X tokens" notice reports the pre-compaction size.
 The raw transcript remains visible and stored after compaction.
 Pi temporarily reports unknown context usage until the first post-compaction response.
 Use that response's usage to confirm the new working size.
+The preparing notice means inference runs in background.
+The installed notice means a committed Pi compaction was observed, not merely proposed or stored as extension state.
 A successful native or Shadow compaction invalidates the previous request-local checkpoint.
 A failed compaction leaves a still-valid checkpoint available.
 
@@ -243,7 +266,9 @@ Examples:
 * verification failure prevents publication
 * stale checkpoints are not restored onto incompatible branches
 * checkpoints are invalidated when their underlying compaction ancestry no longer matches
-* failed background preparation falls back to native Pi behavior
+* failed replacement keeps the previous valid checkpoint serving
+* failed preparation with no checkpoint queues native Pi fallback
+* provider failures report bounded, sanitized model and builder/verifier details
 * an emergency context threshold provides a last-resort native-compaction path
 
 A failed optimization should leave you with Pi's normal behavior rather than a corrupted working state.
@@ -368,7 +393,9 @@ Default:
 80
 ```
 
-At this usage a ready checkpoint becomes the mandatory working context on the next request. Preparations in flight are never aborted here.
+Accepted for compatibility and activation telemetry.
+It never delays a ready checkpoint.
+Preparations in flight are never aborted here.
 
 ### `nativeFallbackThresholdPercent`
 
@@ -402,7 +429,8 @@ Default:
 
 Minimum recent response/tool rounds retained verbatim past a request-local checkpoint.
 One round contains an assistant response and its tool results, not an entire user-message span.
-The continuity tail also retains every message after the evidence boundary.
+The continuity tail also retains every message after the evidence boundary and the fixed trigger-time overlap.
+Safe-boundary installations use this same tail.
 A partially covered round stays intact.
 Real `/compact` and automatic compactions use Pi's `compaction.keepRecentTokens` instead of this minimum.
 
