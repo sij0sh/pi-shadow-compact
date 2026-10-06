@@ -1,7 +1,6 @@
-import type { ContextEvent, SessionEntry } from "@earendil-works/pi-coding-agent";
+import { buildSessionProjection, type ContextEvent, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { CheckpointCoverage } from "./checkpoint.js";
 import { contextSwapDropCount, hasOrphanedToolResult } from "./swap.js";
-import { segmentTurns } from "./turns.js";
 
 /**
  * Working context builder (refactor §3, Phase 2).
@@ -38,7 +37,7 @@ export interface WorkingContextInput {
 export interface SwapPlan {
   /** Checkpoint's guaranteed evidence boundary. */
   summaryCoverageEnd: string;
-  /** First complete turn after the coverage boundary. */
+  /** First complete model round containing any uncovered conversation. */
   coverageTailStart: string;
   /** First turn among the last-X-turns minimum. */
   recentTailStart: string;
@@ -84,7 +83,7 @@ export function planSwap(
   coverageTailOverride?: string,
 ): SwapPlan | undefined {
   if (branch.length === 0) return undefined;
-  const turns = segmentTurns(branch);
+  const turns = continuityTurns(branch);
   if (turns.length === 0) return undefined;
 
   // Empty coverageEnd means "covers nothing yet": the tail starts at the
@@ -101,7 +100,7 @@ export function planSwap(
     coverageTailStart = coverageTailOverride;
   } else {
     coverageTailStart = (
-      turns.find((turn) => (entryIndex.get(turn.startEntryId) ?? -1) > coverageIdx)
+      turns.find((turn) => (entryIndex.get(turn.endEntryId) ?? -1) > coverageIdx)
       ?? turns[turns.length - 1]!
     ).startEntryId;
   }
@@ -167,17 +166,44 @@ export function buildWorkingContext(
   };
 }
 
+/**
+ * Pi turns are assistant responses with their tool results, not whole spans
+ * between user prompts. Keep the history reader's user-anchored groups for
+ * evidence inspection, but count projected model rounds for the live tail.
+ * New input joins its following assistant response; parallel results stay
+ * with their call. Omitted attempts and prompt/state entries do not count.
+ */
+function continuityTurns(branch: SessionEntry[]): Array<{ startEntryId: string; endEntryId: string }> {
+  const turns: Array<{ startEntryId: string; endEntryId: string }> = [];
+  let hasAssistant = false;
+  for (const entry of buildSessionProjection(branch).entries) {
+    const messages = entry.messages.filter((message) => message.role !== "system" && message.role !== "compactionSummary");
+    if (messages.length === 0) continue;
+    const assistant = messages.some((message) => message.role === "assistant");
+    const input = messages.some((message) => message.role !== "assistant" && message.role !== "toolResult");
+    if (turns.length === 0 || input || (assistant && hasAssistant)) {
+      turns.push({ startEntryId: entry.sourceEntry.id, endEntryId: entry.sourceEntry.id });
+      hasAssistant = false;
+    } else {
+      turns[turns.length - 1]!.endEntryId = entry.sourceEntry.id;
+    }
+    if (assistant) hasAssistant = true;
+  }
+  return turns;
+}
+
 function assertNoGap(branch: SessionEntry[], plan: SwapPlan): boolean {
   const entryIndex = new Map(branch.map((entry, index) => [entry.id, index]));
   const coverageIdx = plan.summaryCoverageEnd === "" ? -1 : (entryIndex.get(plan.summaryCoverageEnd) ?? -2);
   if (coverageIdx < -1) return false;
   const swapIdx = entryIndex.get(plan.swapStartEntryId) ?? -2;
   if (swapIdx < 0) return false;
-  for (const turn of segmentTurns(branch)) {
-    const startIdx = entryIndex.get(turn.startEntryId) ?? -1;
-    // A turn starting after the coverage boundary but before the tail start
-    // would be represented by neither the summary nor the tail.
-    if (startIdx > coverageIdx && startIdx < swapIdx) return false;
-  }
-  return true;
+  // Check entries, not just turn starts: a partly covered round can contain
+  // uncovered tool outputs even when its assistant call is already covered.
+  return buildSessionProjection(branch).entries.every((entry) => {
+    const index = entryIndex.get(entry.sourceEntry.id) ?? -1;
+    return index <= coverageIdx || index >= swapIdx || entry.messages.every(
+      (message) => message.role === "system" || message.role === "compactionSummary",
+    );
+  });
 }
