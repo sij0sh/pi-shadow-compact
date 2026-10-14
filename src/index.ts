@@ -46,6 +46,7 @@ import {
 import { compactWithRecovery } from "./native-compaction.js";
 import { sanitizeForContext } from "./normalize.js";
 import { fileDetails, hasCompactableHistory } from "./prepare.js";
+import { registerActingRequestObserver } from "./request-trace.js";
 import { SessionHistoryIndex } from "./session-reader.js";
 import { ShadowCompactStateController, type PreparedResult } from "./state.js";
 import {
@@ -92,6 +93,7 @@ function isContextStale(ctx: ExtensionContext): boolean {
 }
 
 export default function shadowCompact(pi: ExtensionAPI): void {
+  registerActingRequestObserver(pi);
   const state = new ShadowCompactStateController();
   let configPromise: Promise<ShadowCompactConfig> | undefined;
   let reportedError: string | undefined;
