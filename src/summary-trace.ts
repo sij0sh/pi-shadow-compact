@@ -8,21 +8,44 @@ export interface SummaryCallTrace {
   round: number;
 }
 
-function record(value: unknown): Record<string, unknown> {
+export function record(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" ? value as Record<string, unknown> : {};
 }
 
-function numeric(value: unknown): number | null {
+export function numeric(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
 }
 
-function label(value: unknown, allowed: readonly string[]): string | null {
+export function label(value: unknown, allowed: readonly string[]): string | null {
   return typeof value === "string" ? (allowed.includes(value) ? value : "other") : null;
 }
 
-const REASONING = ["off", "none", "minimal", "low", "medium", "high", "xhigh", "max"];
-const STATUS = ["completed", "incomplete", "failed", "cancelled", "in_progress", "queued"];
-const REASONS = ["max_output_tokens", "content_filter"];
+export const REASONING = ["off", "none", "minimal", "low", "medium", "high", "xhigh", "max"];
+export const STATUS = ["completed", "incomplete", "failed", "cancelled", "in_progress", "queued"];
+export const REASONS = ["max_output_tokens", "content_filter"];
+
+export const TERMINAL_EVENTS = ["response.completed", "response.incomplete", "response.failed", "response.cancelled"];
+export const OUTCOMES = ["stop", "toolUse", "length", "error", "aborted"];
+
+/** Output allowance and reasoning effort from a provider payload; nothing else is read. */
+export function payloadBudget(payload: unknown): { payloadMaxTokens: number | null; payloadReasoning: string | null } {
+  const body = record(payload);
+  return {
+    payloadMaxTokens: numeric(body.max_output_tokens ?? body.max_completion_tokens ?? body.max_tokens ?? record(body.generationConfig).maxOutputTokens),
+    payloadReasoning: label(record(body.reasoning).effort ?? body.reasoning_effort, REASONING),
+  };
+}
+
+/** Terminal status and incomplete reason from a provider stream event, or null for other events. */
+export function terminalStatus(event: unknown): { providerStatus: string | null; providerReason: string | null } | null {
+  const data = record(event);
+  if (!TERMINAL_EVENTS.includes(typeof data.type === "string" ? data.type : "")) return null;
+  const response = record(data.response);
+  return {
+    providerStatus: label(response.status, STATUS),
+    providerReason: label(record(response.incomplete_details).reason, REASONS),
+  };
+}
 
 /** Observe named safe fields only. Never retain raw payloads, events or errors. */
 export async function completeWithSummaryTrace(
@@ -46,9 +69,7 @@ export async function completeWithSummaryTrace(
     ...options,
     onPayload: async (payload, requestModel) => {
       const replacement = await options.onPayload?.(payload, requestModel);
-      const body = record(replacement === undefined ? payload : replacement);
-      fields.payloadMaxTokens = numeric(body.max_output_tokens ?? body.max_completion_tokens ?? body.max_tokens ?? record(body.generationConfig).maxOutputTokens);
-      fields.payloadReasoning = label(record(body.reasoning).effort ?? body.reasoning_effort, REASONING);
+      Object.assign(fields, payloadBudget(replacement === undefined ? payload : replacement));
       return replacement;
     },
     onResponse: async (response, requestModel) => {
@@ -56,12 +77,8 @@ export async function completeWithSummaryTrace(
       await options.onResponse?.(response, requestModel);
     },
     onProviderStreamEvent: async (event, requestModel) => {
-      const data = record(event);
-      if (["response.completed", "response.incomplete", "response.failed", "response.cancelled"].includes(typeof data.type === "string" ? data.type : "")) {
-        const response = record(data.response);
-        fields.providerStatus = label(response.status, STATUS);
-        fields.providerReason = label(record(response.incomplete_details).reason, REASONS);
-      }
+      const status = terminalStatus(event);
+      if (status) Object.assign(fields, status);
       await options.onProviderStreamEvent?.(event, requestModel);
     },
   };
@@ -70,7 +87,7 @@ export async function completeWithSummaryTrace(
     traceEvent("summary_call", {
       ...fields,
       providerReasoning: label(response.providerThinkingLevel, REASONING),
-      outcome: label(response.stopReason, ["stop", "toolUse", "length", "error", "aborted"]),
+      outcome: label(response.stopReason, OUTCOMES),
       inputTokens: numeric(response.usage.input), outputTokens: numeric(response.usage.output),
       reasoningTokens: numeric(response.usage.reasoning), cacheReadTokens: numeric(response.usage.cacheRead),
       cacheWriteTokens: numeric(response.usage.cacheWrite), totalTokens: numeric(response.usage.totalTokens),

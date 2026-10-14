@@ -40,7 +40,9 @@ export type TraceEventType =
   | "summary_recovery"
   | "compaction_route"
   | "compaction_outcome"
-  | "summary_call";
+  | "summary_call"
+  | "private_context_bounded"
+  | "acting_request";
 
 /** Change when the deployed compaction routing contract changes. */
 export const COMPACTION_CAPABILITY = "bounded-recovery-v2";
