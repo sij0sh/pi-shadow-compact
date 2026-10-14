@@ -85,6 +85,8 @@ E0018  user         "Do not change the wire format..."
 E0019  diff         "src/transport.ts ..."
 ```
 
+Reads are paged by size as well as count. A page holds at most a quarter of the private transcript budget (half the summarizer's context window), between 48k and 200k serialized characters. An oversized turn is served in entry pages with a `nextEntryOffset` continuation, and only served entries count as inspected. Once the accumulated private transcript exceeds its budget, the oldest earlier read results are replaced with an explicit stub that names their evidence IDs, so the agent can re-read exact text rather than silently losing it.
+
 Before submitting, the agent must have inspected the first turn, every user-correction and error turn, and everything since the previous checkpoint's coverage boundary. The submit call itself is validated: unknown coverage, uninspected ranges, and uncited evidence IDs are rejected with an error the agent can fix.
 
 This makes the full session **readable rather than merely truncated**.
@@ -334,6 +336,14 @@ These new records never include draft text, tool submissions, payloads, headers,
 Existing lifecycle events retain their bounded, sanitized error reporting.
 An observed request allowance does not establish a gateway's hidden effective limit.
 Pure-Pi requests are route-observable but are not instrumented by Shadow.
+
+`acting_request` records each acting-model request.
+It reports the provider and model IDs, context window, Pi's canonical context estimate, the final transformed context estimate, a usage-trusting estimate that mirrors the provider adapter, the retained assistant usage it relies on, whether a later context edit or compaction invalidated that usage in Pi's own accounting, the requested and payload output allowances, whether the payload was clamped, the provider termination labels, token usage, visible text size, and tool-call count.
+A large gap between the canonical and usage-trusting estimates after an edit indicates that the adapter can budget almost no output while Pi reports less context pressure.
+`private_context_bounded` records when a builder or verifier transcript elides earlier read results to stay within budget.
+
+Without tracing, a `length` stop whose payload allowance fell below the model's allowance raises a warning that the turn is unfinished and that compaction is the remedy.
+Shadow does not retry the acting response; Pi's own recovery path keeps that role.
 
 ## Persistence and resume
 
