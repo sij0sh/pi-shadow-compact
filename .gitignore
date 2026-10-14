@@ -1,5 +1,4 @@
 .agents/
-.pi/shadow-compact.json
 node_modules/
 dist/
 .pi-files/

@@ -1,0 +1,12 @@
+{
+  "softCompactThresholdPercent": 60,
+  "summarizerModel": {
+    "provider": "azure-gateway-responses",
+    "id": "gpt-6.1-sol"
+  },
+  "verificationModel": {
+    "provider": "azure-gateway-responses",
+    "id": "gpt-6.1-sol"
+  },
+  "verificationThinkingLevel": "max"
+}
