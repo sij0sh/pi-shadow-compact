@@ -6,3 +6,4 @@ dist/
 experiments/
 analysis/
 AGENTS.md
+.trace/
