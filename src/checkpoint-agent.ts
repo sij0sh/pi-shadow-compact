@@ -8,14 +8,17 @@ import {
   type ModelThinkingLevel,
   type Tool,
   type ToolCall,
+  type ToolResultMessage,
   type Usage,
 } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { completeWithSummaryTrace, type SummaryCallTrace } from "./summary-trace.js";
+import { traceEvent } from "./trace.js";
 import { sanitizeForContext, tokensToChars } from "./normalize.js";
 import type { CheckpointCoverage } from "./checkpoint.js";
 import type { ShadowCompactConfig } from "./config.js";
 import {
+  DEFAULT_MAX_PAGE_CHARS,
   PREVIOUS_CHECKPOINT_EVIDENCE_ID,
   SessionHistoryIndex,
 } from "./session-reader.js";
@@ -44,6 +47,9 @@ export const CHECKPOINT_BUILDER_MAX_ROUNDS = 40;
 export const CHECKPOINT_VERIFIER_MAX_ROUNDS = 20;
 const MAX_SUBMIT_ATTEMPTS = 3;
 const DEFAULT_SUMMARY_CHARS = 16_000;
+/** Share of the private model's context window its accumulated transcript may fill. */
+const PRIVATE_TRANSCRIPT_SHARE = 0.5;
+const MAX_READ_PAGE_CHARS = 200_000;
 
 /** A prose budget, not a tokenizer or a provider generation limit. */
 export function checkpointSummaryTarget(model: Model<Api>, maxTokens?: number): number {
@@ -51,6 +57,50 @@ export function checkpointSummaryTarget(model: Model<Api>, maxTokens?: number): 
   return Number.isFinite(allowance)
     ? Math.min(DEFAULT_SUMMARY_CHARS, tokensToChars(Math.floor(allowance / 2)))
     : DEFAULT_SUMMARY_CHARS;
+}
+
+/**
+ * Character budget for one private builder/verifier transcript. Paging bounds
+ * each read; this bounds what accumulates across rounds.
+ */
+export function privateTranscriptBudgetChars(model: Model<Api>): number {
+  return model.contextWindow > 0
+    ? tokensToChars(Math.floor(model.contextWindow * PRIVATE_TRANSCRIPT_SHARE))
+    : Infinity;
+}
+
+/** One read page: a quarter of the transcript budget, within fixed bounds, never above the budget. */
+export function readPageChars(model: Model<Api>): number {
+  const budget = privateTranscriptBudgetChars(model);
+  return Math.min(budget, MAX_READ_PAGE_CHARS, Math.max(DEFAULT_MAX_PAGE_CHARS, Math.floor(budget / 4)));
+}
+
+const EVIDENCE_ID = /"evidenceId":"(E\d{4,})"/g;
+
+/**
+ * Replaces a read result with an explicit stub. Its entries stay inspected
+ * (they were served), and the stub names them so the agent can re-read
+ * exact text instead of silently losing it.
+ */
+function elideReadResult(message: ToolResultMessage): void {
+  const text = message.content.map((block) => (block.type === "text" ? block.text : "")).join("");
+  const ids = [...text.matchAll(EVIDENCE_ID)].map((match) => match[1]!);
+  message.content = [{
+    type: "text",
+    text: JSON.stringify({
+      elided: true,
+      note: "Earlier read result removed to bound private context. Its entries remain inspected; re-read them if you need exact text.",
+      evidenceIds: ids.length > 0 ? { first: ids[0], last: ids.at(-1), count: ids.length } : null,
+    }),
+  }];
+}
+
+function messageChars(message: Message): number {
+  try {
+    return JSON.stringify(message).length;
+  } catch {
+    return 0;
+  }
 }
 
 type ToolParameters = Tool["parameters"];
@@ -64,7 +114,7 @@ const READ_TOOLS: Tool[] = [
   },
   {
     name: "read_session_entries",
-    description: "Read raw session entries by branch position. Use for precise evidence reads.",
+    description: "Read raw session entries by branch position. Use for precise evidence reads. Large pages stop early; continue from nextStart.",
     parameters: params({
       type: "object",
       properties: {
@@ -77,7 +127,7 @@ const READ_TOOLS: Tool[] = [
   },
   {
     name: "read_turn_range",
-    description: "Read complete turns by 1-based turn number. Prefer this for covering ranges efficiently.",
+    description: "Read complete turns by 1-based turn number. Prefer this for covering ranges efficiently. Large pages stop early: continue from nextTurn, and finish a partial turn (nextEntryOffset) with read_session_turn.",
     parameters: params({
       type: "object",
       properties: {
@@ -90,10 +140,13 @@ const READ_TOOLS: Tool[] = [
   },
   {
     name: "read_session_turn",
-    description: "Read one complete turn by turn id (e.g. turn-12).",
+    description: "Read one turn by turn id (e.g. turn-12). Large turns are paged: repeat with entryOffset set to nextEntryOffset until it is absent.",
     parameters: params({
       type: "object",
-      properties: { turnId: { type: "string", description: "Turn id from the manifest" } },
+      properties: {
+        turnId: { type: "string", description: "Turn id from the manifest" },
+        entryOffset: { type: "integer", description: "Turn-relative entry to start at (default 0)" },
+      },
       required: ["turnId"],
       additionalProperties: false,
     }),
@@ -191,6 +244,7 @@ export class UnusableCheckpointError extends Error {
 
 interface RunState {
   index: SessionHistoryIndex;
+  pageChars: number;
   servedRefs: Set<string>;
   submitAttempts: number;
   readCalls: number;
@@ -218,7 +272,7 @@ function executeReadTool(state: RunState, name: string, args: Record<string, unk
       const start = asInteger(args.start);
       const count = asInteger(args.count);
       if (start === undefined || count === undefined) throw new Error("read_session_entries needs integer start and count");
-      const result = index.readEntries(start, count);
+      const result = index.readEntries(start, count, state.pageChars);
       for (const entry of result.entries) state.servedRefs.add(entry.evidenceId);
       state.readCalls++;
       return result;
@@ -227,7 +281,7 @@ function executeReadTool(state: RunState, name: string, args: Record<string, unk
       const startTurn = asInteger(args.startTurn);
       const count = asInteger(args.count);
       if (startTurn === undefined || count === undefined) throw new Error("read_turn_range needs integer startTurn and count");
-      const result = index.readTurnRange(startTurn, count);
+      const result = index.readTurnRange(startTurn, count, state.pageChars);
       for (const turn of result.turns) {
         for (const entry of turn.entries) state.servedRefs.add(entry.evidenceId);
       }
@@ -236,7 +290,9 @@ function executeReadTool(state: RunState, name: string, args: Record<string, unk
     }
     case "read_session_turn": {
       if (typeof args.turnId !== "string" || !args.turnId) throw new Error("read_session_turn needs a turnId");
-      const result = index.readTurn(args.turnId);
+      const entryOffset = args.entryOffset === undefined ? 0 : asInteger(args.entryOffset);
+      if (entryOffset === undefined) throw new Error("read_session_turn entryOffset must be an integer");
+      const result = index.readTurn(args.turnId, entryOffset, state.pageChars);
       for (const entry of result.entries) state.servedRefs.add(entry.evidenceId);
       state.readCalls++;
       return result;
@@ -448,6 +504,9 @@ async function runToolLoop(options: ToolLoopOptions): Promise<ToolLoopResult> {
   };
   messages.push({ role: "user", content: [{ type: "text", text: options.prompt }], timestamp: Date.now() });
   let textOnlyRetries = 0;
+  const budget = privateTranscriptBudgetChars(options.model);
+  // Read results eligible for elision, oldest first.
+  const readResults: ToolResultMessage[] = [];
 
   for (let round = 0; round < options.maxRounds; round++) {
     options.signal?.throwIfAborted();
@@ -479,6 +538,7 @@ async function runToolLoop(options: ToolLoopOptions): Promise<ToolLoopResult> {
       continue;
     }
     let finished = false;
+    const roundReads: ToolResultMessage[] = [];
     for (const call of toolCalls) {
       const args = isRecord(call.arguments) ? call.arguments : {};
       const outcome = await options.execute(call.name, args);
@@ -496,17 +556,37 @@ async function runToolLoop(options: ToolLoopOptions): Promise<ToolLoopResult> {
         break;
       }
       const isError = "error" in outcome;
-      messages.push({
+      const result: ToolResultMessage = {
         role: "toolResult",
         toolCallId: call.id,
         toolName: call.name,
         content: [{ type: "text", text: isError ? outcome.error : outcome.text }],
         isError,
         timestamp: Date.now(),
-      });
+      };
+      messages.push(result);
+      if (!isError) roundReads.push(result);
     }
     if (finished) {
       return { usage: sumUsage(usages), toolRounds: round + 1 };
+    }
+    // Keep this round's reads visible; elide the oldest earlier reads until
+    // the transcript fits its budget again.
+    let chars = messages.reduce((total, message) => total + messageChars(message), 0);
+    let elided = 0;
+    while (chars > budget && readResults.length > 0) {
+      const oldest = readResults.shift()!;
+      const before = messageChars(oldest);
+      elideReadResult(oldest);
+      chars -= before - messageChars(oldest);
+      elided++;
+    }
+    readResults.push(...roundReads);
+    if (elided > 0) {
+      traceEvent("private_context_bounded", {
+        ...options.trace, round: round + 1, elidedResults: elided,
+        transcriptChars: chars, budgetChars: budget, overBudget: chars > budget,
+      });
     }
   }
   throw new Error(`${options.responseLabel} exceeded ${options.maxRounds} tool rounds`);
@@ -527,7 +607,7 @@ export async function runCheckpointBuilderAgent(
     complete: (completedModel, context, options) => ctx.modelRegistry.streamSimple(completedModel, context, options).result(),
   };
   const target = request.targetSummaryChars ?? checkpointSummaryTarget(model, request.maxTokens ?? config.summaryMaxTokens);
-  const state: RunState = { index, servedRefs: new Set(), submitAttempts: 0, readCalls: 0 };
+  const state: RunState = { index, pageChars: readPageChars(model), servedRefs: new Set(), submitAttempts: 0, readCalls: 0 };
   let accepted: { checkpoint: Checkpoint; coverageEndEntryId: string } | undefined;
 
   const { usage, toolRounds } = await runToolLoop({
@@ -595,7 +675,7 @@ export async function runCheckpointVerifierAgent(
     complete: (completedModel, context, options) => ctx.modelRegistry.streamSimple(completedModel, context, options).result(),
   };
   const target = request.targetSummaryChars ?? checkpointSummaryTarget(model, request.maxTokens ?? config.summaryMaxTokens);
-  const state: RunState = { index, servedRefs: new Set(), submitAttempts: 0, readCalls: 0 };
+  const state: RunState = { index, pageChars: readPageChars(model), servedRefs: new Set(), submitAttempts: 0, readCalls: 0 };
   let accepted: { checkpoint: Checkpoint; coverageEndEntryId: string; verdict: "accept" | "repair" } | undefined;
 
   const { usage, toolRounds } = await runToolLoop({

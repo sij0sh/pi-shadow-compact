@@ -56,6 +56,12 @@ export interface ServedTurn {
   index: number;
   startEntryId: string;
   endEntryId: string;
+  /** Entries in the whole turn; a partial page serves fewer. */
+  entryCount: number;
+  /** Turn-relative position of the first served entry, when not 0. */
+  entryOffset?: number;
+  /** Turn-relative position to continue from when the page stopped early. */
+  nextEntryOffset?: number;
   entries: ServedEntry[];
 }
 
@@ -73,11 +79,15 @@ export interface SessionHistoryIndexOptions {
   previousCheckpointSummary?: string;
   maxPreviewChars?: number;
   maxManifestTurns?: number;
+  /** Default serialized-character budget for one read page; readers may pass their own. */
+  maxPageChars?: number;
 }
 
 const DEFAULT_MAX_PREVIEW_CHARS = 120;
 const DEFAULT_MAX_MANIFEST_TURNS = 120;
 const MAX_ENTRY_TEXT_CHARS = 4000;
+/** ~12k tokens: one page stays small next to any private model's context window. */
+export const DEFAULT_MAX_PAGE_CHARS = 48_000;
 const MAX_SEARCH_HITS = 10;
 const CORRECTION_SIGNALS =
   /\b(no\b|wrong|incorrect|instead|actually|not that|fix\b|should\b|must\b|never\b|always\b|don't\b|do not\b|require[sd]?|prefer|prohibit)/i;
@@ -94,6 +104,10 @@ function contentText(content: unknown): string {
     .join("\n");
 }
 
+function servedSize(entries: ServedEntry[]): number {
+  return entries.reduce((total, entry) => total + JSON.stringify(entry).length + 1, 0);
+}
+
 export class SessionHistoryIndex {
   readonly turns: SessionTurn[];
   readonly entryIndex = new Map<string, number>();
@@ -103,6 +117,7 @@ export class SessionHistoryIndex {
   readonly #previousCheckpointSummary: string | undefined;
   readonly #maxPreviewChars: number;
   readonly #maxManifestTurns: number;
+  readonly #maxPageChars: number;
   readonly #inspectedEntryIds = new Set<string>();
   readonly #texts: string[];
 
@@ -113,6 +128,7 @@ export class SessionHistoryIndex {
     this.#previousCheckpointSummary = options.previousCheckpointSummary;
     this.#maxPreviewChars = options.maxPreviewChars ?? DEFAULT_MAX_PREVIEW_CHARS;
     this.#maxManifestTurns = options.maxManifestTurns ?? DEFAULT_MAX_MANIFEST_TURNS;
+    this.#maxPageChars = Math.max(1, options.maxPageChars ?? DEFAULT_MAX_PAGE_CHARS);
     this.turns = segmentTurns(options.branch);
     options.branch.forEach((entry, index) => this.entryIndex.set(entry.id, index));
     this.#texts = options.branch.map((entry) => this.describeEntry(entry).text);
@@ -199,74 +215,115 @@ export class SessionHistoryIndex {
     for (const id of entryIds) this.#inspectedEntryIds.add(id);
   }
 
+  /**
+   * Reads entries by branch position. The page stops early once its serialized
+   * size reaches the page budget; `nextStart` then names where to continue.
+   */
   readEntries(
     start: number,
     count: number,
-  ): { start: number; end: number; totalEntries: number; entries: ServedEntry[] } {
+    maxChars = this.#maxPageChars,
+  ): { start: number; end: number; totalEntries: number; entries: ServedEntry[]; nextStart?: number } {
     const totalEntries = this.#branch.length;
     const clampedStart = Math.max(0, Math.min(start, totalEntries));
     const clampedCount = Math.max(1, Math.min(count, 50));
-    const end = Math.min(totalEntries, clampedStart + clampedCount);
-    const entries: ServedEntry[] = [];
-    const inspected: string[] = [];
-    for (let index = clampedStart; index < end; index++) {
-      const entry = this.#branch[index]!;
-      entries.push({
-        evidenceId: evidenceIdForEntryIndex(index),
-        entryId: entry.id,
-        kind: this.describeEntry(entry).kind,
-        text: this.#texts[index]!,
-      });
-      inspected.push(entry.id);
-    }
-    this.markInspected(inspected);
-    return { start: clampedStart, end, totalEntries, entries };
+    const requestedEnd = Math.min(totalEntries, clampedStart + clampedCount);
+    const indices: number[] = [];
+    for (let index = clampedStart; index < requestedEnd; index++) indices.push(index);
+    const entries = this.page(indices, maxChars);
+    this.markInspected(entries.map((entry) => entry.entryId));
+    const end = clampedStart + entries.length;
+    return { start: clampedStart, end, totalEntries, entries, ...(end < requestedEnd ? { nextStart: end } : {}) };
   }
 
+  /**
+   * Reads whole turns until the page budget is spent. A first turn larger than
+   * the budget is served partially with `nextEntryOffset`; continue it with
+   * read_session_turn. `nextTurn` names the first requested turn not served.
+   */
   readTurnRange(
     startTurn: number,
     count: number,
-  ): { startTurn: number; endTurn: number; totalTurns: number; turns: ServedTurn[] } {
+    maxChars = this.#maxPageChars,
+  ): { startTurn: number; endTurn: number; totalTurns: number; turns: ServedTurn[]; nextTurn?: number } {
     const totalTurns = this.turns.length;
     const clampedStart = Math.max(1, Math.min(startTurn, Math.max(1, totalTurns)));
     const clampedCount = Math.max(1, Math.min(count, 25));
-    const endTurn = Math.min(totalTurns, clampedStart + clampedCount - 1);
+    const requestedEnd = Math.min(totalTurns, clampedStart + clampedCount - 1);
     const turns: ServedTurn[] = [];
-    for (let number = clampedStart; number <= endTurn; number++) {
+    let remaining = maxChars;
+    for (let number = clampedStart; number <= requestedEnd; number++) {
       const turn = this.turns[number - 1]!;
-      const entries = turn.entryIds.map((id) => {
-        const index = this.entryIndex.get(id) ?? 0;
-        return {
-          evidenceId: evidenceIdForEntryIndex(index),
-          entryId: id,
-          kind: this.describeEntry(this.#branch[index]!).kind,
-          text: this.#texts[index]!,
-        };
-      });
-      this.markInspected(turn.entryIds);
-      turns.push({ turnId: turn.id, index: turn.index, startEntryId: turn.startEntryId, endEntryId: turn.endEntryId, entries });
+      const indices = turn.entryIds.map((id) => this.entryIndex.get(id) ?? 0);
+      const entries = this.page(indices, remaining, turns.length === 0);
+      if (entries.length === 0) break;
+      remaining -= servedSize(entries);
+      this.markInspected(entries.map((entry) => entry.entryId));
+      turns.push(this.servedTurn(turn, entries, 0));
+      if (entries.length < turn.entryIds.length) break;
     }
-    return { startTurn: clampedStart, endTurn, totalTurns, turns };
+    const endTurn = clampedStart + turns.length - 1;
+    return {
+      startTurn: clampedStart,
+      endTurn,
+      totalTurns,
+      turns,
+      ...(endTurn < requestedEnd ? { nextTurn: endTurn + 1 } : {}),
+    };
   }
 
-  readTurn(turnId: string): ServedTurn {
+  /** Reads one turn from `entryOffset`, paged by the same budget as the other readers. */
+  readTurn(turnId: string, entryOffset = 0, maxChars = this.#maxPageChars): ServedTurn {
     const turn = this.turns.find((candidate) => candidate.id === turnId);
     if (!turn) throw new Error(`Unknown turn: ${turnId}`);
-    this.markInspected(turn.entryIds);
+    const offset = Math.max(0, Math.min(Math.floor(entryOffset), Math.max(0, turn.entryIds.length - 1)));
+    const indices = turn.entryIds.slice(offset).map((id) => this.entryIndex.get(id) ?? 0);
+    const entries = this.page(indices, maxChars);
+    this.markInspected(entries.map((entry) => entry.entryId));
+    return this.servedTurn(turn, entries, offset);
+  }
+
+  private servedTurn(turn: SessionTurn, entries: ServedEntry[], offset: number): ServedTurn {
+    const next = offset + entries.length;
     return {
       turnId: turn.id,
       index: turn.index,
       startEntryId: turn.startEntryId,
       endEntryId: turn.endEntryId,
-      entries: turn.entryIds.map((id) => {
-        const index = this.entryIndex.get(id) ?? 0;
-        return {
-          evidenceId: evidenceIdForEntryIndex(index),
-          entryId: id,
-          kind: this.describeEntry(this.#branch[index]!).kind,
-          text: this.#texts[index]!,
-        };
-      }),
+      entryCount: turn.entryIds.length,
+      ...(offset > 0 ? { entryOffset: offset } : {}),
+      ...(next < turn.entryIds.length ? { nextEntryOffset: next } : {}),
+      entries,
+    };
+  }
+
+  /**
+   * Serves branch positions in order until `budget` serialized characters are
+   * used. A page always serves at least one entry unless `partial` is false,
+   * in which case it serves all of `indices` or nothing. Does not mark inspection.
+   */
+  private page(indices: number[], budget: number, partial = true): ServedEntry[] {
+    const entries: ServedEntry[] = [];
+    let used = 0;
+    for (const index of indices) {
+      const entry = this.servedEntry(index);
+      const size = servedSize([entry]);
+      if (used + size > budget && (entries.length > 0 || !partial)) {
+        return partial ? entries : [];
+      }
+      entries.push(entry);
+      used += size;
+    }
+    return entries;
+  }
+
+  private servedEntry(index: number): ServedEntry {
+    const entry = this.#branch[index]!;
+    return {
+      evidenceId: evidenceIdForEntryIndex(index),
+      entryId: entry.id,
+      kind: this.describeEntry(entry).kind,
+      text: this.#texts[index]!,
     };
   }
 

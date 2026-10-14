@@ -446,3 +446,29 @@ describe("runCheckpointVerifierAgent", () => {
     );
   });
 });
+
+describe("private transcript bounds", () => {
+  it("elides older read results explicitly once the transcript exceeds its budget", async () => {
+    const small = { ...model, contextWindow: 10_000 } as Model<Api>;
+    const branch: SessionEntry[] = [];
+    for (let i = 1; i <= 6; i++) branch.push(userEntry(`e${i}`, i > 1 ? `e${i - 1}` : null, `task ${i} `.repeat(500)));
+    const fake = scripted((context) => {
+      const reads = toolNames(context).filter((name) => name === "read_session_entries").length;
+      if (reads < 3) {
+        return toolResponse([{ id: `r${reads}`, name: "read_session_entries", args: { start: reads * 2, count: 2 } }]);
+      }
+      return toolResponse([{ id: "submit", name: "submit_checkpoint", args: { checkpoint: checkpointPayload(), coverageEndEntryId: "e6" } }]);
+    });
+    const outcome = await runCheckpointBuilderAgent(ctx, new SessionHistoryIndex({ branch, cwd: "/repo" }), config, { completion: fake.completion, model: small });
+    assert.equal(outcome.coverageEndEntryId, "e6");
+    const last = fake.calls.at(-1)!;
+    const results = last.messages.filter((message) => message.role === "toolResult")
+      .map((message) => (message as { content: Array<{ text: string }> }).content[0]!.text);
+    const elided = results.filter((text) => text.includes('"elided":true'));
+    assert.ok(elided.length >= 1);
+    assert.deepEqual(JSON.parse(elided[0]!).evidenceIds, { first: "E0001", last: "E0002", count: 2 });
+    assert.ok(!results.at(-1)!.includes('"elided":true'), "the latest read stays visible");
+    const transcript = last.messages.reduce((total, message) => total + JSON.stringify(message).length, 0);
+    assert.ok(transcript <= 20_000, `transcript ${transcript} exceeds budget`);
+  });
+});
