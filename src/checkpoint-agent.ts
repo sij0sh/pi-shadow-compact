@@ -171,13 +171,75 @@ const READ_TOOLS: Tool[] = [
   },
 ];
 
+const CHECKPOINT_ITEM_SCHEMA = {
+  type: "object",
+  properties: {
+    text: { type: "string", description: "One checkpoint fact in plain prose" },
+    evidenceRefs: {
+      type: "array",
+      items: { type: "string" },
+      description: "Evidence ids served by the read tools, e.g. E0001",
+    },
+  },
+  required: ["text", "evidenceRefs"],
+  additionalProperties: false,
+};
+
+const VERIFICATION_ITEM_SCHEMA = {
+  type: "object",
+  properties: {
+    text: { type: "string", description: "One verified or unverified fact" },
+    status: { type: "string", enum: ["verified", "unverified"] },
+    evidenceRefs: {
+      type: "array",
+      items: { type: "string" },
+      description: "Evidence ids served by the read tools, e.g. E0001",
+    },
+  },
+  required: ["text", "status", "evidenceRefs"],
+  additionalProperties: false,
+};
+
+const CONTINUATION_STATE_SCHEMA = {
+  type: "object",
+  properties: {
+    currentGoal: { type: "string" },
+    currentApproach: { type: "string" },
+    immediateNextStep: { type: "string" },
+  },
+  required: ["currentGoal", "currentApproach", "immediateNextStep"],
+  additionalProperties: false,
+};
+
+const CHECKPOINT_SCHEMA = {
+  type: "object",
+  description:
+    "Complete structured checkpoint. Every item in every list section must be an object {text, evidenceRefs}, never a bare string.",
+  properties: {
+    objective: { type: "array", items: CHECKPOINT_ITEM_SCHEMA },
+    constraints: { type: "array", items: CHECKPOINT_ITEM_SCHEMA },
+    completedWork: { type: "array", items: CHECKPOINT_ITEM_SCHEMA },
+    currentState: { type: "array", items: CHECKPOINT_ITEM_SCHEMA },
+    decisions: { type: "array", items: CHECKPOINT_ITEM_SCHEMA },
+    openIssues: { type: "array", items: CHECKPOINT_ITEM_SCHEMA },
+    nextActions: { type: "array", items: CHECKPOINT_ITEM_SCHEMA },
+    criticalContext: { type: "array", items: CHECKPOINT_ITEM_SCHEMA },
+    modifiedFiles: { type: "array", items: CHECKPOINT_ITEM_SCHEMA },
+    referencedFiles: { type: "array", items: CHECKPOINT_ITEM_SCHEMA },
+    verificationState: { type: "array", items: VERIFICATION_ITEM_SCHEMA },
+    continuationState: CONTINUATION_STATE_SCHEMA,
+  },
+  required: ["objective", "continuationState"],
+  additionalProperties: false,
+};
+
 const SUBMIT_CHECKPOINT_TOOL: Tool = {
   name: "submit_checkpoint",
   description: "Submit the finished checkpoint. Validates coverage, inspection requirements, and schema; returns errors to fix.",
   parameters: params({
     type: "object",
     properties: {
-      checkpoint: { type: "object", description: "Complete structured checkpoint in the schema from the task prompt" },
+      checkpoint: CHECKPOINT_SCHEMA,
       coverageEndEntryId: { type: "string", description: "Last session entry id the checkpoint represents" },
     },
     required: ["checkpoint", "coverageEndEntryId"],
@@ -191,8 +253,8 @@ const SUBMIT_VERDICT_TOOL: Tool = {
   parameters: params({
     type: "object",
     properties: {
-      verdict: { type: "string", description: "accept, repair, or unusable" },
-      checkpoint: { type: "object", description: "Complete corrected checkpoint (required for repair)" },
+      verdict: { type: "string", enum: ["accept", "repair", "unusable"], description: "accept, repair, or unusable" },
+      checkpoint: { ...CHECKPOINT_SCHEMA, description: "Complete corrected checkpoint (required for repair)" },
       coverageEndEntryId: { type: "string", description: "Coverage boundary (required for repair)" },
       reason: { type: "string", description: "One sentence on what was wrong or confirmed" },
     },
@@ -387,7 +449,9 @@ Rules:
 - Fill continuationState with the current goal, the approach in progress, and the immediate next step.
 - Cite only evidence ids served to you by the read tools (plus E0000 for the previous checkpoint once fetched).
 - Be dense but readable. Call submit_checkpoint once with the complete checkpoint shaped:
-${JSON.stringify({ objective: [{ text: "string", evidenceRefs: ["E0001"] }], constraints: [], completedWork: [], currentState: [], decisions: [], openIssues: [], nextActions: [], criticalContext: [], modifiedFiles: [], referencedFiles: [], verificationState: [{ text: "string", status: "verified", evidenceRefs: ["E0001"] }], continuationState: { currentGoal: "string", currentApproach: "string", immediateNextStep: "string" } })}`;
+${JSON.stringify({ objective: [{ text: "string", evidenceRefs: ["E0001"] }], constraints: [], completedWork: [{ text: "string", evidenceRefs: ["E0001"] }], currentState: [], decisions: [], openIssues: [], nextActions: [], criticalContext: [], modifiedFiles: [], referencedFiles: [], verificationState: [{ text: "string", status: "verified", evidenceRefs: ["E0001"] }], continuationState: { currentGoal: "string", currentApproach: "string", immediateNextStep: "string" } })}
+
+Every item in every list section (objective, completedWork, currentState, and the rest) must be an object shaped { text: "...", evidenceRefs: ["E0001"] }. Never submit a bare string such as completedWork: ["did X"]; resubmit the same entry as { text: "did X", evidenceRefs: ["E0001"] }.`;
 }
 
 function verifierPrompt(index: SessionHistoryIndex, draft: Checkpoint, coverage: CheckpointCoverage): string {
@@ -424,6 +488,7 @@ Repair rules:
 - Preserve exact identifiers continuation depends on: file paths, symbols, commands, flags, versions, URLs, error text, literal values, and API names.
 - Keep verificationState honest: verified only with direct supporting evidence, everything else unverified.
 - Keep continuationState accurate: the true current goal, approach, and immediate next step.
+- Every repaired list item must be an object { text: "...", evidenceRefs: ["E0001"] } (verificationState adds status), never a bare string.
 - Cite only evidence ids served to you by the read tools (plus E0000 for the previous checkpoint once fetched).
 - Distinguish facts from assumptions. Do not invent details. Do not continue the task.
 - Be dense but readable. Call submit_verdict once: accept the draft, repair it with the complete corrected checkpoint, or reject it as unusable (with a reason) when the evidence cannot support a reliable checkpoint at all.`;

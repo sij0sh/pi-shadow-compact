@@ -210,7 +210,10 @@ function parseVerificationItem(
   knownRefs: Set<string>,
 ): VerificationItem {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`Item ${index} in ${VERIFICATION_SECTION} must be an object`);
+    const received = Array.isArray(value) ? "array" : typeof value;
+    throw new Error(
+      `Item ${index} in ${VERIFICATION_SECTION} must be an object like {"text": "...", "status": "verified", "evidenceRefs": ["E0001"]}, got ${received}`,
+    );
   }
   const record = value as Record<string, unknown>;
   for (const key of Object.keys(record)) {
@@ -291,7 +294,10 @@ function parseItem(
   knownRefs: Set<string>,
 ): CheckpointItem {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`Item ${index} in ${section} must be an object`);
+    const received = Array.isArray(value) ? "array" : typeof value;
+    throw new Error(
+      `Item ${index} in ${section} must be an object like {"text": "...", "evidenceRefs": ["E0001"]}, got ${received}: resubmit the same entry as an object, never a bare string`,
+    );
   }
   const record = value as Record<string, unknown>;
   for (const key of Object.keys(record)) {

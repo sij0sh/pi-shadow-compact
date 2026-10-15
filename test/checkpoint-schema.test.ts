@@ -116,6 +116,26 @@ describe("checkpoint schema additions", () => {
     }
   });
 
+  it("rejects bare-string items with an actionable object shape", () => {
+    const base = JSON.parse(legacyJson());
+    assert.throws(
+      () =>
+        validateCheckpointObject(
+          { ...base, completedWork: ["Did the thing"] },
+          REFS,
+        ),
+      /Item 0 in completedWork must be an object like.*got string/,
+    );
+    assert.throws(
+      () =>
+        validateCheckpointObject(
+          { ...base, completedWork: [["Did the thing"]] },
+          REFS,
+        ),
+      /Item 0 in completedWork must be an object like.*got array/,
+    );
+  });
+
   it("still rejects an entirely empty checkpoint", () => {
     const empty: Record<string, unknown> = {
       objective: [{ text: "g", evidenceRefs: ["E0001"] }],

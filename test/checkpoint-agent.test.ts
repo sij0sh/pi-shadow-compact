@@ -197,6 +197,35 @@ describe("runCheckpointBuilderAgent", () => {
     assert.ok(results.some((message) => (message as { isError: boolean }).isError));
   });
 
+  it("recovers after a bare-string completedWork item", async () => {
+    const index = new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" });
+    const bad = checkpointPayload();
+    (bad as Record<string, unknown>).completedWork = ["Did the scaffolding"];
+    const fake = scripted((context) => {
+      const names = toolNames(context);
+      if (!names.includes("read_turn_range")) {
+        return toolResponse([{ id: "c1", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]);
+      }
+      const submits = names.filter((name) => name === "submit_checkpoint").length;
+      if (submits === 0) {
+        return toolResponse([
+          { id: "c2", name: "submit_checkpoint", args: { checkpoint: bad, coverageEndEntryId: "e2" } },
+        ]);
+      }
+      return toolResponse([
+        { id: "c3", name: "submit_checkpoint", args: { checkpoint: checkpointPayload(), coverageEndEntryId: "e2" } },
+      ]);
+    });
+    const outcome = await runCheckpointBuilderAgent(ctx, index, config, { completion: fake.completion, model });
+    assert.equal(outcome.coverageEndEntryId, "e2");
+    const texts = fake.calls.flatMap((call) =>
+      call.messages
+        .filter((message) => message.role === "toolResult")
+        .map((message) => JSON.stringify((message as { content: Array<{ text: string }> }).content)),
+    ).join("\n");
+    assert.match(texts, /must be an object like/);
+  });
+
   it("fails after repeated invalid submits", async () => {
     const index = new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" });
     const fake = scripted((context) => {
