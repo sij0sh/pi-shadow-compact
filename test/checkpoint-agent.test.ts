@@ -329,11 +329,24 @@ describe("runCheckpointBuilderAgent", () => {
     assert.match(JSON.stringify(fake.calls.at(-1)), /Rewrite the complete checkpoint/);
   });
 
-  it("fails closed when ordinary prose remains oversized through bounded corrections", async () => {
+  it("keeps a corrected checkpoint that stays under the hard cap", async () => {
     const fake = scripted((context) => {
       if (!toolNames(context).includes("read_turn_range")) return toolResponse([{ id: "read", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]);
       const payload = checkpointPayload();
       payload.decisions = Array.from({ length: 4 }, () => ({ text: "old decisions ".repeat(400), evidenceRefs: ["E0001"] }));
+      return toolResponse([{ id: "submit", name: "submit_checkpoint", args: { checkpoint: payload, coverageEndEntryId: "e2" } }]);
+    });
+    const result = await runCheckpointBuilderAgent(ctx, new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" }), config, { completion: fake.completion, model });
+    assert.equal(fake.calls.length, 3, "one read, one correction, then keep the near miss");
+    assert.ok(result.summary.length > 16000);
+    assert.ok(result.summary.length <= 32000);
+  });
+
+  it("fails closed when ordinary prose remains oversized through bounded corrections", async () => {
+    const fake = scripted((context) => {
+      if (!toolNames(context).includes("read_turn_range")) return toolResponse([{ id: "read", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]);
+      const payload = checkpointPayload();
+      payload.decisions = Array.from({ length: 6 }, () => ({ text: "old decisions ".repeat(500), evidenceRefs: ["E0001"] }));
       return toolResponse([{ id: "submit", name: "submit_checkpoint", args: { checkpoint: payload, coverageEndEntryId: "e2" } }]);
     });
     await assert.rejects(runCheckpointBuilderAgent(ctx, new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" }), config, { completion: fake.completion, model }), /Rewrite the complete checkpoint/);
@@ -435,11 +448,41 @@ describe("runCheckpointVerifierAgent", () => {
     assert.equal(capped.calls.length, 1, "a recovery cap is terminal even with a parsed submit call");
   });
 
-  it("rejects an oversized ordinary verifier repair instead of installing or slicing it", async () => {
+  it("keeps a corrected repair that stays under the hard cap", async () => {
     const fake = scripted((context) => {
       if (!toolNames(context).includes("read_turn_range")) return toolResponse([{ id: "read", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]);
       const payload = checkpointPayload();
       payload.decisions = Array.from({ length: 4 }, () => ({ text: "old decisions ".repeat(400), evidenceRefs: ["E0001"] }));
+      return toolResponse([{ id: "repair", name: "submit_verdict", args: { verdict: "repair", checkpoint: payload, coverageEndEntryId: "e2" } }]);
+    });
+    const outcome = await runCheckpointVerifierAgent(ctx, new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" }), draft, draftCoverage, config, {
+      completion: fake.completion, model, targetSummaryChars: 16000,
+    });
+    assert.equal(fake.calls.length, 3, "one read, one correction, then keep the near miss");
+    assert.equal(outcome.verdict, "repair");
+    assert.ok(outcome.summary.length > 16000);
+    assert.ok(outcome.summary.length <= 32000);
+  });
+
+  it("accepts an over-soft draft that the builder already corrected", async () => {
+    const oversized = checkpointPayload("Draft goal") as unknown as Checkpoint;
+    oversized.decisions = Array.from({ length: 4 }, () => ({ text: "old decisions ".repeat(400), evidenceRefs: ["E0001"] }));
+    const fake = scripted((context) => toolNames(context).includes("read_turn_range")
+      ? toolResponse([{ id: "accept", name: "submit_verdict", args: { verdict: "accept" } }])
+      : toolResponse([{ id: "read", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]));
+    const outcome = await runCheckpointVerifierAgent(ctx, new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" }), oversized, draftCoverage, config, {
+      completion: fake.completion, model, targetSummaryChars: 16000,
+    });
+    assert.equal(fake.calls.length, 2, "no correction is requested for an accepted draft");
+    assert.equal(outcome.verdict, "accept");
+    assert.ok(outcome.summary.length > 16000);
+  });
+
+  it("rejects an oversized ordinary verifier repair instead of installing or slicing it", async () => {
+    const fake = scripted((context) => {
+      if (!toolNames(context).includes("read_turn_range")) return toolResponse([{ id: "read", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]);
+      const payload = checkpointPayload();
+      payload.decisions = Array.from({ length: 6 }, () => ({ text: "old decisions ".repeat(500), evidenceRefs: ["E0001"] }));
       return toolResponse([{ id: "repair", name: "submit_verdict", args: { verdict: "repair", checkpoint: payload, coverageEndEntryId: "e2" } }]);
     });
     await assert.rejects(runCheckpointVerifierAgent(ctx, new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" }), draft, draftCoverage, config, { completion: fake.completion, model }), /Rewrite the complete checkpoint/);

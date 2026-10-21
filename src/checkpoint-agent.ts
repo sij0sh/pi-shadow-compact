@@ -47,6 +47,8 @@ export const CHECKPOINT_BUILDER_MAX_ROUNDS = 40;
 export const CHECKPOINT_VERIFIER_MAX_ROUNDS = 20;
 const MAX_SUBMIT_ATTEMPTS = 3;
 const DEFAULT_SUMMARY_CHARS = 16_000;
+/** Multiplier over the soft prose target that a corrected rewrite may reach. */
+const HARD_SUMMARY_MULTIPLIER = 2;
 /** Share of the private model's context window its accumulated transcript may fill. */
 const PRIVATE_TRANSCRIPT_SHARE = 0.5;
 const MAX_READ_PAGE_CHARS = 200_000;
@@ -309,6 +311,8 @@ interface RunState {
   pageChars: number;
   servedRefs: Set<string>;
   submitAttempts: number;
+  /** True once an oversized submission was rejected for correction. */
+  sizeCorrected: boolean;
   readCalls: number;
 }
 
@@ -515,10 +519,29 @@ Incomplete draft (JSON string):
 ${JSON.stringify(draft)}` : ""}`;
 }
 
-function requireConciseSummary(checkpoint: Checkpoint, target: number | undefined): void {
-  if (target !== undefined && renderCheckpoint(checkpoint).length > target) {
-    throw new Error(`Rewrite the complete checkpoint within ${target} rendered characters; do not truncate sections`);
+class OversizedCheckpointError extends Error {
+  constructor(target: number, rendered: number) {
+    super(`Rewrite the complete checkpoint within ${target} rendered characters (current: ${rendered}); do not truncate sections`);
+    this.name = "OversizedCheckpointError";
   }
+}
+
+/**
+ * The soft target is the size the agent is told to hit. One oversize
+ * submission is rejected for correction. After that, a rewrite within the
+ * hard target is kept so a small overshoot does not cancel compaction.
+ */
+function requireConciseSummary(
+  checkpoint: Checkpoint,
+  target: number | undefined,
+  hardTarget: number | undefined,
+  corrected: boolean,
+): void {
+  if (target === undefined) return;
+  const rendered = renderCheckpoint(checkpoint).length;
+  if (rendered <= target) return;
+  if (corrected && hardTarget !== undefined && rendered <= hardTarget) return;
+  throw new OversizedCheckpointError(target, rendered);
 }
 
 interface ToolLoopOptions {
@@ -672,7 +695,8 @@ export async function runCheckpointBuilderAgent(
     complete: (completedModel, context, options) => ctx.modelRegistry.streamSimple(completedModel, context, options).result(),
   };
   const target = request.targetSummaryChars ?? checkpointSummaryTarget(model, request.maxTokens ?? config.summaryMaxTokens);
-  const state: RunState = { index, pageChars: readPageChars(model), servedRefs: new Set(), submitAttempts: 0, readCalls: 0 };
+  const hardTarget = target * HARD_SUMMARY_MULTIPLIER;
+  const state: RunState = { index, pageChars: readPageChars(model), servedRefs: new Set(), submitAttempts: 0, sizeCorrected: false, readCalls: 0 };
   let accepted: { checkpoint: Checkpoint; coverageEndEntryId: string } | undefined;
 
   const { usage, toolRounds } = await runToolLoop({
@@ -698,11 +722,12 @@ export async function runCheckpointBuilderAgent(
           const { entryId } = validateCoverage(index, args.coverageEndEntryId);
           const checkpoint = validateCheckpointObject(args.checkpoint, state.servedRefs);
           requireContinuation(checkpoint);
-          requireConciseSummary(checkpoint, target);
+          requireConciseSummary(checkpoint, target, hardTarget, state.sizeCorrected);
           accepted = { checkpoint, coverageEndEntryId: entryId };
           return { done: true };
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
+          if (error instanceof OversizedCheckpointError) state.sizeCorrected = true;
           if (state.submitAttempts >= MAX_SUBMIT_ATTEMPTS) return { fatal: new Error(message) };
           return { done: false, error: `submit_checkpoint rejected: ${message}` };
         }
@@ -740,7 +765,8 @@ export async function runCheckpointVerifierAgent(
     complete: (completedModel, context, options) => ctx.modelRegistry.streamSimple(completedModel, context, options).result(),
   };
   const target = request.targetSummaryChars ?? checkpointSummaryTarget(model, request.maxTokens ?? config.summaryMaxTokens);
-  const state: RunState = { index, pageChars: readPageChars(model), servedRefs: new Set(), submitAttempts: 0, readCalls: 0 };
+  const hardTarget = target * HARD_SUMMARY_MULTIPLIER;
+  const state: RunState = { index, pageChars: readPageChars(model), servedRefs: new Set(), submitAttempts: 0, sizeCorrected: false, readCalls: 0 };
   let accepted: { checkpoint: Checkpoint; coverageEndEntryId: string; verdict: "accept" | "repair" } | undefined;
 
   const { usage, toolRounds } = await runToolLoop({
@@ -775,7 +801,9 @@ export async function runCheckpointVerifierAgent(
               requireCompletion(state);
               validateCoverage(index, draftCoverage.coverageEndEntryId);
             }
-            requireConciseSummary(draft, target);
+            // The builder already required a size correction, so accept the
+            // draft up to the hard target instead of forcing a rewrite.
+            requireConciseSummary(draft, target, hardTarget, true);
             accepted = { checkpoint: draft, coverageEndEntryId: draftCoverage.coverageEndEntryId, verdict: "accept" };
             return { done: true };
           }
@@ -784,7 +812,7 @@ export async function runCheckpointVerifierAgent(
             const { entryId } = validateCoverage(index, args.coverageEndEntryId);
             const checkpoint = validateCheckpointObject(args.checkpoint, state.servedRefs);
             requireContinuation(checkpoint);
-            requireConciseSummary(checkpoint, target);
+            requireConciseSummary(checkpoint, target, hardTarget, state.sizeCorrected);
             accepted = { checkpoint, coverageEndEntryId: entryId, verdict: "repair" };
             return { done: true };
           }
@@ -792,6 +820,7 @@ export async function runCheckpointVerifierAgent(
         } catch (error) {
           if (error instanceof UnusableCheckpointError) return { fatal: error };
           const message = error instanceof Error ? error.message : String(error);
+          if (error instanceof OversizedCheckpointError) state.sizeCorrected = true;
           if (state.submitAttempts >= MAX_SUBMIT_ATTEMPTS) return { fatal: new Error(message) };
           return { done: false, error: `submit_verdict rejected: ${message}` };
         }
