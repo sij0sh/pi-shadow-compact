@@ -7,18 +7,13 @@ import { buildSessionContext, type SessionEntry } from "@earendil-works/pi-codin
 import { MODE_ENV_VAR } from "../src/config.js";
 import {
   CHECKPOINT_CUSTOM_TYPE,
-  CHECKPOINT_CUSTOM_TYPE_LEGACY,
   collectShadowSummaries,
   checkpointStalenessReason,
   findLatestPersistedCheckpoint,
   findLatestRestorableCheckpoint,
   isPersistedShadowCheckpoint,
   SHADOW_CHAIN_LIMIT,
-  toPreparedResult,
   type PersistedShadowCheckpoint,
-  type PersistedShadowCheckpointV1,
-  type PersistedShadowCheckpointV2Legacy,
-  type PersistedShadowCheckpointV3,
 } from "../src/persist.js";
 import { combineUsage } from "../src/summary.js";
 import { SessionHistoryIndex } from "../src/session-reader.js";
@@ -70,7 +65,7 @@ const SWAP_CONFIG = {
   recentTurns: 1,
 };
 
-function structuredFixture(): PersistedShadowCheckpointV3["structured"] {
+function structuredFixture(): PersistedShadowCheckpoint["structured"] {
   return {
     objective: [{ text: "objective", evidenceRefs: ["E0001"] }],
     constraints: [],
@@ -91,50 +86,18 @@ function structuredFixture(): PersistedShadowCheckpointV3["structured"] {
   };
 }
 
-function checkpointDataV3(
-  overrides: Partial<PersistedShadowCheckpointV3> = {},
-): PersistedShadowCheckpointV3 {
-  return {
-    ...checkpointData(),
-    version: 3,
-    structured: structuredFixture(),
-    coverage: {
-      sourceStartEntryId: null,
-      coverageEndEntryId: "e3",
-      preparedAtLeafId: "e4",
-      publishedAtLeafId: "e4",
-    },
-    prompts: { summaryPromptVersion: 2, verifierPromptVersion: 2 },
-    generatedAt: 0,
-    ...overrides,
-  };
-}
-
-function checkpointDataV2Legacy(
-  overrides: Partial<PersistedShadowCheckpointV2Legacy> = {},
-): PersistedShadowCheckpointV2Legacy {
-  return {
-    ...checkpointData(),
-    version: 2,
-    structured: structuredFixture(),
-    coverage: {
-      sourceStartEntryId: null,
-      coverageEndEntryId: "e3",
-      preparedAtLeafId: "e4",
-      publishedAtLeafId: "e4",
-    },
-    prompts: { summaryPromptVersion: 2, verifierPromptVersion: 2, relevancePromptVersion: 1 },
-    historicTurns: [],
-    generatedAt: 0,
-    ...overrides,
-  };
-}
+const COVERAGE = {
+  sourceStartEntryId: null,
+  coverageEndEntryId: "e3",
+  preparedAtLeafId: "e4",
+  publishedAtLeafId: "e4",
+};
 
 function checkpointData(
-  overrides: Partial<PersistedShadowCheckpointV1> = {},
-): PersistedShadowCheckpointV1 {
+  overrides: Partial<PersistedShadowCheckpoint> = {},
+): PersistedShadowCheckpoint {
   return {
-    version: 1,
+    version: 3,
     checkpointId: "checkpoint-test",
     sessionId: "session-1",
     summary: "# Continuation Checkpoint\n\n## Objective\n- test checkpoint",
@@ -145,6 +108,10 @@ function checkpointData(
     usage: USAGE,
     details: { readFiles: ["src/read.ts"], modifiedFiles: ["src/edited.ts"] },
     createdAt: 1_700_000_000_000,
+    structured: structuredFixture(),
+    coverage: COVERAGE,
+    prompts: { summaryPromptVersion: 2, verifierPromptVersion: 2 },
+    generatedAt: 0,
     ...overrides,
   };
 }
@@ -186,6 +153,7 @@ describe("persisted checkpoint validation", () => {
     assert.equal(isPersistedShadowCheckpoint(checkpointData()), true);
     assert.equal(isPersistedShadowCheckpoint(undefined), false);
     assert.equal(isPersistedShadowCheckpoint("garbage"), false);
+    assert.equal(isPersistedShadowCheckpoint({ ...checkpointData(), version: 1 }), false);
     assert.equal(isPersistedShadowCheckpoint({ ...checkpointData(), version: 2 }), false);
     assert.equal(isPersistedShadowCheckpoint({ ...checkpointData(), summary: "" }), false);
     assert.equal(
@@ -254,109 +222,33 @@ describe("persisted checkpoint validation", () => {
     }
   });
 
-  it("round-trips a checkpoint back into the serving shape", () => {
-    const data = checkpointData({ checkpointId: "round-trip" });
-    const result = toPreparedResult(data);
-    assert.equal(result.checkpointId, "round-trip");
-    assert.equal(result.sessionId, "session-1");
-    assert.equal(result.summary, data.summary);
-    assert.equal(result.firstKeptEntryId, "e4");
-    assert.equal(result.leafId, "e4");
-    assert.equal(result.latestCompactionId, null);
-    assert.equal(result.contextTokensBefore, 600);
-    assert.deepEqual(result.usage, USAGE);
-    assert.deepEqual(result.details, { readFiles: ["src/read.ts"], modifiedFiles: ["src/edited.ts"] });
-    assert.equal(result.coverage, undefined);
-    assert.equal(result.structured, undefined);
-  });
-
   it("accepts v3 checkpoints and rejects malformed v3 payloads", () => {
-    assert.equal(isPersistedShadowCheckpoint(checkpointDataV3()), true);
-    assert.equal(isPersistedShadowCheckpoint({ ...checkpointDataV3(), structured: {} }), false);
-    assert.equal(isPersistedShadowCheckpoint({ ...checkpointDataV3(), coverage: null }), false);
+    assert.equal(isPersistedShadowCheckpoint(checkpointData()), true);
+    assert.equal(isPersistedShadowCheckpoint({ ...checkpointData(), structured: {} }), false);
+    assert.equal(isPersistedShadowCheckpoint({ ...checkpointData(), coverage: null }), false);
     assert.equal(
-      isPersistedShadowCheckpoint({ ...checkpointDataV3(), coverage: { coverageEndEntryId: "e3" } }),
+      isPersistedShadowCheckpoint({ ...checkpointData(), coverage: { coverageEndEntryId: "e3" } }),
       false,
     );
-    assert.equal(isPersistedShadowCheckpoint({ ...checkpointDataV3(), prompts: {} }), false);
-    assert.equal(isPersistedShadowCheckpoint({ ...checkpointDataV3(), generatedAt: "now" }), false);
-    assert.equal(isPersistedShadowCheckpoint({ ...checkpointDataV3(), version: 4 }), false);
+    assert.equal(isPersistedShadowCheckpoint({ ...checkpointData(), prompts: {} }), false);
+    assert.equal(isPersistedShadowCheckpoint({ ...checkpointData(), generatedAt: "now" }), false);
+    assert.equal(isPersistedShadowCheckpoint({ ...checkpointData(), version: 4 }), false);
   });
 
-  it("accepts legacy v2 checkpoints and rejects malformed v2 payloads", () => {
-    assert.equal(isPersistedShadowCheckpoint(checkpointDataV2Legacy()), true);
-    // The Jev payload must be structurally present (a corrupt v2 entry is
-    // skipped like any corrupt entry) even though restore ignores it.
-    assert.equal(
-      isPersistedShadowCheckpoint({ ...checkpointDataV2Legacy(), historicTurns: {} }),
-      false,
-    );
-    assert.equal(
-      isPersistedShadowCheckpoint({
-        ...checkpointDataV2Legacy(),
-        prompts: { summaryPromptVersion: 2, verifierPromptVersion: 2 },
-      }),
-      false,
-    );
-    assert.equal(isPersistedShadowCheckpoint({ ...checkpointDataV2Legacy(), structured: {} }), false);
-    assert.equal(
-      isPersistedShadowCheckpoint({ ...checkpointDataV2Legacy(), generatedAt: "now" }),
-      false,
-    );
-  });
-
-  it("reports missing-coverage-end for v2 and v3 checkpoints off the branch", async () => {
+  it("reports missing-coverage-end when the coverage end left the branch", async () => {
     const f = await fixture();
     try {
-      // The v2 arm is the migration regression: old checkpoints must not
-      // skip coverage validation just because the schema moved to v3.
-      for (const data of [checkpointDataV2Legacy(), checkpointDataV3()]) {
-        assert.equal(checkpointStalenessReason(f.branch, "session-1", data), undefined);
-        assert.equal(
-          checkpointStalenessReason(f.branch, "session-1", {
-            ...data,
-            coverage: {
-              sourceStartEntryId: null,
-              coverageEndEntryId: "missing",
-              preparedAtLeafId: "e4",
-              publishedAtLeafId: "e4",
-            },
-          }),
-          "missing-coverage-end",
-        );
-      }
+      assert.equal(checkpointStalenessReason(f.branch, "session-1", checkpointData()), undefined);
+      assert.equal(
+        checkpointStalenessReason(f.branch, "session-1", {
+          ...checkpointData(),
+          coverage: { ...COVERAGE, coverageEndEntryId: "missing" },
+        }),
+        "missing-coverage-end",
+      );
     } finally {
       await f.cleanup();
     }
-  });
-
-  it("round-trips a v3 checkpoint back into the serving shape", () => {
-    const data = checkpointDataV3({ checkpointId: "round-trip-v3" });
-    const result = toPreparedResult(data);
-    assert.equal(result.checkpointId, "round-trip-v3");
-    assert.equal(result.coverage?.coverageEndEntryId, "e3");
-    assert.equal(result.structured?.objective[0]?.text, "objective");
-    assert.deepEqual(result.prompts, {
-      summaryPromptVersion: 2,
-      verifierPromptVersion: 2,
-    });
-    assert.ok(!("historicTurns" in result));
-  });
-
-  it("restores a legacy v2 checkpoint while discarding its Jev payload", () => {
-    const data = checkpointDataV2Legacy({
-      checkpointId: "round-trip-v2",
-      historicTurns: [{ turn: { id: "turn-1" }, relevance: 0.9, reason: "fake" }],
-    });
-    const result = toPreparedResult(data);
-    assert.equal(result.checkpointId, "round-trip-v2");
-    assert.equal(result.coverage?.coverageEndEntryId, "e3");
-    assert.equal(result.structured?.objective[0]?.text, "objective");
-    assert.deepEqual(result.prompts, {
-      summaryPromptVersion: 2,
-      verifierPromptVersion: 2,
-    });
-    assert.ok(!("historicTurns" in result));
   });
 });
 
@@ -433,7 +325,13 @@ describe("newest current checkpoint wins", () => {
           toolResultEntry("r1", "a1", "call-1"),
           userEntry("e2", "r1", "two"),
         ]);
-        f.appendCustom(checkpointData({ firstKeptEntryId: "r1", leafId: "e2" }));
+        f.appendCustom(
+          checkpointData({
+            firstKeptEntryId: "r1",
+            leafId: "e2",
+            coverage: { ...COVERAGE, coverageEndEntryId: "r1", preparedAtLeafId: "e2", publishedAtLeafId: "e2" },
+          }),
+        );
         const g = f.restart();
         try {
           await g.emit("session_start");
@@ -457,58 +355,6 @@ describe("newest current checkpoint wins", () => {
     assert.equal(swaps[0]?.messagesDropped, 2);
   });
 
-  it("reload serves a legacy v2 checkpoint while discarding its obsolete historic-turn payload", async () => {
-    const f = await fixture(SWAP_CONFIG);
-    try {
-      f.appendCustom(
-        checkpointDataV2Legacy({
-          checkpointId: "V2",
-          summary: "SUMMARY-V2",
-          // Obsolete payload, including entries long off the branch: restore
-          // must ignore it entirely, not filter or serve it.
-          historicTurns: [
-            { turn: { id: "turn-1", entryIds: ["gone"] }, relevance: 1, reason: "fake" },
-          ],
-        }),
-      );
-      const g = f.restart();
-      try {
-        await g.emit("session_start");
-        const outcome = (await g.emit("context", { messages: g.contextMessages() })) as {
-          messages: Array<Record<string, unknown>>;
-        };
-        const summary = outcome.messages[0]?.summary as string;
-        assert.match(summary, /SUMMARY-V2/);
-        assert.ok(!summary.includes("turn-1"));
-      } finally {
-        await g.cleanup();
-      }
-    } finally {
-      await f.cleanup();
-    }
-  });
-
-  it("reads checkpoints persisted under the legacy namespace", async () => {
-    const f = await fixture(SWAP_CONFIG);
-    try {
-      f.appendCustom(
-        checkpointData({ checkpointId: "LEGACY", summary: "SUMMARY-LEGACY" }),
-        CHECKPOINT_CUSTOM_TYPE_LEGACY,
-      );
-      const g = f.restart();
-      try {
-        await g.emit("session_start");
-        const outcome = (await g.emit("context", { messages: g.contextMessages() })) as {
-          messages: Array<Record<string, unknown>>;
-        };
-        assert.match(outcome.messages[0]?.summary as string, /SUMMARY-LEGACY/);
-      } finally {
-        await g.cleanup();
-      }
-    } finally {
-      await f.cleanup();
-    }
-  });
 });
 
 describe("soft durability without compaction", () => {
@@ -794,19 +640,13 @@ describe("checkpoint self-repair (summary omission is not evidence loss)", () =>
     firstKeptEntryId: string,
     leafId: string,
   ): SessionEntry {
-    const data: PersistedShadowCheckpoint = {
-      version: 1,
+    const data: PersistedShadowCheckpoint = checkpointData({
       checkpointId: id,
-      sessionId: "session-1",
       summary,
       firstKeptEntryId,
       leafId,
-      latestCompactionId: null,
-      contextTokensBefore: 600,
-      usage: USAGE,
-      details: { readFiles: [], modifiedFiles: [] },
-      createdAt: 1_700_000_000_000,
-    };
+      coverage: { ...COVERAGE, coverageEndEntryId: leafId, preparedAtLeafId: leafId, publishedAtLeafId: leafId },
+    });
     assert.equal(isPersistedShadowCheckpoint(data), true);
     return {
       id: `custom-${id}`,

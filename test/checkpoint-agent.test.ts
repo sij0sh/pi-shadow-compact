@@ -376,8 +376,8 @@ describe("runCheckpointVerifierAgent", () => {
     const index = new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" });
     const fake = scripted((context) => {
       const names = toolNames(context);
-      if (!names.includes("read_session_turn")) {
-        return toolResponse([{ id: "c1", name: "read_session_turn", args: { turnId: "turn-2" } }]);
+      if (!names.includes("read_turn_range")) {
+        return toolResponse([{ id: "c1", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]);
       }
       return toolResponse([{ id: "c2", name: "submit_verdict", args: { verdict: "accept" } }]);
     });

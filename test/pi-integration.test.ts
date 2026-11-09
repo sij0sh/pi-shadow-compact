@@ -28,6 +28,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import shadowCompact from "../src/index.js";
 import { CHECKPOINT_CUSTOM_TYPE, type PersistedShadowCheckpoint } from "../src/persist.js";
+import { emptyContinuationState, SECTIONS } from "../src/summary.js";
 import { FakeRegistry, USAGE, waitFor, tick } from "./helpers/index-fixture.js";
 
 async function integrationFixture(extraExtensions: ExtensionFactory[] = [], config: Record<string, unknown> = {}) {
@@ -683,11 +684,25 @@ describe("Pi 1.0.4 integration", () => {
       await f.session.compact();
       const previous = f.manager.getLeafEntry() as CompactionEntry;
       const checkpoint: PersistedShadowCheckpoint = {
-        version: 1, checkpointId: "cached", sessionId: f.manager.getSessionId(),
+        version: 3, checkpointId: "cached", sessionId: f.manager.getSessionId(),
         summary: previous.summary, firstKeptEntryId: previous.firstKeptEntryId,
         leafId: previous.id, latestCompactionId: previous.id,
         contextTokensBefore: 100_000, usage: USAGE,
         details: { readFiles: [], modifiedFiles: [] }, createdAt: Date.now(),
+        // Coverage stops at the native cut: the uncached work that follows it
+        // is outside the checkpoint's evidence boundary.
+        structured: {
+          ...Object.fromEntries(SECTIONS.map((section) => [section, []])),
+          continuationState: emptyContinuationState(),
+        } as PersistedShadowCheckpoint["structured"],
+        coverage: {
+          sourceStartEntryId: null,
+          coverageEndEntryId: previous.firstKeptEntryId,
+          preparedAtLeafId: previous.id,
+          publishedAtLeafId: previous.id,
+        },
+        prompts: { summaryPromptVersion: 3, verifierPromptVersion: 3 },
+        generatedAt: Date.now(),
       };
       f.manager.appendCustomEntry(CHECKPOINT_CUSTOM_TYPE, checkpoint);
       await f.session.bindExtensions({});

@@ -1,27 +1,4 @@
-import type { Usage } from "@earendil-works/pi-ai";
-import type { Checkpoint, CheckpointCoverage, PromptVersions } from "./summary.js";
-import type { FileDetails } from "./working-context.js";
-
-export interface PreparedResult {
-  /** Stable identity across persist/restore so an idle settle persists once. */
-  checkpointId: string;
-  sessionId: string;
-  leafId: string;
-  latestCompactionId: string | null;
-  /** Frozen trigger overlap for fresh checkpoints; legacy serving cut on older entries. */
-  firstKeptEntryId: string;
-  summary: string;
-  usage: Usage;
-  details: FileDetails;
-  /** Context size observed at publish; metadata for the mid-run swap message. */
-  contextTokensBefore?: number;
-  /** Evidence boundary; absent on v1 restores (derived from firstKeptEntryId). */
-  coverage?: CheckpointCoverage;
-  /** Structured checkpoint behind the rendering; absent on v1 restores. */
-  structured?: Checkpoint;
-  generatedAt?: number;
-  prompts?: PromptVersions;
-}
+import type { PreparedResult } from "./persist.js";
 
 export interface PreparingInfo {
   generation: number;

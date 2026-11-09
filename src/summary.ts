@@ -351,10 +351,9 @@ export function combineUsage(a: Usage, b: Usage): Usage {
  */
 
 /**
- * Current durable checkpoint schema version. V3 drops the removed
- * historic-turn subsystem (no `historicTurns`, no relevance prompt version).
- * Persisted v1 checkpoints restore with derived coverage; persisted v2
- * checkpoints restore with their Jev payload ignored.
+ * Current durable checkpoint schema version. Only this version is readable:
+ * pre-v3 entries (the removed historic-turn subsystem, `historicTurns`,
+ * relevance prompt versions) are ignored on restore rather than migrated.
  */
 export const CHECKPOINT_SCHEMA_VERSION = 3;
 

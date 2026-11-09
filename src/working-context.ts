@@ -31,14 +31,6 @@ export interface WorkingContextInput {
   contextTokensBefore?: number;
   /** Frozen trigger-time overlap. Combines with coverage and recency; never replaces them. */
   retainedAnchor?: string;
-  /**
-   * Explicit tail start replacing the coverage-derived one. Used for v1
-   * checkpoints, whose cut is entry-granular (possibly mid-turn): starting
-   * the tail at the next complete turn would silently drop the turn head the
-   * legacy summary never covered. The recent-turns minimum still applies on
-   * top, and the orphan guard still fails closed on pair splits.
-   */
-  coverageTailOverride?: string;
 }
 
 export interface SwapPlan {
@@ -87,7 +79,6 @@ export function planSwap(
   branch: SessionEntry[],
   coverageEndEntryId: string,
   minimumRecentTurns: number,
-  coverageTailOverride?: string,
   retainedAnchor?: string,
 ): SwapPlan | undefined {
   if (branch.length === 0) return undefined;
@@ -102,16 +93,10 @@ export function planSwap(
   if (coverageIdx < -1 || (coverageEndEntryId !== "" && coverageIdx < 0)) return undefined;
 
   const entryIndex = new Map(branch.map((entry, index) => [entry.id, index]));
-  let coverageTailStart: string;
-  if (coverageTailOverride !== undefined) {
-    if (!entryIndex.has(coverageTailOverride)) return undefined;
-    coverageTailStart = coverageTailOverride;
-  } else {
-    coverageTailStart = (
-      turns.find((turn) => (entryIndex.get(turn.endEntryId) ?? -1) > coverageIdx)
-      ?? turns[turns.length - 1]!
-    ).startEntryId;
-  }
+  const coverageTailStart = (
+    turns.find((turn) => (entryIndex.get(turn.endEntryId) ?? -1) > coverageIdx)
+    ?? turns[turns.length - 1]!
+  ).startEntryId;
   const recentCount = Math.max(1, Math.floor(minimumRecentTurns));
   const recentTailStart = turns[Math.max(0, turns.length - recentCount)]!.startEntryId;
   let swapStartEntryId = (entryIndex.get(coverageTailStart) ?? 0) <= (entryIndex.get(recentTailStart) ?? 0)
@@ -140,7 +125,6 @@ export function buildWorkingContext(
     branch,
     checkpoint.coverage.coverageEndEntryId,
     input.minimumRecentTurns,
-    input.coverageTailOverride,
     input.retainedAnchor,
   );
   if (!plan) return { skipped: "stale-coverage" };

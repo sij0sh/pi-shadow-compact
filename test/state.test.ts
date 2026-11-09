@@ -1,11 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { Usage } from "@earendil-works/pi-ai";
-import {
-  ShadowCompactStateController,
-  type PreparingInfo,
-  type PreparedResult,
-} from "../src/state.js";
+import type { PreparedResult } from "../src/persist.js";
+import { ShadowCompactStateController, type PreparingInfo } from "../src/state.js";
 
 const usage: Usage = {
   input: 1,
@@ -21,6 +18,7 @@ let resultSeq = 0;
 function prepared(): PreparedResult {
   resultSeq++;
   return {
+    version: 3,
     checkpointId: `checkpoint-${resultSeq}`,
     sessionId: `session-${resultSeq}`,
     leafId: `leaf-${resultSeq}`,
@@ -29,6 +27,30 @@ function prepared(): PreparedResult {
     summary: `summary-${resultSeq}`,
     usage,
     details: { readFiles: ["src/a.ts"], modifiedFiles: ["src/b.ts"] },
+    contextTokensBefore: 1000,
+    createdAt: 0,
+    structured: {
+      objective: [{ text: "objective", evidenceRefs: ["E0001"] }],
+      constraints: [],
+      completedWork: [],
+      currentState: [],
+      decisions: [],
+      openIssues: [],
+      nextActions: [],
+      criticalContext: [],
+      modifiedFiles: [],
+      referencedFiles: [],
+      verificationState: [],
+      continuationState: { currentGoal: "g", currentApproach: "a", immediateNextStep: "n" },
+    },
+    coverage: {
+      sourceStartEntryId: null,
+      coverageEndEntryId: `kept-${resultSeq}`,
+      preparedAtLeafId: `leaf-${resultSeq}`,
+      publishedAtLeafId: `leaf-${resultSeq}`,
+    },
+    prompts: { summaryPromptVersion: 3, verifierPromptVersion: 3 },
+    generatedAt: 0,
   };
 }
 

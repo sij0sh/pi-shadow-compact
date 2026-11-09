@@ -2,12 +2,10 @@ import type { Usage } from "@earendil-works/pi-ai";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import {
   CHECKPOINT_SCHEMA_VERSION,
-  currentPromptVersions,
   type CheckpointCoverage,
   type PromptVersions,
 } from "./summary.js";
-import type { PreparedResult } from "./state.js";
-import { coverageIsUnchanged } from "./working-context.js";
+import { coverageIsUnchanged, type FileDetails } from "./working-context.js";
 import { SECTIONS, type Checkpoint } from "./summary.js";
 
 /**
@@ -18,12 +16,6 @@ import { SECTIONS, type Checkpoint } from "./summary.js";
  * Both paths preserve raw history as evidence for future checkpoints.
  */
 export const CHECKPOINT_CUSTOM_TYPE = "shadow-compact.checkpoint";
-/** Pre-v2 namespace: still read for restore, never written. */
-export const CHECKPOINT_CUSTOM_TYPE_LEGACY = "shadow-compact.checkpoint.v1";
-
-function isCheckpointCustomType(customType: unknown): boolean {
-  return customType === CHECKPOINT_CUSTOM_TYPE || customType === CHECKPOINT_CUSTOM_TYPE_LEGACY;
-}
 
 /**
  * How many prior Shadow summaries ride along as protected evidence slots.
@@ -34,45 +26,30 @@ function isCheckpointCustomType(customType: unknown): boolean {
  */
 export const SHADOW_CHAIN_LIMIT = 2;
 
-export interface PersistedShadowCheckpointV1 {
-  version: 1;
-  checkpointId: string;
-  sessionId: string;
-  summary: string;
-  /** Entry-granular legacy serving cut. */
-  firstKeptEntryId: string;
-  leafId: string;
-  latestCompactionId: string | null;
-  contextTokensBefore: number;
-  usage: Usage;
-  details: {
-    readFiles: string[];
-    modifiedFiles: string[];
-  };
-  createdAt: number;
-}
-
 /**
- * V3 durable checkpoint: the structured checkpoint is the durable object,
- * the rendering is derived, and coverage states the evidence boundary
- * explicitly. No historic-turn payload: long-range continuity is the
- * verified checkpoint's job, near-term continuity the no-gap tail's.
+ * One checkpoint shape is both the durable entry and the serving value: a
+ * published result is already a v3 checkpoint, so persistence appends it
+ * as-is and restore hands the entry straight back to the state controller.
+ *
+ * The structured checkpoint is the durable object, the rendering is derived,
+ * and coverage states the evidence boundary explicitly. No historic-turn
+ * payload: long-range continuity is the verified checkpoint's job, near-term
+ * continuity the no-gap tail's.
  */
-export interface PersistedShadowCheckpointV3 {
-  version: 3;
+export interface PersistedShadowCheckpoint {
+  version: typeof CHECKPOINT_SCHEMA_VERSION;
   checkpointId: string;
   sessionId: string;
   summary: string;
-  /** Frozen trigger overlap for fresh checkpoints; legacy serving cut on older entries. */
+  /** Frozen trigger overlap: the earliest entry the checkpoint's tail keeps. */
   firstKeptEntryId: string;
   leafId: string;
   latestCompactionId: string | null;
+  /** Context size observed at publish; metadata for the mid-run swap message. */
   contextTokensBefore: number;
   usage: Usage;
-  details: {
-    readFiles: string[];
-    modifiedFiles: string[];
-  };
+  details: FileDetails;
+  /** Wall-clock publish time. */
   createdAt: number;
   structured: Checkpoint;
   coverage: CheckpointCoverage;
@@ -80,39 +57,7 @@ export interface PersistedShadowCheckpointV3 {
   generatedAt: number;
 }
 
-/**
- * Legacy v2 reader shape. Never written, never part of runtime types: v2's
- * `historicTurns` and `relevancePromptVersion` belonged to the removed
- * historic-turn subsystem and are validated structurally, then ignored on
- * restore so a good v2 checkpoint keeps serving.
- */
-export interface PersistedShadowCheckpointV2Legacy {
-  version: 2;
-  checkpointId: string;
-  sessionId: string;
-  summary: string;
-  /** Legacy estimated serving cut, retained conservatively on restore. */
-  firstKeptEntryId: string;
-  leafId: string;
-  latestCompactionId: string | null;
-  contextTokensBefore: number;
-  usage: Usage;
-  details: {
-    readFiles: string[];
-    modifiedFiles: string[];
-  };
-  createdAt: number;
-  structured: Checkpoint;
-  coverage: CheckpointCoverage;
-  prompts: PromptVersions & { relevancePromptVersion: number };
-  historicTurns: unknown[];
-  generatedAt: number;
-}
-
-export type PersistedShadowCheckpoint =
-  | PersistedShadowCheckpointV1
-  | PersistedShadowCheckpointV2Legacy
-  | PersistedShadowCheckpointV3;
+export type PreparedResult = PersistedShadowCheckpoint;
 
 function isStringList(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item): item is string => typeof item === "string");
@@ -155,18 +100,6 @@ function isPromptVersions(value: unknown): value is PromptVersions {
   return true;
 }
 
-/** Legacy v2 prompt versions: the relevance field is validated, then ignored on restore. */
-function isPromptVersionsV2Legacy(
-  value: unknown,
-): value is PersistedShadowCheckpointV2Legacy["prompts"] {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const prompts = value as Record<string, unknown>;
-  for (const key of ["summaryPromptVersion", "verifierPromptVersion", "relevancePromptVersion"] as const) {
-    if (typeof prompts[key] !== "number" || !Number.isFinite(prompts[key] as number)) return false;
-  }
-  return true;
-}
-
 const CHECKPOINT_SECTION_KEYS = [...SECTIONS, "verificationState", "continuationState"];
 
 /** Shape check for the structured checkpoint (evidence refs are branch-relative, not re-validated). */
@@ -183,9 +116,7 @@ function isStructuredCheckpoint(value: unknown): value is Checkpoint {
 export function isPersistedShadowCheckpoint(value: unknown): value is PersistedShadowCheckpoint {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const candidate = value as Record<string, unknown>;
-  if (candidate.version !== 1 && candidate.version !== 2 && candidate.version !== CHECKPOINT_SCHEMA_VERSION) {
-    return false;
-  }
+  if (candidate.version !== CHECKPOINT_SCHEMA_VERSION) return false;
   for (const key of ["checkpointId", "sessionId", "summary", "firstKeptEntryId", "leafId"] as const) {
     if (typeof candidate[key] !== "string" || (candidate[key] as string).length === 0) return false;
   }
@@ -202,18 +133,9 @@ export function isPersistedShadowCheckpoint(value: unknown): value is PersistedS
   }
   const details = candidate.details as Record<string, unknown>;
   if (!isStringList(details.readFiles) || !isStringList(details.modifiedFiles)) return false;
-  if (candidate.version === 1) return true;
   if (!isStructuredCheckpoint(candidate.structured)) return false;
   if (!isCheckpointCoverage(candidate.coverage)) return false;
-  if (candidate.version === 2) {
-    // Legacy v2: the Jev payload must be structurally present (a corrupt v2
-    // entry is skipped like any corrupt entry) but its contents are never
-    // restored into runtime state.
-    if (!isPromptVersionsV2Legacy(candidate.prompts)) return false;
-    if (!Array.isArray(candidate.historicTurns)) return false;
-  } else if (!isPromptVersions(candidate.prompts)) {
-    return false;
-  }
+  if (!isPromptVersions(candidate.prompts)) return false;
   return typeof candidate.generatedAt === "number" && Number.isFinite(candidate.generatedAt);
 }
 
@@ -234,7 +156,7 @@ function* newestValidCheckpoints(
 ): Generator<{ entryId: string; checkpoint: PersistedShadowCheckpoint }> {
   for (let index = branch.length - 1; index >= 0; index--) {
     const entry = branch[index];
-    if (!entry || entry.type !== "custom" || !isCheckpointCustomType(entry.customType)) continue;
+    if (!entry || entry.type !== "custom" || entry.customType !== CHECKPOINT_CUSTOM_TYPE) continue;
     if (!isPersistedShadowCheckpoint(entry.data)) continue;
     yield { entryId: entry.id, checkpoint: entry.data };
   }
@@ -283,17 +205,6 @@ export function findLatestRestorableCheckpoint(
   return { found: undefined, skippedStale };
 }
 
-/**
- * Capability check for the structured/coverage tail of the schema (v2 and
- * v3). Version-equality checks would silently drop old checkpoints on every
- * schema bump; this keeps them restoring with their full structure.
- */
-function hasCoverage(
-  checkpoint: PersistedShadowCheckpoint,
-): checkpoint is PersistedShadowCheckpointV2Legacy | PersistedShadowCheckpointV3 {
-  return checkpoint.version >= 2;
-}
-
 export type CheckpointStalenessReason =
   | "session-mismatch"
   | "missing-first-kept"
@@ -302,13 +213,13 @@ export type CheckpointStalenessReason =
   | "changed-coverage"
   | "compaction-mismatch";
 
-/** The fields every currency check needs; a legacy checkpoint has no coverage. */
+/** The fields every currency check needs. */
 export interface CheckpointCurrentness {
   sessionId: string;
   leafId: string;
   latestCompactionId: string | null;
   firstKeptEntryId: string;
-  coverage?: CheckpointCoverage | undefined;
+  coverage: CheckpointCoverage;
 }
 
 /**
@@ -329,15 +240,10 @@ export function checkpointStalenessReason(
     return "missing-first-kept";
   }
   if (!branch.some((entry) => entry.id === checkpoint.leafId)) return "missing-leaf";
-  if (
-    checkpoint.coverage !== undefined &&
-    !branch.some((entry) => entry.id === checkpoint.coverage!.coverageEndEntryId)
-  ) {
+  if (!branch.some((entry) => entry.id === checkpoint.coverage.coverageEndEntryId)) {
     return "missing-coverage-end";
   }
-  if (checkpoint.coverage !== undefined && !coverageIsUnchanged(branch, checkpoint.coverage)) {
-    return "changed-coverage";
-  }
+  if (!coverageIsUnchanged(branch, checkpoint.coverage)) return "changed-coverage";
   if (latestCompactionId(branch) !== checkpoint.latestCompactionId) return "compaction-mismatch";
   return undefined;
 }
@@ -360,7 +266,7 @@ export function collectShadowSummaries(
   const ids = new Set(branch.map((entry) => entry.id));
   const matches: string[] = [];
   for (const entry of branch) {
-    if (entry.type !== "custom" || !isCheckpointCustomType(entry.customType)) continue;
+    if (entry.type !== "custom" || entry.customType !== CHECKPOINT_CUSTOM_TYPE) continue;
     if (!isPersistedShadowCheckpoint(entry.data)) continue;
     if (entry.data.sessionId !== sessionId) continue;
     if (!ids.has(entry.data.firstKeptEntryId)) continue;
@@ -374,61 +280,4 @@ export function latestCompactionId(branch: SessionEntry[]): string | null {
     if (branch[index]?.type === "compaction") return branch[index]!.id;
   }
   return null;
-}
-
-/** Restores a validated checkpoint into the serving shape. */
-/**
- * The single forward projection: a published result becomes the durable
- * entry. Structured results persist as v3; a v1 restore without structure
- * re-persists as v1 until a fresh preparation replaces it.
- */
-export function toPersistedCheckpoint(result: PreparedResult): PersistedShadowCheckpoint {
-  const common = {
-    checkpointId: result.checkpointId,
-    sessionId: result.sessionId,
-    summary: result.summary,
-    firstKeptEntryId: result.firstKeptEntryId,
-    leafId: result.leafId,
-    latestCompactionId: result.latestCompactionId,
-    contextTokensBefore: result.contextTokensBefore ?? 0,
-    usage: result.usage,
-    details: result.details,
-    createdAt: Date.now(),
-  };
-  return result.structured && result.coverage
-    ? {
-        ...common,
-        version: CHECKPOINT_SCHEMA_VERSION,
-        structured: result.structured,
-        coverage: result.coverage,
-        prompts: result.prompts ?? currentPromptVersions(),
-        generatedAt: result.generatedAt ?? Date.now(),
-      }
-    : { ...common, version: 1 };
-}
-
-export function toPreparedResult(checkpoint: PersistedShadowCheckpoint): PreparedResult {
-  const result: PreparedResult = {
-    checkpointId: checkpoint.checkpointId,
-    sessionId: checkpoint.sessionId,
-    leafId: checkpoint.leafId,
-    latestCompactionId: checkpoint.latestCompactionId,
-    firstKeptEntryId: checkpoint.firstKeptEntryId,
-    summary: checkpoint.summary,
-    usage: checkpoint.usage,
-    details: checkpoint.details,
-    contextTokensBefore: checkpoint.contextTokensBefore,
-  };
-  if (hasCoverage(checkpoint)) {
-    result.coverage = checkpoint.coverage;
-    result.structured = checkpoint.structured;
-    result.generatedAt = checkpoint.generatedAt;
-    // Legacy v2's historicTurns and relevancePromptVersion are dropped here:
-    // a good v2 checkpoint keeps serving, minus its obsolete Jev payload.
-    result.prompts = {
-      summaryPromptVersion: checkpoint.prompts.summaryPromptVersion,
-      verifierPromptVersion: checkpoint.prompts.verifierPromptVersion,
-    };
-  }
-  return result;
 }

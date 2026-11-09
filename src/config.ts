@@ -92,6 +92,11 @@ export const THINKING_LEVELS = [
 
 export type ManualCompactMode = "shadow" | "native";
 
+export interface ModelPair {
+  provider: string;
+  id: string;
+}
+
 export interface ShadowCompactConfig {
   /** Usage percent where checkpoint preparation starts. */
   prepareThresholdPercent: number;
@@ -99,10 +104,7 @@ export interface ShadowCompactConfig {
   nativeFallbackThresholdPercent: number;
   /** Benchmark-only absolute prepare trigger in tokens (env-only, never from file). */
   softCompactThresholdTokens?: number;
-  summarizerModel: {
-    provider: string;
-    id: string;
-  };
+  summarizerModel: ModelPair;
   summaryMaxTokens?: number;
   thinkingLevel?: ModelThinkingLevel;
   /**
@@ -110,10 +112,7 @@ export interface ShadowCompactConfig {
    * configs keep loading unchanged: when absent or blank the verifier
    * reuses the resolved summarizer model.
    */
-  verificationModel?: {
-    provider: string;
-    id: string;
-  };
+  verificationModel?: ModelPair;
   /** Verifier reasoning level; falls back to `thinkingLevel` when unset. */
   verificationThinkingLevel?: ModelThinkingLevel;
   idleCompact: {
@@ -155,49 +154,319 @@ export async function loadConfig(ctx: ExtensionContext): Promise<ShadowCompactCo
 }
 
 /**
- * Trimmed raw env value, or undefined when unset/blank. All env parsers
- * share this so empty-vs-missing handling cannot drift between knobs.
+ * One validation surface for every setting, whatever its source.
+ *
+ * A source adapter only does what only it can do — JSON parsing and unknown-key
+ * checks for files, string/blank normalization for env vars — and hands the raw
+ * values here. Ranges, kinds, model-pair completeness, and threshold ordering
+ * are stated exactly once.
  */
-function rawEnv(name: string): { trimmed: string; raw: string } | undefined {
-  const raw = process.env[name];
-  if (raw === undefined || raw.trim() === "") return undefined;
-  return { trimmed: raw.trim(), raw };
+interface RawSettings {
+  prepareThresholdPercent?: unknown;
+  nativeFallbackThresholdPercent?: unknown;
+  summarizerModel?: unknown;
+  summaryMaxTokens?: unknown;
+  thinkingLevel?: unknown;
+  verificationModel?: unknown;
+  verificationThinkingLevel?: unknown;
+  idleCompact?: unknown;
+  recentTurns?: unknown;
+  manualCompactMode?: unknown;
 }
 
-function parseEnvThreshold(name: string): number | undefined {
-  const env = rawEnv(name);
-  if (env === undefined) return undefined;
-  const value = Number(env.trimmed);
-  if (!Number.isFinite(value)) {
-    throw new Error(`${name} must be a number between 1 and 99, got ${JSON.stringify(env.raw)}`);
+interface Settings extends Partial<Omit<ShadowCompactConfig, "idleCompact">> {
+  idleCompact?: Partial<ShadowCompactConfig["idleCompact"]>;
+}
+
+/** Human name of a setting in the source being read (file path + key, or env var). */
+type Label = (key: keyof RawSettings) => string;
+
+function expectRecord(value: unknown, label: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} must be an object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function assertKnownKeys(value: unknown, allowed: readonly string[], label: string): void {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return;
+  for (const key of Object.keys(value as Record<string, unknown>)) {
+    if (!allowed.includes(key)) throw new Error(`${label} has unknown key: ${key}`);
+  }
+}
+
+function expectPercent(value: unknown, label: string): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error(`${label} must be a number`);
   }
   if (value < 1 || value > 99) {
-    throw new Error(`${name} must be between 1 and 99, got ${JSON.stringify(env.raw)}`);
+    throw new Error(`${label} must be between 1 and 99`);
   }
   return value;
 }
 
-function parseEnvTokenCount(name: string): number | undefined {
-  const env = rawEnv(name);
-  if (env === undefined) return undefined;
-  const value = Number(env.trimmed);
-  if (!Number.isInteger(value) || value < 1) {
-    throw new Error(`${name} must be a positive integer token count, got ${JSON.stringify(env.raw)}`);
+function expectPositiveInt(value: unknown, label: string): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+    throw new Error(`${label} must be a positive integer`);
   }
   return value;
 }
 
-function parseOptionalString(name: string): string | undefined {
-  return rawEnv(name)?.trimmed;
+function expectBoolean(value: unknown, label: string): boolean | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") {
+    throw new Error(`${label} must be a boolean`);
+  }
+  return value;
 }
 
-function parseEnvThinking(name: string): ModelThinkingLevel | undefined {
-  const env = rawEnv(name);
-  if (env === undefined) return undefined;
-  if (!THINKING_LEVELS.includes(env.trimmed as ModelThinkingLevel)) {
-    throw new Error(`${name} must be one of: ${THINKING_LEVELS.join(", ")}, got ${JSON.stringify(env.raw)}`);
+function expectThinkingLevel(value: unknown, label: string): ModelThinkingLevel | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !THINKING_LEVELS.includes(value as ModelThinkingLevel)) {
+    throw new Error(`${label} must be one of: ${THINKING_LEVELS.join(", ")}`);
   }
-  return env.trimmed as ModelThinkingLevel;
+  return value as ModelThinkingLevel;
+}
+
+function expectManualMode(value: unknown, label: string): ManualCompactMode | undefined {
+  if (value === undefined) return undefined;
+  if (value !== "shadow" && value !== "native") {
+    throw new Error(`${label} must be "shadow" or "native"`);
+  }
+  return value;
+}
+
+/** Provider and ID are all-or-nothing: a half pair is a config bug, not a partial override. */
+function expectModelPair(value: unknown, label: string): ModelPair | undefined {
+  if (value === undefined) return undefined;
+  const record = expectRecord(value, label);
+  assertKnownKeys(record, ["provider", "id"], label);
+  const provider = expectText(record.provider, `${label}.provider`);
+  const id = expectText(record.id, `${label}.id`);
+  if ((provider.length > 0) !== (id.length > 0)) {
+    throw new Error(`${label}.provider and .id must both be blank or both be set`);
+  }
+  return { provider, id };
+}
+
+function expectText(value: unknown, label: string): string {
+  if (value === undefined) return "";
+  if (typeof value !== "string") {
+    throw new Error(`${label} must be a string`);
+  }
+  return value.trim();
+}
+
+function expectIdleCompact(
+  value: unknown,
+  label: string,
+): { enabled?: boolean; minimumTokens?: number } | undefined {
+  if (value === undefined) return undefined;
+  const record = expectRecord(value, label);
+  assertKnownKeys(record, ["enabled", "minimumTokens"], label);
+  const enabled = expectBoolean(record.enabled, `${label}.enabled`);
+  const minimumTokens = expectPositiveInt(record.minimumTokens, `${label}.minimumTokens`);
+  return {
+    ...(enabled !== undefined ? { enabled } : {}),
+    ...(minimumTokens !== undefined ? { minimumTokens } : {}),
+  };
+}
+
+/** Validates a raw settings record from any source; absent settings stay absent. */
+function validateSettings(raw: RawSettings, label: Label): Settings {
+  const prepare = expectPercent(raw.prepareThresholdPercent, label("prepareThresholdPercent"));
+  const native = expectPercent(raw.nativeFallbackThresholdPercent, label("nativeFallbackThresholdPercent"));
+  const summarizer = expectModelPair(raw.summarizerModel, label("summarizerModel"));
+  const summaryMaxTokens = expectPositiveInt(raw.summaryMaxTokens, label("summaryMaxTokens"));
+  const thinkingLevel = expectThinkingLevel(raw.thinkingLevel, label("thinkingLevel"));
+  const verificationModel = expectModelPair(raw.verificationModel, label("verificationModel"));
+  const verificationThinking = expectThinkingLevel(
+    raw.verificationThinkingLevel,
+    label("verificationThinkingLevel"),
+  );
+  const idleCompact = expectIdleCompact(raw.idleCompact, label("idleCompact"));
+  const recentTurns = expectPositiveInt(raw.recentTurns, label("recentTurns"));
+  const manualCompactMode = expectManualMode(raw.manualCompactMode, label("manualCompactMode"));
+  return {
+    ...(prepare !== undefined ? { prepareThresholdPercent: prepare } : {}),
+    ...(native !== undefined ? { nativeFallbackThresholdPercent: native } : {}),
+    ...(summarizer !== undefined ? { summarizerModel: summarizer } : {}),
+    ...(summaryMaxTokens !== undefined ? { summaryMaxTokens } : {}),
+    ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
+    ...(verificationModel !== undefined ? { verificationModel } : {}),
+    ...(verificationThinking !== undefined ? { verificationThinkingLevel: verificationThinking } : {}),
+    ...(idleCompact !== undefined ? { idleCompact } : {}),
+    ...(recentTurns !== undefined ? { recentTurns } : {}),
+    ...(manualCompactMode !== undefined ? { manualCompactMode } : {}),
+  };
+}
+
+/**
+ * The native fallback must fire after preparation starts, or the emergency
+ * hatch would pre-empt the checkpoint path it depends on. Checked only when
+ * the native threshold is stated, so an unrelated prepare override keeps the
+ * default ordering.
+ */
+function assertThresholdOrder(
+  config: Pick<ShadowCompactConfig, "prepareThresholdPercent" | "nativeFallbackThresholdPercent">,
+  label: Label,
+): void {
+  if (config.nativeFallbackThresholdPercent <= config.prepareThresholdPercent) {
+    throw new Error(
+      `${label("nativeFallbackThresholdPercent")} must be greater than prepareThresholdPercent ` +
+        `(${config.prepareThresholdPercent})`,
+    );
+  }
+}
+
+const FILE_KEYS = [
+  "prepareThresholdPercent",
+  "nativeFallbackThresholdPercent",
+  "softCompactThresholdPercent",
+  "summarizerModel",
+  "summaryMaxTokens",
+  "thinkingLevel",
+  "verificationModel",
+  "verificationThinkingLevel",
+  "idleCompact",
+  "recentTurns",
+  "manualCompactMode",
+] as const;
+
+export function parseConfig(source: string, path: string): ShadowCompactConfig {
+  let value: unknown;
+  try {
+    value = JSON.parse(source);
+  } catch (error) {
+    throw new Error(`${path} is not valid JSON`, { cause: error });
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${path} must contain a JSON object`);
+  }
+  const record = value as Record<string, unknown>;
+  assertKnownKeys(record, FILE_KEYS, path);
+
+  const label: Label = (key) => `${path} ${key}`;
+  // Legacy soft key: an alias for the prepare threshold, but not a second way
+  // to say "absent" — both set with different values is a config bug.
+  const prepare = expectPercent(record.prepareThresholdPercent, label("prepareThresholdPercent"));
+  const alias = expectPercent(record.softCompactThresholdPercent, `${path} softCompactThresholdPercent`);
+  if (prepare !== undefined && alias !== undefined && prepare !== alias) {
+    throw new Error(
+      `${path} prepareThresholdPercent and legacy softCompactThresholdPercent conflict; use prepareThresholdPercent`,
+    );
+  }
+  const settings = validateSettings(
+    { ...record, ...(record.prepareThresholdPercent === undefined && alias !== undefined ? { prepareThresholdPercent: alias } : {}) },
+    label,
+  );
+  const config: ShadowCompactConfig = {
+    ...defaultConfig(),
+    ...settings,
+    idleCompact: { ...defaultConfig().idleCompact, ...settings.idleCompact },
+  };
+  if (record.nativeFallbackThresholdPercent !== undefined) assertThresholdOrder(config, label);
+  return config;
+}
+
+// ---------------------------------------------------------------------------
+// Environment adapter: the same settings, one env var each.
+// ---------------------------------------------------------------------------
+
+/** Trimmed raw env value, or undefined when unset/blank. */
+function rawEnv(name: string): string | undefined {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return undefined;
+  return raw.trim();
+}
+
+function envNumber(name: string): number | undefined {
+  const raw = rawEnv(name);
+  if (raw === undefined) return undefined;
+  const value = Number(raw);
+  if (!Number.isFinite(value)) {
+    throw new Error(`${name} must be a number, got ${JSON.stringify(process.env[name])}`);
+  }
+  return value;
+}
+
+/** Provider and ID arrive as two vars; a lone half is still a config bug. */
+function envModelPair(providerVar: string, idVar: string): ModelPair | undefined {
+  const provider = rawEnv(providerVar);
+  const id = rawEnv(idVar);
+  if ((provider === undefined) !== (id === undefined)) {
+    throw new Error(`${providerVar} and ${idVar} must both be set or both be unset`);
+  }
+  if (provider === undefined || id === undefined) return undefined;
+  return { provider, id };
+}
+
+export function applyEnvOverrides(config: ShadowCompactConfig): ShadowCompactConfig {
+  const raw: RawSettings = {
+    ...(rawEnv(SOFT_THRESHOLD_ENV_VAR) !== undefined
+      ? { prepareThresholdPercent: envNumber(SOFT_THRESHOLD_ENV_VAR) }
+      : {}),
+    ...(rawEnv(NATIVE_THRESHOLD_ENV_VAR) !== undefined
+      ? { nativeFallbackThresholdPercent: envNumber(NATIVE_THRESHOLD_ENV_VAR) }
+      : {}),
+    ...(rawEnv(SUMMARIZER_PROVIDER_ENV_VAR) !== undefined || rawEnv(SUMMARIZER_ID_ENV_VAR) !== undefined
+      ? { summarizerModel: envModelPair(SUMMARIZER_PROVIDER_ENV_VAR, SUMMARIZER_ID_ENV_VAR) }
+      : {}),
+    ...(rawEnv(SUMMARIZER_THINKING_ENV_VAR) !== undefined
+      ? { thinkingLevel: rawEnv(SUMMARIZER_THINKING_ENV_VAR) }
+      : {}),
+    ...(rawEnv(VERIFIER_PROVIDER_ENV_VAR) !== undefined || rawEnv(VERIFIER_ID_ENV_VAR) !== undefined
+      ? { verificationModel: envModelPair(VERIFIER_PROVIDER_ENV_VAR, VERIFIER_ID_ENV_VAR) }
+      : {}),
+    ...(rawEnv(VERIFIER_THINKING_ENV_VAR) !== undefined
+      ? { verificationThinkingLevel: rawEnv(VERIFIER_THINKING_ENV_VAR) }
+      : {}),
+    ...(rawEnv(MANUAL_MODE_ENV_VAR) !== undefined ? { manualCompactMode: rawEnv(MANUAL_MODE_ENV_VAR) } : {}),
+    ...(rawEnv(IDLE_MIN_TOKENS_ENV_VAR) !== undefined
+      ? { idleCompact: { minimumTokens: envNumber(IDLE_MIN_TOKENS_ENV_VAR) } }
+      : {}),
+  };
+  const envLabel: Label = (key) => ENV_VAR_BY_KEY[key] ?? key;
+  const { idleCompact, ...settings } = validateSettings(raw, envLabel);
+  // Env-only knobs outside the shared record.
+  const softTokens = expectPositiveInt(
+    envNumber(SOFT_THRESHOLD_ABS_ENV_VAR),
+    SOFT_THRESHOLD_ABS_ENV_VAR,
+  );
+  const merged: ShadowCompactConfig = {
+    ...config,
+    ...settings,
+    ...(softTokens !== undefined ? { softCompactThresholdTokens: softTokens } : {}),
+    ...(idleCompact !== undefined
+      ? { idleCompact: { ...config.idleCompact, ...idleCompact } }
+      : {}),
+  };
+  if (settings.nativeFallbackThresholdPercent !== undefined) assertThresholdOrder(merged, envLabel);
+  return merged;
+}
+
+const ENV_VAR_BY_KEY: Record<keyof RawSettings, string> = {
+  prepareThresholdPercent: SOFT_THRESHOLD_ENV_VAR,
+  nativeFallbackThresholdPercent: NATIVE_THRESHOLD_ENV_VAR,
+  summarizerModel: `${SUMMARIZER_PROVIDER_ENV_VAR} / ${SUMMARIZER_ID_ENV_VAR}`,
+  summaryMaxTokens: "summaryMaxTokens",
+  thinkingLevel: SUMMARIZER_THINKING_ENV_VAR,
+  verificationModel: `${VERIFIER_PROVIDER_ENV_VAR} / ${VERIFIER_ID_ENV_VAR}`,
+  verificationThinkingLevel: VERIFIER_THINKING_ENV_VAR,
+  idleCompact: `${IDLE_MIN_TOKENS_ENV_VAR} idleCompact`,
+  recentTurns: "recentTurns",
+  manualCompactMode: MANUAL_MODE_ENV_VAR,
+};
+
+async function readOptional(path: string): Promise<string | undefined> {
+  try {
+    return await readFile(path, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw new Error(`Cannot read ${path}: ${String(error)}`);
+  }
 }
 
 /**
@@ -245,281 +514,4 @@ export function isAtOrAboveNativeFallback(
     usage.percent !== null &&
     usage.percent >= config.nativeFallbackThresholdPercent
   );
-}
-
-function assertEnvPair(
-  first: string | undefined,
-  firstVar: string,
-  second: string | undefined,
-  secondVar: string,
-): void {
-  if ((first !== undefined) !== (second !== undefined)) {
-    throw new Error(`${firstVar} and ${secondVar} must both be set or both be unset`);
-  }
-}
-
-function parseEnvManualMode(): ManualCompactMode | undefined {
-  const env = rawEnv(MANUAL_MODE_ENV_VAR);
-  if (env === undefined) return undefined;
-  if (env.trimmed !== "shadow" && env.trimmed !== "native") {
-    throw new Error(`${MANUAL_MODE_ENV_VAR} must be "shadow" or "native", got ${JSON.stringify(env.raw)}`);
-  }
-  return env.trimmed;
-}
-
-export function applyEnvOverrides(config: ShadowCompactConfig): ShadowCompactConfig {
-  const soft = parseEnvThreshold(SOFT_THRESHOLD_ENV_VAR);
-  const native = parseEnvThreshold(NATIVE_THRESHOLD_ENV_VAR);
-  const softTokens = parseEnvTokenCount(SOFT_THRESHOLD_ABS_ENV_VAR);
-  const idleMinTokens = parseEnvTokenCount(IDLE_MIN_TOKENS_ENV_VAR);
-  const manualMode = parseEnvManualMode();
-  const summarizerProvider = parseOptionalString(SUMMARIZER_PROVIDER_ENV_VAR);
-  const summarizerId = parseOptionalString(SUMMARIZER_ID_ENV_VAR);
-  assertEnvPair(summarizerProvider, SUMMARIZER_PROVIDER_ENV_VAR, summarizerId, SUMMARIZER_ID_ENV_VAR);
-  const summarizerThinking = parseEnvThinking(SUMMARIZER_THINKING_ENV_VAR);
-  const verifierProvider = parseOptionalString(VERIFIER_PROVIDER_ENV_VAR);
-  const verifierId = parseOptionalString(VERIFIER_ID_ENV_VAR);
-  assertEnvPair(verifierProvider, VERIFIER_PROVIDER_ENV_VAR, verifierId, VERIFIER_ID_ENV_VAR);
-  const verifierThinking = parseEnvThinking(VERIFIER_THINKING_ENV_VAR);
-  const merged: ShadowCompactConfig = {
-    ...config,
-    ...(soft !== undefined ? { prepareThresholdPercent: soft } : {}),
-    ...(native !== undefined ? { nativeFallbackThresholdPercent: native } : {}),
-    ...(softTokens !== undefined ? { softCompactThresholdTokens: softTokens } : {}),
-    ...(idleMinTokens !== undefined
-      ? { idleCompact: { ...config.idleCompact, minimumTokens: idleMinTokens } }
-      : {}),
-    ...(manualMode !== undefined ? { manualCompactMode: manualMode } : {}),
-    ...(summarizerProvider !== undefined && summarizerId !== undefined
-      ? { summarizerModel: { provider: summarizerProvider, id: summarizerId } }
-      : {}),
-    ...(summarizerThinking !== undefined ? { thinkingLevel: summarizerThinking } : {}),
-    ...(verifierProvider !== undefined && verifierId !== undefined
-      ? { verificationModel: { provider: verifierProvider, id: verifierId } }
-      : {}),
-    ...(verifierThinking !== undefined ? { verificationThinkingLevel: verifierThinking } : {}),
-  };
-  // Only env-moved thresholds are cross-checked here so file behavior keeps
-  // its own validation path and env misuse still fails fast.
-  if (
-    native !== undefined &&
-    merged.nativeFallbackThresholdPercent <= merged.prepareThresholdPercent
-  ) {
-    throw new Error(
-      `${NATIVE_THRESHOLD_ENV_VAR} must be greater than the prepare threshold ` +
-        `(${merged.prepareThresholdPercent}), got ${merged.nativeFallbackThresholdPercent}`,
-    );
-  }
-  return merged;
-}
-
-async function readOptional(path: string): Promise<string | undefined> {
-  try {
-    return await readFile(path, "utf8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-    throw new Error(`Cannot read ${path}: ${String(error)}`);
-  }
-}
-
-function assertKnownKeys(
-  value: Record<string, unknown>,
-  allowed: readonly string[],
-  path: string,
-  scope: string,
-): void {
-  for (const key of Object.keys(value)) {
-    if (!allowed.includes(key)) {
-      throw new Error(scope ? `${path} ${scope} has unknown key: ${key}` : `${path} has unknown key: ${key}`);
-    }
-  }
-}
-
-interface ModelPair {
-  provider: string;
-  id: string;
-}
-
-function parseModelPair(value: unknown, path: string, key: string): ModelPair {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`${path} ${key} must be an object`);
-  }
-  const record = value as Record<string, unknown>;
-  assertKnownKeys(record, ["provider", "id"], path, key);
-  const provider = typeof record.provider === "string" ? record.provider.trim() : "";
-  const id = typeof record.id === "string" ? record.id.trim() : "";
-  if (record.provider !== undefined && typeof record.provider !== "string") {
-    throw new Error(`${path} ${key}.provider must be a string`);
-  }
-  if (record.id !== undefined && typeof record.id !== "string") {
-    throw new Error(`${path} ${key}.id must be a string`);
-  }
-  if ((provider.length > 0) !== (id.length > 0)) {
-    throw new Error(`${path} ${key}.provider and .id must both be blank or both be set`);
-  }
-  return { provider, id };
-}
-
-function parsePositiveInt(value: unknown, path: string, key: string): number | undefined {
-  if (value === undefined) return undefined;
-  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
-    throw new Error(`${path} ${key} must be a positive integer`);
-  }
-  return value;
-}
-
-function parseThinkingLevel(value: unknown, path: string, key: string): ModelThinkingLevel | undefined {
-  if (value === undefined) return undefined;
-  if (typeof value !== "string" || !THINKING_LEVELS.includes(value as ModelThinkingLevel)) {
-    throw new Error(`${path} ${key} must be one of: ${THINKING_LEVELS.join(", ")}`);
-  }
-  return value as ModelThinkingLevel;
-}
-
-function parseFileThreshold(value: unknown, path: string, key: string): number | undefined {
-  if (value === undefined) return undefined;
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    throw new Error(`${path} ${key} must be a number`);
-  }
-  if (value < 1 || value > 99) {
-    throw new Error(`${path} ${key} must be between 1 and 99`);
-  }
-  return value;
-}
-
-/**
- * Resolves a canonical threshold key with its legacy alias. Both present
- * with different values is a config bug and throws; otherwise the explicit
- * value wins and the default fills a fully absent threshold.
- */
-function resolveThreshold(
-  record: Record<string, unknown>,
-  path: string,
-  key: string,
-  aliasKey: string,
-  defaultValue: number,
-): number {
-  const primary = parseFileThreshold(record[key], path, key);
-  const alias = parseFileThreshold(record[aliasKey], path, aliasKey);
-  if (primary !== undefined && alias !== undefined && primary !== alias) {
-    throw new Error(`${path} ${key} and legacy ${aliasKey} conflict; use ${key}`);
-  }
-  return primary ?? alias ?? defaultValue;
-}
-
-function parseBoolean(value: unknown, path: string, key: string): boolean | undefined {
-  if (value === undefined) return undefined;
-  if (typeof value !== "boolean") {
-    throw new Error(`${path} ${key} must be a boolean`);
-  }
-  return value;
-}
-
-function parseManualMode(value: unknown, path: string): ManualCompactMode | undefined {
-  if (value === undefined) return undefined;
-  if (value !== "shadow" && value !== "native") {
-    throw new Error(`${path} manualCompactMode must be "shadow" or "native"`);
-  }
-  return value;
-}
-
-function parseIdleCompact(
-  value: unknown,
-  path: string,
-): ShadowCompactConfig["idleCompact"] | undefined {
-  if (value === undefined) return undefined;
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`${path} idleCompact must be an object`);
-  }
-  const record = value as Record<string, unknown>;
-  assertKnownKeys(record, ["enabled", "minimumTokens"], path, "idleCompact");
-  const enabled = parseBoolean(record.enabled, path, "idleCompact.enabled") ?? true;
-  const minimumTokens = parsePositiveInt(record.minimumTokens, path, "idleCompact.minimumTokens")
-    ?? DEFAULT_IDLE_COMPACT_MIN_TOKENS;
-  return { enabled, minimumTokens };
-}
-
-export function parseConfig(source: string, path: string): ShadowCompactConfig {
-  let value: unknown;
-  try {
-    value = JSON.parse(source);
-  } catch (error) {
-    throw new Error(`${path} is not valid JSON`, { cause: error });
-  }
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`${path} must contain a JSON object`);
-  }
-  const record = value as Record<string, unknown>;
-  assertKnownKeys(
-    record,
-    [
-      "prepareThresholdPercent",
-      "nativeFallbackThresholdPercent",
-      "softCompactThresholdPercent",
-      "summarizerModel",
-      "summaryMaxTokens",
-      "thinkingLevel",
-      "verificationModel",
-      "verificationThinkingLevel",
-      "idleCompact",
-      "recentTurns",
-      "manualCompactMode",
-    ],
-    path,
-    "",
-  );
-
-  const prepareThresholdPercent = resolveThreshold(
-    record,
-    path,
-    "prepareThresholdPercent",
-    "softCompactThresholdPercent",
-    DEFAULT_PREPARE_THRESHOLD_PERCENT,
-  );
-  const nativeFallbackThresholdPercent = parseFileThreshold(
-    record.nativeFallbackThresholdPercent,
-    path,
-    "nativeFallbackThresholdPercent",
-  ) ?? DEFAULT_NATIVE_FALLBACK_THRESHOLD_PERCENT;
-  if (
-    record.nativeFallbackThresholdPercent !== undefined &&
-    nativeFallbackThresholdPercent <= prepareThresholdPercent
-  ) {
-    throw new Error(`${path} nativeFallbackThresholdPercent must be greater than prepareThresholdPercent`);
-  }
-
-  const summarizer = record.summarizerModel === undefined
-    ? { provider: "", id: "" }
-    : parseModelPair(record.summarizerModel, path, "summarizerModel");
-
-  const config: ShadowCompactConfig = {
-    prepareThresholdPercent,
-    nativeFallbackThresholdPercent,
-    summarizerModel: summarizer,
-    idleCompact: parseIdleCompact(record.idleCompact, path)
-      ?? { enabled: true, minimumTokens: DEFAULT_IDLE_COMPACT_MIN_TOKENS },
-    recentTurns: parsePositiveInt(record.recentTurns, path, "recentTurns") ?? DEFAULT_RECENT_TURNS,
-    manualCompactMode: parseManualMode(record.manualCompactMode, path) ?? "shadow",
-  };
-
-  const maxTokens = parsePositiveInt(record.summaryMaxTokens, path, "summaryMaxTokens");
-  if (maxTokens !== undefined) config.summaryMaxTokens = maxTokens;
-
-  const thinkingLevel = parseThinkingLevel(record.thinkingLevel, path, "thinkingLevel");
-  if (thinkingLevel !== undefined) config.thinkingLevel = thinkingLevel;
-
-  if (record.verificationModel !== undefined) {
-    config.verificationModel = parseModelPair(record.verificationModel, path, "verificationModel");
-  }
-
-  const verificationThinkingLevel = parseThinkingLevel(
-    record.verificationThinkingLevel,
-    path,
-    "verificationThinkingLevel",
-  );
-  if (verificationThinkingLevel !== undefined) {
-    config.verificationThinkingLevel = verificationThinkingLevel;
-  }
-
-  return config;
 }

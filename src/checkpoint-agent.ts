@@ -835,10 +835,8 @@ export async function runCheckpointVerifierAgent(
             return { fatal: new UnusableCheckpointError(reason) };
           }
           if (verdict === "accept") {
-            if (request.targetSummaryChars !== undefined) {
-              requireCompletion(state);
-              validateCoverage(index, draftCoverage.coverageEndEntryId);
-            }
+            requireCompletion(state);
+            validateCoverage(index, draftCoverage.coverageEndEntryId);
             // The builder already required a size correction, so accept the
             // draft up to the hard target instead of forcing a rewrite.
             requireConciseSummary(draft, target, hardTarget, true);
@@ -846,7 +844,7 @@ export async function runCheckpointVerifierAgent(
             return { done: true };
           }
           if (verdict === "repair") {
-            if (request.targetSummaryChars !== undefined) requireCompletion(state);
+            requireCompletion(state);
             const { entryId } = validateCoverage(index, args.coverageEndEntryId);
             const checkpoint = validateCheckpointObject(args.checkpoint, state.servedRefs);
             requireContinuation(checkpoint);

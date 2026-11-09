@@ -19,8 +19,8 @@ import {
 } from "./checkpoint-agent.js";
 import {
   buildCoverage,
+  CHECKPOINT_SCHEMA_VERSION,
   currentPromptVersions,
-  type CheckpointCoverage,
 } from "./summary.js";
 import {
   DEFAULT_NATIVE_FALLBACK_THRESHOLD_PERCENT,
@@ -37,15 +37,13 @@ import {
   checkpointStalenessReason,
   findLatestRestorableCheckpoint,
   latestCompactionId,
-  toPersistedCheckpoint,
-  toPreparedResult,
+  type PreparedResult,
 } from "./persist.js";
 import { compactWithRecovery } from "./native-compaction.js";
 import { sanitizeForContext } from "./normalize.js";
 import { fileDetails, hasCompactableHistory } from "./working-context.js";
-import { registerActingRequestObserver } from "./request-trace.js";
 import { SessionHistoryIndex } from "./session-reader.js";
-import { ShadowCompactStateController, type PreparedResult } from "./state.js";
+import { ShadowCompactStateController } from "./state.js";
 import {
   combineUsage,
   resolveSummarizerModel,
@@ -89,7 +87,6 @@ function isContextStale(ctx: ExtensionContext): boolean {
 }
 
 export default function shadowCompact(pi: ExtensionAPI): void {
-  registerActingRequestObserver(pi);
   const state = new ShadowCompactStateController();
   let configPromise: Promise<ShadowCompactConfig> | undefined;
   let reportedError: string | undefined;
@@ -129,34 +126,21 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     return true;
   };
 
-  // A v2 checkpoint carries its evidence boundary; a v1 restore derives it
-  // from the cut it was prepared with (the summary covers everything before
-  // firstKeptEntryId). Undefined means the anchor left the branch: stale.
-  const effectiveCoverage = (
-    branch: SessionEntry[],
-    result: PreparedResult,
-  ): CheckpointCoverage | undefined => {
-    if (result.coverage) {
-      return branch.some((entry) => entry.id === result.coverage!.coverageEndEntryId)
-        ? result.coverage
-        : undefined;
-    }
-    const index = branch.findIndex((entry) => entry.id === result.firstKeptEntryId);
-    if (index < 0) return undefined;
-    return {
-      sourceStartEntryId: null,
-      coverageEndEntryId: index > 0 ? branch[index - 1]!.id : "",
-      preparedAtLeafId: result.leafId,
-      publishedAtLeafId: result.leafId,
-    };
-  };
+  const resultIsCurrent = (ctx: ExtensionContext, result: PreparedResult): boolean =>
+    checkpointStalenessReason(
+      ctx.sessionManager.getBranch(),
+      ctx.sessionManager.getSessionId(),
+      result,
+    ) === undefined;
 
-  const resultIsCurrent = (ctx: ExtensionContext, result: PreparedResult): boolean => {
-    const branch = ctx.sessionManager.getBranch();
-    return (
-      checkpointStalenessReason(branch, ctx.sessionManager.getSessionId(), result) === undefined &&
-      effectiveCoverage(branch, result) !== undefined
-    );
+  /**
+   * The one staleness sync. A checkpoint whose session, cut, coverage, or
+   * native-compaction ancestry moved can never serve or install again, so it
+   * is dropped (which re-arms the next crossing) rather than left latched.
+   * Every hook that can act on the serving checkpoint calls this first.
+   */
+  const dropStalePublishedCheckpoint = (ctx: ExtensionContext): void => {
+    if (state.published && !resultIsCurrent(ctx, state.published)) state.discardPublished();
   };
 
   // Shared durability path: a published, still-current checkpoint is appended
@@ -171,16 +155,12 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       // A native compaction landed under the checkpoint (or the branch moved
       // on): drop the projection and re-arm so the next crossing prepares
       // fresh. Validation on restore rejects the persisted twin the same way.
-      state.discardPublished();
+      dropStalePublishedCheckpoint(ctx);
       return;
     }
     if (result.checkpointId === state.persistedCheckpointId) return;
-    // A structured checkpoint persists as v3; a v1 restore without one
-    // re-persists as v1 until a fresh preparation replaces it. A restored
-    // legacy v2 checkpoint re-persists as v3 with its Jev payload dropped.
-    const checkpoint = toPersistedCheckpoint(result);
     try {
-      pi.appendEntry(CHECKPOINT_CUSTOM_TYPE, checkpoint);
+      pi.appendEntry(CHECKPOINT_CUSTOM_TYPE, result);
     } catch (error) {
       // An append can fail when the idle point races teardown. The checkpoint
       // keeps serving and the next settle retries; nothing crashes the agent.
@@ -197,7 +177,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     traceEvent("checkpoint_persisted", {
       turn: turnCount,
       generation: state.generation,
-      version: checkpoint.version,
+      version: result.version,
       checkpointId: result.checkpointId,
       firstKeptEntryId: result.firstKeptEntryId,
       leafId: result.leafId,
@@ -230,14 +210,13 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       });
     }
     if (!found) return;
-    const restored = toPreparedResult(found.checkpoint);
-    state.restorePublished(restored);
+    state.restorePublished(found.checkpoint);
     traceEvent("checkpoint_restored", {
       version: found.checkpoint.version,
       checkpointId: found.checkpoint.checkpointId,
       firstKeptEntryId: found.checkpoint.firstKeptEntryId,
       leafId: found.checkpoint.leafId,
-      coverageEnd: restored.coverage?.coverageEndEntryId ?? null,
+      coverageEnd: found.checkpoint.coverage.coverageEndEntryId,
       summaryChars: found.checkpoint.summary.length,
     });
   };
@@ -461,6 +440,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       });
       const estimate = planSwap(branch, coverage.coverageEndEntryId, config.recentTurns);
       const result: PreparedResult = {
+        version: CHECKPOINT_SCHEMA_VERSION,
         checkpointId: randomUUID(),
         sessionId: sessionIdAtStart,
         leafId: publishedLeaf,
@@ -470,6 +450,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         usage,
         details: fileDetails(branch),
         contextTokensBefore: ctx.getContextUsage()?.tokens ?? 0,
+        createdAt: Date.now(),
         coverage,
         structured: verified.checkpoint,
         generatedAt: Date.now(),
@@ -656,16 +637,14 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       return undefined;
     }
     if (!resultIsCurrent(ctx, result)) return undefined;
-    const coverage = effectiveCoverage(branch, result);
-    if (!coverage) return undefined;
+    const coverage = result.coverage;
     const built = buildWorkingContext({
       checkpoint: { summary: result.summary, coverage },
       branch,
       messages: event.messages,
       minimumRecentTurns: config?.recentTurns ?? DEFAULT_RECENT_TURNS,
-      ...(result.contextTokensBefore !== undefined ? { contextTokensBefore: result.contextTokensBefore } : {}),
-      // v1 checkpoints carry an entry-granular cut, not a coverage promise.
-      ...(result.coverage ? { retainedAnchor: result.firstKeptEntryId } : { coverageTailOverride: result.firstKeptEntryId }),
+      contextTokensBefore: result.contextTokensBefore,
+      retainedAnchor: result.firstKeptEntryId,
     });
     if (isWorkingContextSkipped(built)) {
       traceEvent("swap_applied", {
@@ -714,14 +693,12 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     const messages = buildSessionProjection(branch).messages.filter((message) => message.role !== "system");
     const result = state.published;
     if (!result || !resultIsCurrent(ctx, result)) return messages;
-    const coverage = effectiveCoverage(branch, result);
-    if (!coverage) return messages;
     const built = buildWorkingContext({
-      checkpoint: { summary: result.summary, coverage },
+      checkpoint: { summary: result.summary, coverage: result.coverage },
       branch,
       messages,
       minimumRecentTurns: recentTurns,
-      ...(result.coverage ? { retainedAnchor: result.firstKeptEntryId } : { coverageTailOverride: result.firstKeptEntryId }),
+      retainedAnchor: result.firstKeptEntryId,
     });
     return isWorkingContextSkipped(built) ? messages : built.messages;
   };
@@ -735,9 +712,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     firstKeptEntryId: string,
   ): boolean => {
     const branch = ctx.sessionManager.getBranch();
-    const coverage = effectiveCoverage(branch, result);
-    if (!coverage) return false;
-    return isCoveredPrefix(branch, coverage.coverageEndEntryId, firstKeptEntryId);
+    return isCoveredPrefix(branch, result.coverage.coverageEndEntryId, firstKeptEntryId);
   };
 
   const serveCompaction = (
@@ -833,14 +808,16 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       } as SessionEntry);
     }
     if (latestCompactionId(branch) !== result.latestCompactionId) return;
-    const coverage = effectiveCoverage(branch, result);
-    if (!coverage || (result.coverage && !coverageIsUnchanged(branch, result.coverage))) return;
+    const coverage = result.coverage;
+    // The replayed drafts must still cover the checkpoint's evidence boundary.
+    if (!branch.some((entry) => entry.id === coverage.coverageEndEntryId)) return;
+    if (!coverageIsUnchanged(branch, coverage)) return;
     const beforeMessages = event.context.contextMessages;
     const before = beforeMessages.filter((message) => message.role !== "system");
     const built = buildWorkingContext({
       checkpoint: { summary: result.summary, coverage }, branch, messages: before,
       minimumRecentTurns: recentTurns,
-      ...(result.coverage ? { retainedAnchor: result.firstKeptEntryId } : { coverageTailOverride: result.firstKeptEntryId }),
+      retainedAnchor: result.firstKeptEntryId,
     });
     if (isWorkingContextSkipped(built)) return;
     const firstKeptEntryId = built.plan.swapStartEntryId;
@@ -911,9 +888,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     // published, no refresh starts (rolling replaces it instead).
     if (!isRollingEnabled() && state.published) return;
 
-    // A stale serving checkpoint can never land again: drop it so the next
-    // crossing retries fresh instead of latching.
-    if (state.published && !resultIsCurrent(ctx, state.published)) state.discardPublished();
+    dropStalePublishedCheckpoint(ctx);
 
     if (
       isRollingEnabled() &&
@@ -1004,13 +979,12 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     if (state.preparing || state.pendingNativeFallback) return;
     const tokens = ctx.getContextUsage()?.tokens;
     if (typeof tokens !== "number" || tokens < config.idleCompact.minimumTokens) return;
-    if (state.published && !resultIsCurrent(ctx, state.published)) state.discardPublished();
+    dropStalePublishedCheckpoint(ctx);
     const published = state.published;
     if (published) {
       const branch = ctx.sessionManager.getBranch();
       const leafId = ctx.sessionManager.getLeafId() ?? branch[branch.length - 1]?.id;
-      const coverage = effectiveCoverage(branch, published);
-      if (coverage && coverage.coverageEndEntryId === leafId) return;
+      if (published.coverage.coverageEndEntryId === leafId) return;
     }
     requestCheckpoint(ctx, config, ctx.sessionManager.getBranch(), "idle");
   };
@@ -1022,7 +996,9 @@ export default function shadowCompact(pi: ExtensionAPI): void {
   });
 
   pi.on("turn_start", (_event, ctx) => {
-    if (!isObserveMode()) observeInstalledCheckpoint(ctx);
+    if (isObserveMode()) return;
+    observeInstalledCheckpoint(ctx);
+    dropStalePublishedCheckpoint(ctx);
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
@@ -1038,6 +1014,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
   pi.on("context", async (event, ctx) => {
     if (isObserveMode()) return undefined;
     observeInstalledCheckpoint(ctx);
+    dropStalePublishedCheckpoint(ctx);
     const config = await configFor(ctx).catch(() => undefined);
     return swapSummaryIntoContext(ctx, event, config);
   });

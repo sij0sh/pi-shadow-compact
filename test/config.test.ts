@@ -898,7 +898,7 @@ describe("shadow compact config loading", () => {
       assert.equal((await loadConfig(context(cwd))).nativeFallbackThresholdPercent, 95);
 
       process.env[NATIVE_THRESHOLD_ENV_VAR] = "50";
-      await assert.rejects(loadConfig(context(cwd)), /must be greater than the prepare threshold/);
+      await assert.rejects(loadConfig(context(cwd)), /must be greater than prepareThresholdPercent/);
     });
 
     it("env manual mode accepts shadow/native and rejects the rest", async (t) => {
