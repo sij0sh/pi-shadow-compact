@@ -1,4 +1,6 @@
-.agents/
+.agents/*
+!.agents/adr/
+!.agents/adr/**
 node_modules/
 dist/
 .pi-files/
@@ -6,3 +8,6 @@ experiments/
 analysis/
 AGENTS.md
 .trace/
+.env
+.env.*
+!.env.example
