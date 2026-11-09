@@ -9,8 +9,6 @@ import {
   DEFAULT_NATIVE_FALLBACK_THRESHOLD_PERCENT,
   DEFAULT_PREPARE_THRESHOLD_PERCENT,
   DEFAULT_RECENT_TURNS,
-  DEFAULT_SWAP_THRESHOLD_PERCENT,
-  HARD_THRESHOLD_ENV_VAR,
   IDLE_MIN_TOKENS_ENV_VAR,
   MANUAL_MODE_ENV_VAR,
   MODE_ENV_VAR,
@@ -26,9 +24,7 @@ import {
   defaultConfig,
   isAtOrAboveNativeFallback,
   isAtOrAbovePrepare,
-  isAtOrAboveSwap,
-  isAtOrAboveSoft,
-  isBelowSoft,
+  isBelowPrepare,
   isObserveMode,
   loadConfig,
 } from "../src/config.js";
@@ -38,7 +34,6 @@ const CONFIG_FILE = "shadow-compact.json";
 function expectedConfig(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     prepareThresholdPercent: DEFAULT_PREPARE_THRESHOLD_PERCENT,
-    swapThresholdPercent: DEFAULT_SWAP_THRESHOLD_PERCENT,
     nativeFallbackThresholdPercent: DEFAULT_NATIVE_FALLBACK_THRESHOLD_PERCENT,
     summarizerModel: { provider: "", id: "" },
     idleCompact: { enabled: true, minimumTokens: DEFAULT_IDLE_COMPACT_MIN_TOKENS },
@@ -51,7 +46,6 @@ function expectedConfig(overrides: Record<string, unknown> = {}): Record<string,
 let savedAgentDirEnv: string | undefined;
 let savedSoftEnv: string | undefined;
 let savedSoftTokensEnv: string | undefined;
-let savedHardEnv: string | undefined;
 let savedNativeEnv: string | undefined;
 let savedManualEnv: string | undefined;
 let savedIdleEnv: string | undefined;
@@ -126,7 +120,6 @@ beforeEach(async () => {
   savedAgentDirEnv = process.env.PI_CODING_AGENT_DIR;
   savedSoftEnv = process.env[SOFT_THRESHOLD_ENV_VAR];
   savedSoftTokensEnv = process.env[SOFT_THRESHOLD_ABS_ENV_VAR];
-  savedHardEnv = process.env[HARD_THRESHOLD_ENV_VAR];
   savedNativeEnv = process.env[NATIVE_THRESHOLD_ENV_VAR];
   savedManualEnv = process.env[MANUAL_MODE_ENV_VAR];
   savedIdleEnv = process.env[IDLE_MIN_TOKENS_ENV_VAR];
@@ -139,7 +132,6 @@ beforeEach(async () => {
   savedVerifierThinkingEnv = process.env[VERIFIER_THINKING_ENV_VAR];
   delete process.env[SOFT_THRESHOLD_ENV_VAR];
   delete process.env[SOFT_THRESHOLD_ABS_ENV_VAR];
-  delete process.env[HARD_THRESHOLD_ENV_VAR];
   delete process.env[NATIVE_THRESHOLD_ENV_VAR];
   delete process.env[MANUAL_MODE_ENV_VAR];
   delete process.env[IDLE_MIN_TOKENS_ENV_VAR];
@@ -169,11 +161,6 @@ afterEach(async () => {
     delete process.env[SOFT_THRESHOLD_ABS_ENV_VAR];
   } else {
     process.env[SOFT_THRESHOLD_ABS_ENV_VAR] = savedSoftTokensEnv;
-  }
-  if (savedHardEnv === undefined) {
-    delete process.env[HARD_THRESHOLD_ENV_VAR];
-  } else {
-    process.env[HARD_THRESHOLD_ENV_VAR] = savedHardEnv;
   }
   if (savedNativeEnv === undefined) {
     delete process.env[NATIVE_THRESHOLD_ENV_VAR];
@@ -245,7 +232,6 @@ describe("shadow compact config loading", () => {
 
     assert.deepEqual(await loadConfig(context(cwd)), expectedConfig({
       prepareThresholdPercent: 80,
-      swapThresholdPercent: DEFAULT_SWAP_THRESHOLD_PERCENT,
       summarizerModel: { provider: "global-provider", id: "global-model" },
     }));
   });
@@ -257,7 +243,6 @@ describe("shadow compact config loading", () => {
 
     assert.deepEqual(await loadConfig(context(cwd)), expectedConfig({
       prepareThresholdPercent: 42,
-      swapThresholdPercent: DEFAULT_SWAP_THRESHOLD_PERCENT,
       summarizerModel: { provider: "project-provider", id: "project-model" },
     }));
   });
@@ -269,7 +254,6 @@ describe("shadow compact config loading", () => {
 
     assert.deepEqual(await loadConfig(context(cwd)), expectedConfig({
       prepareThresholdPercent: 42,
-      swapThresholdPercent: DEFAULT_SWAP_THRESHOLD_PERCENT,
       summarizerModel: { provider: "", id: "" },
     }));
   });
@@ -281,7 +265,6 @@ describe("shadow compact config loading", () => {
 
     assert.deepEqual(await loadConfig(context(cwd, false)), expectedConfig({
       prepareThresholdPercent: 80,
-      swapThresholdPercent: DEFAULT_SWAP_THRESHOLD_PERCENT,
       summarizerModel: { provider: "global-provider", id: "global-model" },
     }));
   });
@@ -292,14 +275,12 @@ describe("shadow compact config loading", () => {
     await writeJson(projectConfigPath(cwd), configBody(42.5, " provider ", " model "));
     assert.deepEqual(await loadConfig(context(cwd)), expectedConfig({
       prepareThresholdPercent: 42.5,
-      swapThresholdPercent: DEFAULT_SWAP_THRESHOLD_PERCENT,
       summarizerModel: { provider: "provider", id: "model" },
     }));
 
     await writeJson(projectConfigPath(cwd), configBody(42.5));
     assert.deepEqual(await loadConfig(context(cwd)), expectedConfig({
       prepareThresholdPercent: 42.5,
-      swapThresholdPercent: DEFAULT_SWAP_THRESHOLD_PERCENT,
       summarizerModel: { provider: "", id: "" },
     }));
   });
@@ -314,39 +295,10 @@ describe("shadow compact config loading", () => {
 
     assert.deepEqual(await loadConfig(context(cwd)), expectedConfig({
       prepareThresholdPercent: 42,
-      swapThresholdPercent: DEFAULT_SWAP_THRESHOLD_PERCENT,
       summarizerModel: { provider: "provider", id: "model" },
       summaryMaxTokens: 32_768,
       thinkingLevel: "high",
     }));
-  });
-
-  it("accepts a swapThresholdPercent override", async (t) => {
-    const cwd = await temporaryCwd(t);
-    await writeJson(projectConfigPath(cwd), {
-      ...configBody(60),
-      swapThresholdPercent: 90,
-    });
-
-    assert.deepEqual(await loadConfig(context(cwd)), expectedConfig({
-      prepareThresholdPercent: 60,
-      swapThresholdPercent: 90,
-      summarizerModel: { provider: "", id: "" },
-    }));
-  });
-
-  it("rejects a swapThresholdPercent at or below the soft threshold", async (t) => {
-    const cwd = await temporaryCwd(t);
-    await writeJson(projectConfigPath(cwd), {
-      ...configBody(60),
-      swapThresholdPercent: 60,
-    });
-
-    await assertLoadError(
-      loadConfig(context(cwd)),
-      projectConfigPath(cwd),
-      /swapThresholdPercent must be greater than prepareThresholdPercent/,
-    );
   });
 
   for (const location of ["global", "project"] as const) {
@@ -471,10 +423,6 @@ describe("shadow compact config loading", () => {
         { summaryMaxTokens: null },
         { thinkingLevel: "bogus" },
         { thinkingLevel: 5 },
-        { swapThresholdPercent: 0 },
-        { swapThresholdPercent: 100 },
-        { swapThresholdPercent: "80" },
-        { swapThresholdPercent: null },
       ]) {
         it(`invalid ${JSON.stringify(invalid)} throws with the file path`, async (t) => {
           const cwd = await temporaryCwd(t);
@@ -483,7 +431,7 @@ describe("shadow compact config loading", () => {
           await assertLoadError(
             loadConfig(context(cwd)),
             path,
-            /summaryMaxTokens must be a positive integer|thinkingLevel must be one of|swapThresholdPercent must be/,
+            /summaryMaxTokens must be a positive integer|thinkingLevel must be one of/,
           );
         });
       }
@@ -492,43 +440,23 @@ describe("shadow compact config loading", () => {
   }
 
   describe("threshold environment overrides", () => {
-    it("env thresholds override file config", async (t) => {
+    it("env threshold overrides file config", async (t) => {
       const cwd = await temporaryCwd(t);
-      await writeJson(projectConfigPath(cwd), {
-        ...configBody(60),
-        swapThresholdPercent: 80,
-      });
+      await writeJson(projectConfigPath(cwd), configBody(60));
       process.env[SOFT_THRESHOLD_ENV_VAR] = "5";
-      process.env[HARD_THRESHOLD_ENV_VAR] = "15";
 
       assert.deepEqual(await loadConfig(context(cwd)), expectedConfig({
         prepareThresholdPercent: 5,
-        swapThresholdPercent: 15,
         summarizerModel: { provider: "", id: "" },
       }));
-    });
-
-    it("a single env threshold merges with file config", async (t) => {
-      const cwd = await temporaryCwd(t);
-      await writeJson(projectConfigPath(cwd), {
-        ...configBody(60),
-        swapThresholdPercent: 80,
-      });
-      process.env[SOFT_THRESHOLD_ENV_VAR] = "10";
-
-      const config = await loadConfig(context(cwd));
-      assert.equal(config.prepareThresholdPercent, 10);
-      assert.equal(config.swapThresholdPercent, 80);
     });
 
     it("empty env values are ignored", async (t) => {
       const cwd = await temporaryCwd(t);
       process.env[SOFT_THRESHOLD_ENV_VAR] = "  ";
-      process.env[HARD_THRESHOLD_ENV_VAR] = "";
 
       const config = await loadConfig(context(cwd));
       assert.equal(config.prepareThresholdPercent, DEFAULT_PREPARE_THRESHOLD_PERCENT);
-      assert.equal(config.swapThresholdPercent, DEFAULT_SWAP_THRESHOLD_PERCENT);
     });
 
     for (const value of ["lots", "NaN", "0", "100", "-3"]) {
@@ -547,31 +475,6 @@ describe("shadow compact config loading", () => {
       });
     }
 
-    it("env hard at or below the soft threshold throws", async (t) => {
-      const cwd = await temporaryCwd(t);
-      process.env[SOFT_THRESHOLD_ENV_VAR] = "15";
-      process.env[HARD_THRESHOLD_ENV_VAR] = "15";
-
-      await assert.rejects(
-        loadConfig(context(cwd)),
-        (error: unknown) => {
-          assert.ok(error instanceof Error);
-          assert.match(error.message, new RegExp(HARD_THRESHOLD_ENV_VAR));
-          return true;
-        },
-      );
-    });
-
-    it("env soft above the file hard threshold throws", async (t) => {
-      const cwd = await temporaryCwd(t);
-      await writeJson(projectConfigPath(cwd), {
-        ...configBody(60),
-        swapThresholdPercent: 80,
-      });
-      process.env[SOFT_THRESHOLD_ENV_VAR] = "85";
-
-      await assert.rejects(loadConfig(context(cwd)), /must be greater than the prepare threshold/);
-    });
   });
 
   describe("absolute soft threshold tokens override", () => {
@@ -588,7 +491,6 @@ describe("shadow compact config loading", () => {
       const config = await loadConfig(context(cwd));
       assert.equal(config.softCompactThresholdTokens, 60000);
       assert.equal(config.prepareThresholdPercent, DEFAULT_PREPARE_THRESHOLD_PERCENT);
-      assert.equal(config.swapThresholdPercent, DEFAULT_SWAP_THRESHOLD_PERCENT);
     });
 
     it("empty values are ignored", async (t) => {
@@ -615,29 +517,29 @@ describe("shadow compact config loading", () => {
     }
   });
 
-  describe("isAtOrAboveSoft / isBelowSoft", () => {
+  describe("isAtOrAbovePrepare / isBelowPrepare", () => {
     it("token threshold wins when set and tokens are reported", () => {
       const config = { prepareThresholdPercent: 5, softCompactThresholdTokens: 60000 };
       // Tokens above, percent below: tokens win -> at/above.
-      assert.equal(isAtOrAboveSoft({ tokens: 61000, percent: 1 }, config), true);
-      assert.equal(isBelowSoft({ tokens: 61000, percent: 1 }, config), false);
+      assert.equal(isAtOrAbovePrepare({ tokens: 61000, percent: 1 }, config), true);
+      assert.equal(isBelowPrepare({ tokens: 61000, percent: 1 }, config), false);
       // Tokens below, percent above: tokens win -> below.
-      assert.equal(isAtOrAboveSoft({ tokens: 59000, percent: 90 }, config), false);
-      assert.equal(isBelowSoft({ tokens: 59000, percent: 90 }, config), true);
+      assert.equal(isAtOrAbovePrepare({ tokens: 59000, percent: 90 }, config), false);
+      assert.equal(isBelowPrepare({ tokens: 59000, percent: 90 }, config), true);
     });
 
     it("falls back to percent when tokens are unset or unreported", () => {
-      assert.equal(isAtOrAboveSoft({ percent: 5 }, { prepareThresholdPercent: 5 }), true);
-      assert.equal(isAtOrAboveSoft({ percent: 4.9 }, { prepareThresholdPercent: 5 }), false);
+      assert.equal(isAtOrAbovePrepare({ percent: 5 }, { prepareThresholdPercent: 5 }), true);
+      assert.equal(isAtOrAbovePrepare({ percent: 4.9 }, { prepareThresholdPercent: 5 }), false);
       assert.equal(
-        isAtOrAboveSoft(
+        isAtOrAbovePrepare(
           { percent: 90 },
           { prepareThresholdPercent: 5, softCompactThresholdTokens: 60000 },
         ),
         true,
       );
       assert.equal(
-        isBelowSoft(
+        isBelowPrepare(
           { percent: 1 },
           { prepareThresholdPercent: 5, softCompactThresholdTokens: 60000 },
         ),
@@ -747,7 +649,6 @@ describe("shadow compact config loading", () => {
 
       assert.deepEqual(await loadConfig(context(cwd)), expectedConfig({
         prepareThresholdPercent: 60,
-        swapThresholdPercent: DEFAULT_SWAP_THRESHOLD_PERCENT,
         summarizerModel: { provider: "provider", id: "model" },
         verificationModel: { provider: "verify-provider", id: "org/verifier:strong" },
         verificationThinkingLevel: "high",
@@ -896,17 +797,23 @@ describe("shadow compact config loading", () => {
   });
 
   describe("threshold aliases and ordering", () => {
-    it("loads legacy soft/hard keys as prepare/swap thresholds", async (t) => {
+    it("loads the legacy soft key as the prepare threshold", async (t) => {
       const cwd = await temporaryCwd(t);
       await writeJson(projectConfigPath(cwd), {
         softCompactThresholdPercent: 55,
-        hardCompactThresholdPercent: 75,
         summarizerModel: { provider: "", id: "" },
       });
 
       const config = await loadConfig(context(cwd));
       assert.equal(config.prepareThresholdPercent, 55);
-      assert.equal(config.swapThresholdPercent, 75);
+    });
+
+    it("rejects the removed hard/swap keys", async (t) => {
+      const cwd = await temporaryCwd(t);
+      const path = projectConfigPath(cwd);
+      await writeJson(path, { ...configBody(60), hardCompactThresholdPercent: 75 });
+
+      await assertLoadError(loadConfig(context(cwd)), path, /hardCompactThresholdPercent/);
     });
 
     it("conflicting canonical and alias values throw", async (t) => {
@@ -921,15 +828,15 @@ describe("shadow compact config loading", () => {
       await assertLoadError(loadConfig(context(cwd)), path, /and legacy softCompactThresholdPercent conflict/);
     });
 
-    it("an explicit native threshold at or below swap throws", async (t) => {
+    it("an explicit native threshold at or below prepare throws", async (t) => {
       const cwd = await temporaryCwd(t);
       const path = projectConfigPath(cwd);
-      await writeJson(path, { ...configBody(60), nativeFallbackThresholdPercent: 80 });
+      await writeJson(path, { ...configBody(60), nativeFallbackThresholdPercent: 55 });
 
       await assertLoadError(
         loadConfig(context(cwd)),
         path,
-        /nativeFallbackThresholdPercent must be greater than swapThresholdPercent/,
+        /nativeFallbackThresholdPercent must be greater than prepareThresholdPercent/,
       );
     });
 
@@ -990,8 +897,8 @@ describe("shadow compact config loading", () => {
       process.env[NATIVE_THRESHOLD_ENV_VAR] = "95";
       assert.equal((await loadConfig(context(cwd))).nativeFallbackThresholdPercent, 95);
 
-      process.env[NATIVE_THRESHOLD_ENV_VAR] = "70";
-      await assert.rejects(loadConfig(context(cwd)), /must be greater than the swap threshold/);
+      process.env[NATIVE_THRESHOLD_ENV_VAR] = "50";
+      await assert.rejects(loadConfig(context(cwd)), /must be greater than the prepare threshold/);
     });
 
     it("env manual mode accepts shadow/native and rejects the rest", async (t) => {
@@ -1033,10 +940,7 @@ describe("threshold comparisons", () => {
     assert.equal(isAtOrAbovePrepare({ percent: 59 }, { prepareThresholdPercent: 60 }), false);
   });
 
-  it("swap and native fallback compare percent only", () => {
-    assert.equal(isAtOrAboveSwap({ percent: 80 }, { swapThresholdPercent: 80 }), true);
-    assert.equal(isAtOrAboveSwap({ percent: 79 }, { swapThresholdPercent: 80 }), false);
-    assert.equal(isAtOrAboveSwap({ tokens: 999999 }, { swapThresholdPercent: 80 }), false);
+  it("native fallback compares percent only", () => {
     assert.equal(
       isAtOrAboveNativeFallback({ percent: 92 }, { nativeFallbackThresholdPercent: 92 }),
       true,
@@ -1045,12 +949,6 @@ describe("threshold comparisons", () => {
       isAtOrAboveNativeFallback({ percent: 91 }, { nativeFallbackThresholdPercent: 92 }),
       false,
     );
-  });
-
-  it("legacy soft aliases match prepare semantics", () => {
-    const config = { prepareThresholdPercent: 60 };
-    assert.equal(isAtOrAboveSoft({ percent: 60 }, config), isAtOrAbovePrepare({ percent: 60 }, config));
-    assert.equal(isBelowSoft({ percent: 59 }, config), true);
   });
 });
 

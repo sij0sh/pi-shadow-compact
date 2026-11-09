@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
-import { fileDetails, hasCompactableHistory } from "../src/prepare.js";
+import { fileDetails, hasCompactableHistory } from "../src/working-context.js";
 
 let sequence = 0;
 

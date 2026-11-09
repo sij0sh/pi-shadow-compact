@@ -1,9 +1,14 @@
 import type { Usage } from "@earendil-works/pi-ai";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
-import { CHECKPOINT_SCHEMA_VERSION, type CheckpointCoverage, type PromptVersions } from "./checkpoint.js";
+import {
+  CHECKPOINT_SCHEMA_VERSION,
+  currentPromptVersions,
+  type CheckpointCoverage,
+  type PromptVersions,
+} from "./summary.js";
 import type { PreparedResult } from "./state.js";
 import { coverageIsUnchanged } from "./working-context.js";
-import type { Checkpoint } from "./summary.js";
+import { SECTIONS, type Checkpoint } from "./summary.js";
 
 /**
  * Durable Shadow checkpoints as extension state.
@@ -162,20 +167,7 @@ function isPromptVersionsV2Legacy(
   return true;
 }
 
-const CHECKPOINT_SECTION_KEYS = [
-  "objective",
-  "constraints",
-  "completedWork",
-  "currentState",
-  "decisions",
-  "openIssues",
-  "nextActions",
-  "criticalContext",
-  "modifiedFiles",
-  "referencedFiles",
-  "verificationState",
-  "continuationState",
-];
+const CHECKPOINT_SECTION_KEYS = [...SECTIONS, "verificationState", "continuationState"];
 
 /** Shape check for the structured checkpoint (evidence refs are branch-relative, not re-validated). */
 function isStructuredCheckpoint(value: unknown): value is Checkpoint {
@@ -310,27 +302,42 @@ export type CheckpointStalenessReason =
   | "changed-coverage"
   | "compaction-mismatch";
 
+/** The fields every currency check needs; a legacy checkpoint has no coverage. */
+export interface CheckpointCurrentness {
+  sessionId: string;
+  leafId: string;
+  latestCompactionId: string | null;
+  firstKeptEntryId: string;
+  coverage?: CheckpointCoverage | undefined;
+}
+
 /**
- * The same currency rules the in-memory swap already enforces: the owning
- * session, the cut ancestry, and the native compaction boundary must all
- * still hold. A native compaction that landed after the persist invalidates
- * the projection (undefined means current).
+ * Single currency rule for in-memory swaps, restore, and native recovery:
+ * the owning session, the cut ancestry, and the native compaction boundary
+ * must all still hold (undefined means current). Callers that prove the cut
+ * with `isCoveredPrefix` pass `requireFirstKept: false`, since that proof
+ * already covers the cut entry.
  */
 export function checkpointStalenessReason(
   branch: SessionEntry[],
   sessionId: string,
-  checkpoint: PersistedShadowCheckpoint,
+  checkpoint: CheckpointCurrentness,
+  options: { requireFirstKept?: boolean } = {},
 ): CheckpointStalenessReason | undefined {
   if (checkpoint.sessionId !== sessionId) return "session-mismatch";
-  if (!branch.some((entry) => entry.id === checkpoint.firstKeptEntryId)) return "missing-first-kept";
+  if (options.requireFirstKept !== false && !branch.some((entry) => entry.id === checkpoint.firstKeptEntryId)) {
+    return "missing-first-kept";
+  }
   if (!branch.some((entry) => entry.id === checkpoint.leafId)) return "missing-leaf";
   if (
-    hasCoverage(checkpoint) &&
-    !branch.some((entry) => entry.id === checkpoint.coverage.coverageEndEntryId)
+    checkpoint.coverage !== undefined &&
+    !branch.some((entry) => entry.id === checkpoint.coverage!.coverageEndEntryId)
   ) {
     return "missing-coverage-end";
   }
-  if (hasCoverage(checkpoint) && !coverageIsUnchanged(branch, checkpoint.coverage)) return "changed-coverage";
+  if (checkpoint.coverage !== undefined && !coverageIsUnchanged(branch, checkpoint.coverage)) {
+    return "changed-coverage";
+  }
   if (latestCompactionId(branch) !== checkpoint.latestCompactionId) return "compaction-mismatch";
   return undefined;
 }
@@ -370,6 +377,36 @@ export function latestCompactionId(branch: SessionEntry[]): string | null {
 }
 
 /** Restores a validated checkpoint into the serving shape. */
+/**
+ * The single forward projection: a published result becomes the durable
+ * entry. Structured results persist as v3; a v1 restore without structure
+ * re-persists as v1 until a fresh preparation replaces it.
+ */
+export function toPersistedCheckpoint(result: PreparedResult): PersistedShadowCheckpoint {
+  const common = {
+    checkpointId: result.checkpointId,
+    sessionId: result.sessionId,
+    summary: result.summary,
+    firstKeptEntryId: result.firstKeptEntryId,
+    leafId: result.leafId,
+    latestCompactionId: result.latestCompactionId,
+    contextTokensBefore: result.contextTokensBefore ?? 0,
+    usage: result.usage,
+    details: result.details,
+    createdAt: Date.now(),
+  };
+  return result.structured && result.coverage
+    ? {
+        ...common,
+        version: CHECKPOINT_SCHEMA_VERSION,
+        structured: result.structured,
+        coverage: result.coverage,
+        prompts: result.prompts ?? currentPromptVersions(),
+        generatedAt: result.generatedAt ?? Date.now(),
+      }
+    : { ...common, version: 1 };
+}
+
 export function toPreparedResult(checkpoint: PersistedShadowCheckpoint): PreparedResult {
   const result: PreparedResult = {
     checkpointId: checkpoint.checkpointId,

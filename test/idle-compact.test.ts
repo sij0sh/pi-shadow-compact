@@ -76,6 +76,22 @@ describe("idle compaction", () => {
     }
   });
 
+  it("serves a ready checkpoint below the native threshold without a turn_end gate", async () => {
+    const f = await fixture(IDLE_CONFIG);
+    try {
+      await startPreparation(f);
+      // 75%: above prepare (60), below the old swap (80) and native (92)
+      // thresholds. A ready, current checkpoint must serve on the next
+      // request; nothing but native fallback is percent-gated.
+      f.setUsage(150_000, 200_000);
+      const swapped = await f.emit("context", { messages: f.contextMessages() });
+      assert.ok(swapped, "a ready checkpoint serves at any percent below native fallback");
+      assert.equal(f.compactCalls.length, 0);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
   it("stays quiet below the idle minimum", async () => {
     const f = await fixture(IDLE_CONFIG);
     try {
@@ -161,7 +177,7 @@ describe("idle compaction", () => {
     }
   });
 
-  it("traces force-swap arming once per checkpoint", async () => {
+  it("does not gate swaps on a percent threshold at turn_end", async () => {
     const { events } = await withTraceFile(async () => {
       const f = await fixture(IDLE_CONFIG);
       try {
@@ -174,10 +190,9 @@ describe("idle compaction", () => {
         await f.cleanup();
       }
     });
-    const armed = events.filter(
+    const gated = events.filter(
       (event) => event.event === "threshold_crossed" && event.action === "force-swap",
     );
-    assert.equal(armed.length, 1);
-    assert.equal(armed[0]?.reason, "swap-threshold");
+    assert.equal(gated.length, 0);
   });
 });

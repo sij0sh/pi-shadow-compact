@@ -192,18 +192,6 @@ export class SessionHistoryIndex {
     return [...required];
   }
 
-  /** Entry ids the completion requirements demand, for submit validation. */
-  requiredEntryIds(): Set<string> {
-    const requiredTurns = new Set(this.requiredTurnIds());
-    const ids = new Set<string>();
-    for (const turn of this.turns) {
-      if (requiredTurns.has(turn.id)) {
-        for (const id of turn.entryIds) ids.add(id);
-      }
-    }
-    return ids;
-  }
-
   missingRequiredTurnIds(): string[] {
     const required = new Set(this.requiredTurnIds());
     return this.turns

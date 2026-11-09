@@ -1,6 +1,5 @@
 {
   "prepareThresholdPercent": 60,
-  "swapThresholdPercent": 80,
   "nativeFallbackThresholdPercent": 92,
   "summarizerModel": {
     "provider": "",

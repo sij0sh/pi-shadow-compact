@@ -15,7 +15,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { completeWithSummaryTrace, type SummaryCallTrace } from "./summary-trace.js";
 import { traceEvent } from "./trace.js";
 import { sanitizeForContext, tokensToChars } from "./normalize.js";
-import type { CheckpointCoverage } from "./checkpoint.js";
+import type { CheckpointCoverage } from "./summary.js";
 import type { ShadowCompactConfig } from "./config.js";
 import {
   DEFAULT_MAX_PAGE_CHARS,
@@ -25,6 +25,7 @@ import {
 import {
   combineUsage,
   renderCheckpoint,
+  SECTIONS,
   resolveSummarizerModel,
   resolveVerificationModel,
   validateCheckpointObject,
@@ -218,16 +219,7 @@ const CHECKPOINT_SCHEMA = {
   description:
     "Complete structured checkpoint. Every item in every list section must be an object {text, evidenceRefs}, never a bare string.",
   properties: {
-    objective: { type: "array", items: CHECKPOINT_ITEM_SCHEMA },
-    constraints: { type: "array", items: CHECKPOINT_ITEM_SCHEMA },
-    completedWork: { type: "array", items: CHECKPOINT_ITEM_SCHEMA },
-    currentState: { type: "array", items: CHECKPOINT_ITEM_SCHEMA },
-    decisions: { type: "array", items: CHECKPOINT_ITEM_SCHEMA },
-    openIssues: { type: "array", items: CHECKPOINT_ITEM_SCHEMA },
-    nextActions: { type: "array", items: CHECKPOINT_ITEM_SCHEMA },
-    criticalContext: { type: "array", items: CHECKPOINT_ITEM_SCHEMA },
-    modifiedFiles: { type: "array", items: CHECKPOINT_ITEM_SCHEMA },
-    referencedFiles: { type: "array", items: CHECKPOINT_ITEM_SCHEMA },
+    ...Object.fromEntries(SECTIONS.map((section) => [section, { type: "array", items: CHECKPOINT_ITEM_SCHEMA }])),
     verificationState: { type: "array", items: VERIFICATION_ITEM_SCHEMA },
     continuationState: CONTINUATION_STATE_SCHEMA,
   },
@@ -684,6 +676,69 @@ function sumUsage(items: Usage[]): Usage {
   return items.reduce((total, item) => (total ? combineUsage(total, item) : item));
 }
 
+interface AgentSetup {
+  ctx: Pick<ExtensionContext, "model" | "modelRegistry">;
+  config: ShadowCompactConfig;
+  request: BuilderRequest;
+  model: Model<Api>;
+  index: SessionHistoryIndex;
+  stage: "builder" | "verifier";
+  thinkingLevel: ModelThinkingLevel | undefined;
+  tools: Tool[];
+  systemPrompt: string;
+  /** Built after the size target is known. */
+  prompt: (target: number) => string;
+  maxRounds: number;
+  responseLabel: string;
+}
+
+/**
+ * Shared private-agent bootstrap: completion interface, size target, run
+ * state, and the tool loop. The caller supplies the prompt, tool set, and
+ * submit handler; only those differ between builder and verifier.
+ */
+function startAgent(options: AgentSetup): {
+  target: number;
+  hardTarget: number;
+  state: RunState;
+  run: (execute: ToolLoopOptions["execute"]) => Promise<ToolLoopResult>;
+} {
+  const { ctx, config, request, model, index } = options;
+  const completion: CompletionInterface = request.completion ?? {
+    complete: (completedModel, context, completionOptions) =>
+      ctx.modelRegistry.streamSimple(completedModel, context, completionOptions).result(),
+  };
+  const target =
+    request.targetSummaryChars ?? checkpointSummaryTarget(model, request.maxTokens ?? config.summaryMaxTokens);
+  const state: RunState = {
+    index,
+    pageChars: readPageChars(model),
+    servedRefs: new Set(),
+    submitAttempts: 0,
+    sizeCorrected: false,
+    readCalls: 0,
+  };
+  return {
+    target,
+    hardTarget: target * HARD_SUMMARY_MULTIPLIER,
+    state,
+    run: (execute) => runToolLoop({
+      completion,
+      model,
+      tools: options.tools,
+      systemPrompt: options.systemPrompt,
+      prompt: options.prompt(target),
+      maxRounds: options.maxRounds,
+      signal: request.signal,
+      maxTokens: request.maxTokens,
+      thinkingLevel: options.thinkingLevel,
+      responseLabel: options.responseLabel,
+      trace: { attemptId: request.attemptId ?? uuidv7(), stage: options.stage },
+      execute,
+    }),
+  };
+}
+
 export async function runCheckpointBuilderAgent(
   ctx: Pick<ExtensionContext, "model" | "modelRegistry">,
   index: SessionHistoryIndex,
@@ -691,27 +746,19 @@ export async function runCheckpointBuilderAgent(
   request: BuilderRequest = {},
 ): Promise<BuilderOutcome> {
   const model = request.model ?? resolveSummarizerModel(ctx, config);
-  const completion: CompletionInterface = request.completion ?? {
-    complete: (completedModel, context, options) => ctx.modelRegistry.streamSimple(completedModel, context, options).result(),
-  };
-  const target = request.targetSummaryChars ?? checkpointSummaryTarget(model, request.maxTokens ?? config.summaryMaxTokens);
-  const hardTarget = target * HARD_SUMMARY_MULTIPLIER;
-  const state: RunState = { index, pageChars: readPageChars(model), servedRefs: new Set(), submitAttempts: 0, sizeCorrected: false, readCalls: 0 };
-  let accepted: { checkpoint: Checkpoint; coverageEndEntryId: string } | undefined;
-
-  const { usage, toolRounds } = await runToolLoop({
-    completion,
-    model,
+  const { target, hardTarget, state, run } = startAgent({
+    ctx, config, request, model, index, stage: "builder",
+    thinkingLevel: request.thinkingLevel ?? config.thinkingLevel ?? "low",
     tools: [...READ_TOOLS, SUBMIT_CHECKPOINT_TOOL],
     systemPrompt: BUILDER_SYSTEM_PROMPT,
-    prompt: builderPrompt(index) + summaryGuidance(request.customInstructions) + compressionGuidance({ ...request, targetSummaryChars: target }),
+    prompt: (target) =>
+      builderPrompt(index) + summaryGuidance(request.customInstructions) + compressionGuidance({ ...request, targetSummaryChars: target }),
     maxRounds: CHECKPOINT_BUILDER_MAX_ROUNDS,
-    signal: request.signal,
-    maxTokens: request.maxTokens,
-    thinkingLevel: request.thinkingLevel ?? config.thinkingLevel ?? "low",
     responseLabel: "Summary model",
-    trace: { attemptId: request.attemptId ?? uuidv7(), stage: "builder" },
-    execute: async (name, args) => {
+  });
+  let accepted: { checkpoint: Checkpoint; coverageEndEntryId: string } | undefined;
+
+  const { usage, toolRounds } = await run(async (name, args) => {
       if (name === SUBMIT_CHECKPOINT_TOOL.name) {
         state.submitAttempts++;
         try {
@@ -738,7 +785,6 @@ export async function runCheckpointBuilderAgent(
       } catch (error) {
         return { done: false as const, error: error instanceof Error ? error.message : String(error) };
       }
-    },
   });
 
   if (!accepted) throw new Error("Unreachable checkpoint builder state");
@@ -761,27 +807,19 @@ export async function runCheckpointVerifierAgent(
   request: BuilderRequest = {},
 ): Promise<VerifierOutcome> {
   const model = request.model ?? resolveVerificationModel(ctx, config);
-  const completion: CompletionInterface = request.completion ?? {
-    complete: (completedModel, context, options) => ctx.modelRegistry.streamSimple(completedModel, context, options).result(),
-  };
-  const target = request.targetSummaryChars ?? checkpointSummaryTarget(model, request.maxTokens ?? config.summaryMaxTokens);
-  const hardTarget = target * HARD_SUMMARY_MULTIPLIER;
-  const state: RunState = { index, pageChars: readPageChars(model), servedRefs: new Set(), submitAttempts: 0, sizeCorrected: false, readCalls: 0 };
-  let accepted: { checkpoint: Checkpoint; coverageEndEntryId: string; verdict: "accept" | "repair" } | undefined;
-
-  const { usage, toolRounds } = await runToolLoop({
-    completion,
-    model,
+  const { target, hardTarget, state, run } = startAgent({
+    ctx, config, request, model, index, stage: "verifier",
+    thinkingLevel: request.thinkingLevel ?? config.verificationThinkingLevel ?? config.thinkingLevel ?? "low",
     tools: [...READ_TOOLS, SUBMIT_VERDICT_TOOL],
     systemPrompt: VERIFIER_SYSTEM_PROMPT,
-    prompt: verifierPrompt(index, draft, draftCoverage) + summaryGuidance(request.customInstructions) + compressionGuidance({ ...request, targetSummaryChars: target }),
+    prompt: (target) =>
+      verifierPrompt(index, draft, draftCoverage) + summaryGuidance(request.customInstructions) + compressionGuidance({ ...request, targetSummaryChars: target }),
     maxRounds: CHECKPOINT_VERIFIER_MAX_ROUNDS,
-    signal: request.signal,
-    maxTokens: request.maxTokens,
-    thinkingLevel: request.thinkingLevel ?? config.verificationThinkingLevel ?? config.thinkingLevel ?? "low",
     responseLabel: "Verification model",
-    trace: { attemptId: request.attemptId ?? uuidv7(), stage: "verifier" },
-    execute: async (name, args) => {
+  });
+  let accepted: { checkpoint: Checkpoint; coverageEndEntryId: string; verdict: "accept" | "repair" } | undefined;
+
+  const { usage, toolRounds } = await run(async (name, args) => {
       if (name === SUBMIT_VERDICT_TOOL.name) {
         state.submitAttempts++;
         try {
@@ -831,7 +869,6 @@ export async function runCheckpointVerifierAgent(
       } catch (error) {
         return { done: false as const, error: error instanceof Error ? error.message : String(error) };
       }
-    },
   });
 
   if (!accepted) throw new Error("Unreachable checkpoint verifier state");

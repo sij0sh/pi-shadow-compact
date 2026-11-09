@@ -28,6 +28,11 @@ export interface SessionTurn {
   entryIds: string[];
 }
 
+/**
+ * User-anchored evidence turns: one per user message, used by the history
+ * reader and coverage math. Deliberately NOT the same unit as working-context's
+ * model rounds (`contextRounds`), which anchor the live continuity tail.
+ */
 export function segmentTurns(branch: SessionEntry[]): SessionTurn[] {
   if (branch.length === 0) return [];
   const boundaries: number[] = [];

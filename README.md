@@ -111,10 +111,9 @@ no/invalid checkpoint ──► Pi native compaction (fail closed)
   Pi will discard and the result shrinks the working context.
 - **Thresholds.** Preparation starts at 60% context usage, with rolling
   refresh re-arming after a Shadow install followed by below-checkpoint
-  context, or after native compaction. The swap threshold (80%) is a
-  compatibility/telemetry threshold, not a readiness gate: a ready
-  checkpoint serves even below it. At 92% one native compaction is queued
-  at the next safe idle point. Idle settle with at least
+  context, or after native compaction. A ready checkpoint serves on the
+  next safe request at any percent; only native fallback is gated (92%,
+  one compaction queued at the next safe idle point). Idle settle with at least
   `idleCompact.minimumTokens` (default 20,000) past the checkpoint's
   coverage prepares a fresh checkpoint so `/compact` and reloads start
   current.
@@ -166,7 +165,6 @@ and model IDs use the model already running the session.
 | Setting | Default | Behavior |
 |---|---|---|
 | `prepareThresholdPercent` | `60` | Start background checkpoint preparation |
-| `swapThresholdPercent` | `80` | Compatibility/telemetry threshold; never delays a ready checkpoint |
 | `nativeFallbackThresholdPercent` | `92` | Queue one native compaction at the next safe idle point |
 | `recentTurns` | `10` | Minimum recent response/tool rounds kept verbatim |
 | `summarizerModel` / `verificationModel` | blank | Checkpoint builder/verifier models; blank reuses the session model, blank verifier reuses the summarizer |
@@ -175,8 +173,8 @@ and model IDs use the model already running the session.
 | `idleCompact` | enabled, `20000` | Prepare a fresh checkpoint on idle settle past coverage |
 | `manualCompactMode` | `shadow` | `shadow` or `native` for manual `/compact` |
 
-Legacy `softCompactThresholdPercent` / `hardCompactThresholdPercent` keys
-still load as aliases for the prepare / swap thresholds.
+Legacy `softCompactThresholdPercent` still loads as an alias for
+`prepareThresholdPercent`.
 
 `manualCompactMode: "native"` uses Pi's original summarizer first, with one
 evidence-backed token-cap recovery. Either way, `/compact-native` runs one

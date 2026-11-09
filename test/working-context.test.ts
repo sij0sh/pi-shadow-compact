@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { ContextEvent, SessionEntry } from "@earendil-works/pi-coding-agent";
-import type { CheckpointCoverage } from "../src/checkpoint.js";
+import type { CheckpointCoverage } from "../src/summary.js";
 import {
   buildWorkingContext,
   isWorkingContextSkipped,

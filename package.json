@@ -1,6 +1,6 @@
 {
   "name": "pi-shadow-compact",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "type": "module",
   "description": "Silent soft-threshold compaction for Pi with native fallback",
   "keywords": [

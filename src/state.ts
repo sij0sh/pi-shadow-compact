@@ -1,11 +1,6 @@
 import type { Usage } from "@earendil-works/pi-ai";
-import type { CheckpointCoverage, PromptVersions } from "./checkpoint.js";
-import type { FileDetails } from "./prepare.js";
-import type { Checkpoint } from "./summary.js";
-
-// Single definition lives in prepare.ts alongside fileDetails(); re-exported
-// here so existing `.../state.js` import sites keep working.
-export type { FileDetails } from "./prepare.js";
+import type { Checkpoint, CheckpointCoverage, PromptVersions } from "./summary.js";
+import type { FileDetails } from "./working-context.js";
 
 export interface PreparedResult {
   /** Stable identity across persist/restore so an idle settle persists once. */

@@ -1,5 +1,10 @@
-import { buildSessionProjection, type ContextEvent, type SessionEntry } from "@earendil-works/pi-coding-agent";
-import type { CheckpointCoverage } from "./checkpoint.js";
+import {
+  buildSessionProjection,
+  findCutPoint,
+  type ContextEvent,
+  type SessionEntry,
+} from "@earendil-works/pi-coding-agent";
+import type { CheckpointCoverage } from "./summary.js";
 import { contextSwapDropCount, hasOrphanedToolResult } from "./swap.js";
 
 /**
@@ -86,7 +91,7 @@ export function planSwap(
   retainedAnchor?: string,
 ): SwapPlan | undefined {
   if (branch.length === 0) return undefined;
-  const turns = continuityTurns(branch);
+  const turns = contextRounds(branch);
   if (turns.length === 0) return undefined;
 
   // Empty coverageEnd means "covers nothing yet": the tail starts at the
@@ -179,12 +184,13 @@ export function buildWorkingContext(
 
 /**
  * Pi turns are assistant responses with their tool results, not whole spans
- * between user prompts. Keep the history reader's user-anchored groups for
- * evidence inspection, but count projected model rounds for the live tail.
+ * between user prompts. Keep the history reader's user-anchored turn groups
+ * (`segmentTurns`) for evidence inspection, but count projected model rounds
+ * here for the live tail. These are different units: never interchange them.
  * New input joins its following assistant response; parallel results stay
  * with their call. Omitted attempts and prompt/state entries do not count.
  */
-function continuityTurns(branch: SessionEntry[]): Array<{ startEntryId: string; endEntryId: string; completed: boolean }> {
+function contextRounds(branch: SessionEntry[]): Array<{ startEntryId: string; endEntryId: string; completed: boolean }> {
   const turns: Array<{ startEntryId: string; endEntryId: string; completed: boolean }> = [];
   let hasAssistant = false;
   let pendingCalls = new Set<string>();
@@ -215,7 +221,7 @@ function continuityTurns(branch: SessionEntry[]): Array<{ startEntryId: string; 
 
 /** Start of five complete preceding rounds plus the trigger/latest round. */
 export function triggerOverlapStart(branch: SessionEntry[]): string | undefined {
-  const turns = continuityTurns(branch);
+  const turns = contextRounds(branch);
   if (!turns.length) return undefined;
   let start = turns.length - 1;
   let preceding = 0;
@@ -254,4 +260,51 @@ export function isCoveredPrefix(
       (message) => message.role === "system" || message.role === "compactionSummary",
     );
   });
+}
+
+/**
+ * Prove a disposable prefix using Pi's public projection and cut helper.
+ * Prompt state and a previous summary cannot make recent history compactable.
+ * Recovery-only omission cuts remain Pi's responsibility; this idle preflight
+ * deliberately requires a visible prefix rather than copying private rules.
+ */
+export function hasCompactableHistory(branch: SessionEntry[], keepRecentTokens: number): boolean {
+  if (branch.at(-1)?.type === "compaction") return false;
+  const projected = buildSessionProjection(branch).entries;
+  const boundary = projected.findIndex((entry) => entry.sourceEntry.type === "compaction" && entry.messages.length > 0);
+  const conversation: SessionEntry[] = projected.slice(boundary + 1).flatMap(({ sourceEntry, messages }) =>
+    sourceEntry.type === "compaction" ? [] : messages.filter((message) => message.role !== "system")
+      .map((message) => ({ ...sourceEntry, type: "message" as const, message })),
+  );
+  const cut = findCutPoint(conversation, 0, conversation.length, keepRecentTokens);
+  return cut.firstKeptEntryIndex > 0;
+}
+
+export interface FileDetails {
+  readFiles: string[];
+  modifiedFiles: string[];
+}
+
+const MUTATING_TOOLS = new Set(["write", "edit", "apply_patch"]);
+
+/** Separates files read from files modified across the given entry groups. */
+export function fileDetails(...entryGroups: SessionEntry[][]): FileDetails {
+  const read = new Set<string>();
+  const modified = new Set<string>();
+  for (const entries of entryGroups) {
+    for (const entry of entries) {
+      if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+      for (const part of entry.message.content) {
+        if (part.type !== "toolCall") continue;
+        const path = (part.arguments as { path?: unknown } | undefined)?.path;
+        if (typeof path !== "string" || path.length === 0) continue;
+        if (part.name === "read") read.add(path);
+        else if (MUTATING_TOOLS.has(part.name)) modified.add(path);
+      }
+    }
+  }
+  return {
+    readFiles: [...read].filter((path) => !modified.has(path)).sort(),
+    modifiedFiles: [...modified].sort(),
+  };
 }

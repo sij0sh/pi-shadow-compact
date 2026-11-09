@@ -12,14 +12,20 @@ import {
   type Usage,
 } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { readEnvFlag, type ShadowCompactConfig } from "./config.js";
+import type { ShadowCompactConfig } from "./config.js";
+import type { FileDetails } from "./working-context.js";
 
 const MAX_ITEM_CHARS = 8_000;
 const MAX_ITEMS_PER_SECTION = 100;
 const MAX_REFS_PER_ITEM = 32;
 const MAX_RENDERED_CHARS = 64_000;
 
-const SECTIONS = [
+/**
+ * Single source of truth for the checkpoint section list: the submit-tool JSON
+ * schema (checkpoint-agent.ts) and the persisted-entry key set (persist.ts)
+ * are both derived from it.
+ */
+export const SECTIONS = [
   "objective",
   "constraints",
   "completedWork",
@@ -32,49 +38,7 @@ const SECTIONS = [
   "referencedFiles",
 ] as const;
 
-type SectionName = (typeof SECTIONS)[number];
-
-/**
- * Action-first render order (fix.md Step 1). Schema order (SECTIONS) is
- * unchanged: validation still accepts exactly those keys. Only the rendered
- * Markdown leads with unresolved work (Next Actions / Open Issues / Current
- * State / Critical Context) before the historical record (Completed Work /
- * Decisions / files), so the continuation agent acts on the compacted state
- * more correctly before thinking harder.
- */
-export const RENDER_SECTIONS = [
-  "objective",
-  "constraints",
-  "nextActions",
-  "openIssues",
-  "currentState",
-  "criticalContext",
-  "completedWork",
-  "decisions",
-  "modifiedFiles",
-  "referencedFiles",
-] as const satisfies readonly SectionName[];
-
-/**
- * Benchmark-only render toggle. Defaults to the legacy schema-order
- * rendering (plus the legacy prompt): the action-first experiment showed no
- * benefit, so normal operation stays on Current/legacy. Set to
- * "1"/"true"/"yes"/"on" only to reproduce the Action-first arm of
- * Current-vs-Action-first A/Bs. Per-arm env is the only supported
- * per-variant channel in the roast harness, so the toggle lives here
- * rather than in the config file (no schema change).
- */
-export const ACTION_FIRST_ENV_VAR = "SHADOW_COMPACT_ACTION_FIRST";
-
-export function isActionFirstEnabled(): boolean {
-  // Explicit true values enable the experiment arm; anything else is legacy.
-  const value = readEnvFlag(ACTION_FIRST_ENV_VAR);
-  return value === "1" || value === "true" || value === "yes" || value === "on";
-}
-
-export function resolveRenderSections(): readonly SectionName[] {
-  return isActionFirstEnabled() ? RENDER_SECTIONS : SECTIONS;
-}
+export type SectionName = (typeof SECTIONS)[number];
 
 export interface CheckpointItem {
   text: string;
@@ -329,7 +293,7 @@ function safeText(value: string): string {
 }
 
 export function renderCheckpoint(checkpoint: Checkpoint): string {
-  const sections = resolveRenderSections().map((section) => {
+  const sections = SECTIONS.map((section) => {
     const title = section
       .replace(/([a-z])([A-Z])/g, "$1 $2")
       .replace(/^./, (char) => char.toUpperCase());
@@ -375,5 +339,87 @@ export function combineUsage(a: Usage, b: Usage): Usage {
       cacheWrite: a.cost.cacheWrite + b.cost.cacheWrite,
       total: a.cost.total + b.cost.total,
     },
+  };
+}
+
+/**
+ * Durable checkpoint data model (refactor §2, §9, §24).
+ *
+ * A checkpoint is evidence-grounded against the durable session, and
+ * `coverage` states precisely how far that grounding extends. The summary
+ * text is a rendering; the structured checkpoint is the durable object.
+ */
+
+/**
+ * Current durable checkpoint schema version. V3 drops the removed
+ * historic-turn subsystem (no `historicTurns`, no relevance prompt version).
+ * Persisted v1 checkpoints restore with derived coverage; persisted v2
+ * checkpoints restore with their Jev payload ignored.
+ */
+export const CHECKPOINT_SCHEMA_VERSION = 3;
+
+/** Prompt versions carried by every checkpoint. */
+export const SUMMARY_PROMPT_VERSION = 3;
+export const VERIFIER_PROMPT_VERSION = 3;
+
+export interface PromptVersions {
+  summaryPromptVersion: number;
+  verifierPromptVersion: number;
+}
+
+export function currentPromptVersions(): PromptVersions {
+  return {
+    summaryPromptVersion: SUMMARY_PROMPT_VERSION,
+    verifierPromptVersion: VERIFIER_PROMPT_VERSION,
+  };
+}
+
+/**
+ * Where a checkpoint's evidence grounding starts and ends.
+ *
+ * - `sourceStartEntryId`: oldest session entry eligible as evidence (null
+ *   when the checkpoint covers from the session start).
+ * - `coverageEndEntryId`: the summary is guaranteed to represent session
+ *   history through this entry. Never inferred from when generation
+ *   completed: a checkpoint triggered at 60% that finishes at 79% covers
+ *   only what its agent actually inspected.
+ * - `preparedAtLeafId`: branch leaf when preparation started.
+ * - `publishedAtLeafId`: branch leaf when the checkpoint published (the
+ *   session kept moving while the agent worked).
+ */
+export interface CheckpointCoverage {
+  sourceStartEntryId: string | null;
+  coverageEndEntryId: string;
+  preparedAtLeafId: string;
+  publishedAtLeafId: string;
+}
+
+export interface ShadowCheckpoint {
+  schemaVersion: typeof CHECKPOINT_SCHEMA_VERSION;
+  structured: Checkpoint;
+  rendered: string;
+  coverage: CheckpointCoverage;
+  generatedAt: number;
+  prompts: PromptVersions;
+  usage?: Usage;
+  details?: FileDetails;
+}
+
+/**
+ * Builds coverage for a freshly generated checkpoint. The agent-supplied
+ * `coverageEndEntryId` is authoritative; the leaves record branch movement
+ * during generation so the swap can prove a gap-free tail.
+ */
+export function buildCoverage(options: {
+  sourceStartEntryId: string | null;
+  coverageEndEntryId: string;
+  preparedAtLeafId: string;
+  publishedAtLeafId: string;
+}): CheckpointCoverage {
+  return {
+    sourceStartEntryId: options.sourceStartEntryId,
+    coverageEndEntryId: options.coverageEndEntryId,
+    preparedAtLeafId: options.preparedAtLeafId,
+    publishedAtLeafId: options.publishedAtLeafId,
   };
 }

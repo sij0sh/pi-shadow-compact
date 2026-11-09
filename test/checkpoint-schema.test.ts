@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
-  ACTION_FIRST_ENV_VAR,
   emptyContinuationState,
   renderCheckpoint,
   validateCheckpointObject,
@@ -92,7 +91,7 @@ describe("checkpoint schema additions", () => {
     );
   });
 
-  it("renders schema order by default and unresolved work first in the action-first arm", () => {
+  it("renders sections in schema order", () => {
     const checkpoint = validateCheckpointObject(
       {
         ...JSON.parse(legacyJson()),
@@ -101,19 +100,8 @@ describe("checkpoint schema additions", () => {
       },
       REFS,
     );
-    const saved = process.env[ACTION_FIRST_ENV_VAR];
-    try {
-      delete process.env[ACTION_FIRST_ENV_VAR];
-      const legacy = renderCheckpoint(checkpoint);
-      assert.ok(legacy.indexOf("## Completed Work") < legacy.indexOf("## Next Actions"));
-
-      process.env[ACTION_FIRST_ENV_VAR] = "1";
-      const actionFirst = renderCheckpoint(checkpoint);
-      assert.ok(actionFirst.indexOf("## Next Actions") < actionFirst.indexOf("## Completed Work"));
-    } finally {
-      if (saved === undefined) delete process.env[ACTION_FIRST_ENV_VAR];
-      else process.env[ACTION_FIRST_ENV_VAR] = saved;
-    }
+    const rendered = renderCheckpoint(checkpoint);
+    assert.ok(rendered.indexOf("## Completed Work") < rendered.indexOf("## Next Actions"));
   });
 
   it("rejects bare-string items with an actionable object shape", () => {

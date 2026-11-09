@@ -7,14 +7,14 @@ import {
   type ExtensionContext,
   type SessionBeforeCompactEvent,
 } from "@earendil-works/pi-coding-agent";
-import { buildCoverage } from "./checkpoint.js";
+import { buildCoverage } from "./summary.js";
 import { checkpointSummaryTarget, runCheckpointBuilderAgent, runCheckpointVerifierAgent } from "./checkpoint-agent.js";
 import type { ShadowCompactConfig } from "./config.js";
 import { sanitizeForContext } from "./normalize.js";
 import { SessionHistoryIndex } from "./session-reader.js";
 import { combineUsage, resolveSummarizerModel, resolveVerificationModel } from "./summary.js";
-import { coverageIsUnchanged, isCoveredPrefix } from "./working-context.js";
-import { latestCompactionId } from "./persist.js";
+import { isCoveredPrefix } from "./working-context.js";
+import { checkpointStalenessReason, latestCompactionId } from "./persist.js";
 import { completeWithSummaryTrace } from "./summary-trace.js";
 import { traceEvent } from "./trace.js";
 
@@ -128,11 +128,21 @@ export async function compactWithRecovery(
       signal.throwIfAborted();
       const current = ctx.sessionManager.getBranch();
       const finalCoverage = { ...coverage, coverageEndEntryId: verified.coverageEndEntryId };
-      if (ctx.sessionManager.getSessionId() !== sessionId ||
-          !current.some((entry) => entry.id === leafId) ||
-          latestCompactionId(current) !== latestCompactionId(branch) ||
-          !coverageIsUnchanged(current, finalCoverage) ||
-          !isCoveredPrefix(current, verified.coverageEndEntryId, preparation.firstKeptEntryId)) {
+      if (
+        checkpointStalenessReason(
+          current,
+          sessionId,
+          {
+            sessionId,
+            leafId,
+            latestCompactionId: latestCompactionId(branch),
+            firstKeptEntryId: preparation.firstKeptEntryId,
+            coverage: finalCoverage,
+          },
+          { requireFirstKept: false },
+        ) !== undefined ||
+        !isCoveredPrefix(current, verified.coverageEndEntryId, preparation.firstKeptEntryId)
+      ) {
         throw new Error("Native summary recovery does not cover the current compaction prefix");
       }
       const modifiedFiles = [...new Set([...fileOps.written, ...fileOps.edited])].sort();

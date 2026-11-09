@@ -6,6 +6,25 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Changed
+
+- One `SECTIONS` list derives the checkpoint tool schema, validation,
+  rendering, and persisted-entry keys (was three copies).
+- One `checkpointStalenessReason` rule backs swaps, restore, and native
+  recovery.
+- Builder and verifier agents share one runner bootstrap; the two compaction
+  paths share one projection helper.
+- `checkpoint.ts` folded into `summary.ts`, `prepare.ts` into
+  `working-context.ts` (13 → 11 modules).
+- Persistence uses one forward projection, `toPersistedCheckpoint`.
+
+### Removed
+
+- `swapThresholdPercent` and `SHADOW_COMPACT_HARD_THRESHOLD_PERCENT`. It never
+  gated a swap; a ready checkpoint always served. Configs or env vars that set
+  it now fail validation instead of silently accepting a dead knob.
+- `SHADOW_COMPACT_ACTION_FIRST` render arm (dead experiment toggle).
+
 ## [0.2.2] - 2026-11-09
 
 ### Added

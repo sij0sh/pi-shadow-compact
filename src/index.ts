@@ -19,16 +19,12 @@ import {
 } from "./checkpoint-agent.js";
 import {
   buildCoverage,
-  CHECKPOINT_SCHEMA_VERSION,
   currentPromptVersions,
   type CheckpointCoverage,
-} from "./checkpoint.js";
+} from "./summary.js";
 import {
   DEFAULT_NATIVE_FALLBACK_THRESHOLD_PERCENT,
   DEFAULT_RECENT_TURNS,
-  DEFAULT_SWAP_THRESHOLD_PERCENT,
-  isAtOrAboveNativeFallback,
-  isAtOrAboveSwap,
   isBelowPrepare,
   isObserveMode,
   isRollingEnabled,
@@ -38,20 +34,20 @@ import {
 import {
   CHECKPOINT_CUSTOM_TYPE,
   collectShadowSummaries,
+  checkpointStalenessReason,
   findLatestRestorableCheckpoint,
   latestCompactionId,
+  toPersistedCheckpoint,
   toPreparedResult,
-  type PersistedShadowCheckpoint,
 } from "./persist.js";
 import { compactWithRecovery } from "./native-compaction.js";
 import { sanitizeForContext } from "./normalize.js";
-import { fileDetails, hasCompactableHistory } from "./prepare.js";
+import { fileDetails, hasCompactableHistory } from "./working-context.js";
 import { registerActingRequestObserver } from "./request-trace.js";
 import { SessionHistoryIndex } from "./session-reader.js";
 import { ShadowCompactStateController, type PreparedResult } from "./state.js";
 import {
   combineUsage,
-  isActionFirstEnabled,
   resolveSummarizerModel,
   resolveVerificationModel,
 } from "./summary.js";
@@ -98,10 +94,12 @@ export default function shadowCompact(pi: ExtensionAPI): void {
   let configPromise: Promise<ShadowCompactConfig> | undefined;
   let reportedError: string | undefined;
   let configErrorReported = false;
-  let nativeFallbackInFlight = false;
-  let forceNativeOnce = false;
+  // One native-compaction request at a time: "escape" is the explicit
+  // /compact-native command (pure Pi), "fallback" is the in-hook emergency or
+  // recovery path (wrapped, with token-cap recovery). Any compaction outcome,
+  // branch change, or session reset clears the slot.
+  let nativeMode: "none" | "escape" | "fallback" = "none";
   let compactTrace: { attemptId: string; sessionId: string | null; route: string } | undefined;
-  let activationTracedFor: string | undefined;
   let turnCount = 0;
 
   const canCompact = (ctx: ExtensionContext): boolean => {
@@ -118,16 +116,15 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         cmdCtx.ui.notify("shadow-compact: nothing to compact; recent history is still within Pi's retained tail", "info");
         return;
       }
-      forceNativeOnce = true;
+      nativeMode = "escape";
       cmdCtx.compact({});
     },
   });
 
   const runNativeFallback = (ctx: ExtensionContext): boolean => {
     // Manual compaction aborts an active agent run, so only start it while Pi is idle.
-    if (nativeFallbackInFlight || !ctx.isIdle()) return false;
-    nativeFallbackInFlight = true;
-    forceNativeOnce = true;
+    if (nativeMode === "fallback" || !ctx.isIdle()) return false;
+    nativeMode = "fallback";
     ctx.compact({});
     return true;
   };
@@ -157,12 +154,8 @@ export default function shadowCompact(pi: ExtensionAPI): void {
   const resultIsCurrent = (ctx: ExtensionContext, result: PreparedResult): boolean => {
     const branch = ctx.sessionManager.getBranch();
     return (
-      ctx.sessionManager.getSessionId() === result.sessionId &&
-      branch.some((entry) => entry.id === result.leafId) &&
-      latestCompactionId(branch) === result.latestCompactionId &&
-      branch.some((entry) => entry.id === result.firstKeptEntryId) &&
-      effectiveCoverage(branch, result) !== undefined &&
-      (!result.coverage || coverageIsUnchanged(branch, result.coverage))
+      checkpointStalenessReason(branch, ctx.sessionManager.getSessionId(), result) === undefined &&
+      effectiveCoverage(branch, result) !== undefined
     );
   };
 
@@ -185,38 +178,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     // A structured checkpoint persists as v3; a v1 restore without one
     // re-persists as v1 until a fresh preparation replaces it. A restored
     // legacy v2 checkpoint re-persists as v3 with its Jev payload dropped.
-    const checkpoint: PersistedShadowCheckpoint =
-      result.structured && result.coverage
-        ? {
-            version: CHECKPOINT_SCHEMA_VERSION,
-            checkpointId: result.checkpointId,
-            sessionId: result.sessionId,
-            summary: result.summary,
-            firstKeptEntryId: result.firstKeptEntryId,
-            leafId: result.leafId,
-            latestCompactionId: result.latestCompactionId,
-            contextTokensBefore: result.contextTokensBefore ?? 0,
-            usage: result.usage,
-            details: result.details,
-            createdAt: Date.now(),
-            structured: result.structured,
-            coverage: result.coverage,
-            prompts: result.prompts ?? currentPromptVersions(),
-            generatedAt: result.generatedAt ?? Date.now(),
-          }
-        : {
-            version: 1,
-            checkpointId: result.checkpointId,
-            sessionId: result.sessionId,
-            summary: result.summary,
-            firstKeptEntryId: result.firstKeptEntryId,
-            leafId: result.leafId,
-            latestCompactionId: result.latestCompactionId,
-            contextTokensBefore: result.contextTokensBefore ?? 0,
-            usage: result.usage,
-            details: result.details,
-            createdAt: Date.now(),
-          };
+    const checkpoint = toPersistedCheckpoint(result);
     try {
       pi.appendEntry(CHECKPOINT_CUSTOM_TYPE, checkpoint);
     } catch (error) {
@@ -447,13 +409,14 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       const maxTokens = config.summaryMaxTokens;
       const verifierModel = resolveVerificationModel(ctx, config);
       const targetSummaryChars = Math.min(checkpointSummaryTarget(model, maxTokens), checkpointSummaryTarget(verifierModel, maxTokens));
-      const index = new SessionHistoryIndex({
+      const makeIndex = () => new SessionHistoryIndex({
         branch,
         cwd: ctx.cwd,
         previousCoverageEndEntryId: previousCoverageEnd,
         ...(previousSummary ? { previousCheckpointSummary: previousSummary } : {}),
       });
-      const outcome = await runCheckpointBuilderAgent(ctx, index, config, {
+      const builderIndex = makeIndex();
+      const outcome = await runCheckpointBuilderAgent(ctx, builderIndex, config, {
         signal: controller.signal,
         ...(customInstructions ? { customInstructions } : {}),
         model,
@@ -475,13 +438,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         preparedAtLeafId: leafIdAtStart,
         publishedAtLeafId: leafIdAtStart,
       });
-      const verifierIndex = new SessionHistoryIndex({
-        branch,
-        cwd: ctx.cwd,
-        previousCoverageEndEntryId: previousCoverageEnd,
-        ...(previousSummary ? { previousCheckpointSummary: previousSummary } : {}),
-      });
-      const verified = await runCheckpointVerifierAgent(ctx, verifierIndex, outcome.checkpoint, draftCoverage, config, {
+      const verified = await runCheckpointVerifierAgent(ctx, makeIndex(), outcome.checkpoint, draftCoverage, config, {
         signal: controller.signal,
         ...(customInstructions ? { customInstructions } : {}),
         model: verifierModel,
@@ -537,9 +494,8 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         verifierThinking: verifierThinking ?? null,
         verifierWallMs,
         verifierVerdict: verified.verdict,
-        renderOrder: isActionFirstEnabled() ? "action-first" : "legacy",
         summaryWallMs,
-        inspectedEntries: index.inspectedEntryIds.size,
+        inspectedEntries: builderIndex.inspectedEntryIds.size,
         builderRounds: outcome.toolRounds,
         verifierRounds: verified.toolRounds,
         hasPreviousCheckpoint: previousSummary !== undefined,
@@ -680,31 +636,6 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     },
   });
 
-  /**
-   * Marks a ready checkpoint as the mandatory working context. Swaps apply
-   * automatically on the next context event; this traces the arming once per
-   * checkpoint so force-swap transitions stay visible without per-turn spam.
-   */
-  const requestActivation = (ctx: ExtensionContext, reason: string): boolean => {
-    const result = state.published;
-    if (!result || !resultIsCurrent(ctx, result)) return false;
-    if (activationTracedFor !== result.checkpointId) {
-      activationTracedFor = result.checkpointId;
-      const usage = ctx.getContextUsage();
-      traceEvent("threshold_crossed", {
-        turn: turnCount,
-        generation: state.generation,
-        action: "force-swap",
-        reason,
-        checkpointId: result.checkpointId,
-        coverageEnd: result.coverage?.coverageEndEntryId ?? null,
-        contextTokens: usage?.tokens ?? null,
-        contextPercent: usage?.percent ?? null,
-      });
-    }
-    return true;
-  };
-
   // Mid-run swap: a published, current summary replaces the stale prefix in the
   // next request. This touches only the request's message list, so the agent run
   // never aborts. A safe boundary can install canonical context; idle completion
@@ -818,21 +749,10 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     const firstKeptEntryId = event.preparation.firstKeptEntryId;
     if (!coversCompactionPrefix(ctx, result, firstKeptEntryId)) return undefined;
     const branch = ctx.sessionManager.getBranch();
-    // Preview with Pi's own projector. Recovery can put the cut on an
-    // invisible omission/state entry, so slicing at a visible message would
-    // reject a valid cut or accidentally retain the abandoned attempt.
-    const candidate = buildSessionProjection([...branch, {
-      type: "compaction",
-      id: randomUUID(),
-      parentId: branch[branch.length - 1]?.id ?? null,
-      timestamp: new Date().toISOString(),
-      summary: result.summary,
-      firstKeptEntryId,
-      tokensBefore: event.preparation.tokensBefore,
-    }]).messages.filter((message) => message.role !== "system");
+    const candidate = projectCheckpoint(branch, result.summary, firstKeptEntryId, event.preparation.tokensBefore);
     if (hasOrphanedToolResult(candidate)) return undefined;
-    const before = messagesBefore.reduce((total, message) => total + estimateMessageTokens(message), 0);
-    const after = candidate.reduce((total, message) => total + estimateMessageTokens(message), 0);
+    const before = estimatedTokens(messagesBefore);
+    const after = estimatedTokens(candidate);
     // Committing the checkpoint and tail already being served is a no-op,
     // even when it drops entries from canonical history. Let Pi summarize
     // natively rather than reporting another successful non-reduction.
@@ -862,11 +782,34 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     if (latest && details?.shadowCheckpoint?.checkpointId === result.checkpointId) {
       traceEvent("checkpoint_installed", { checkpointId: result.checkpointId, compactionId: latest.id, firstKeptEntryId: latest.firstKeptEntryId });
       state.reset();
-      nativeFallbackInFlight = false;
-      forceNativeOnce = false;
+      nativeMode = "none";
       ctx.ui.notify("shadow-compact: checkpoint installed", "info");
     }
   };
+
+  /**
+   * Projects a branch as if `summary` were committed at `firstKeptEntryId`.
+   * Pi's own projector is authoritative: recovery can put the cut on an
+   * invisible omission/state entry, so slicing at a visible message would
+   * reject valid cuts or retain an abandoned attempt.
+   */
+  const projectCheckpoint = (
+    branch: SessionEntry[],
+    summary: string,
+    firstKeptEntryId: string,
+    tokensBefore: number,
+  ): ContextEvent["messages"] => buildSessionProjection([...branch, {
+    type: "compaction",
+    id: randomUUID(),
+    parentId: branch[branch.length - 1]?.id ?? null,
+    timestamp: new Date().toISOString(),
+    summary,
+    firstKeptEntryId,
+    tokensBefore,
+  }]).messages.filter((message) => message.role !== "system");
+
+  const estimatedTokens = (messages: ContextEvent["messages"]): number =>
+    messages.reduce((total, message) => total + estimateMessageTokens(message), 0);
 
   const installAtBoundary = (
     event: BoundaryState,
@@ -901,14 +844,9 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     });
     if (isWorkingContextSkipped(built)) return;
     const firstKeptEntryId = built.plan.swapStartEntryId;
-    const candidate = buildSessionProjection([...branch, {
-      type: "compaction", id: randomUUID(), parentId: branch.at(-1)?.id ?? null,
-      timestamp: new Date().toISOString(), summary: result.summary,
-      firstKeptEntryId, tokensBefore: 0,
-    }]).messages.filter((message) => message.role !== "system");
-    const tokenCount = (messages: ContextEvent["messages"]) => messages.reduce((total, message) => total + estimateMessageTokens(message), 0);
+    const candidate = projectCheckpoint(branch, result.summary, firstKeptEntryId, 0);
     // Compare canonical context, not the request-local context already served.
-    if (hasOrphanedToolResult(candidate) || tokenCount(candidate) >= tokenCount(before)) return;
+    if (hasOrphanedToolResult(candidate) || estimatedTokens(candidate) >= estimatedTokens(before)) return;
     // Pi's projector must produce precisely the proved summary + suffix.
     if (JSON.stringify(candidate.slice(1)) !== JSON.stringify(built.messages.slice(1))) return;
     traceEvent("checkpoint_install_proposed", { checkpointId: result.checkpointId, firstKeptEntryId, overlapStart: result.firstKeptEntryId, coverageEnd: coverage.coverageEndEntryId });
@@ -923,9 +861,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     configPromise = undefined;
     reportedError = undefined;
     configErrorReported = false;
-    nativeFallbackInFlight = false;
-    forceNativeOnce = false;
-    activationTracedFor = undefined;
+    nativeMode = "none";
     turnCount = 0;
     restorePersistedCheckpoint(ctx);
   });
@@ -968,7 +904,6 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     if ((percent === null || percent === undefined) && typeof usage?.tokens !== "number") return;
     const nativeThreshold =
       config?.nativeFallbackThresholdPercent ?? DEFAULT_NATIVE_FALLBACK_THRESHOLD_PERCENT;
-    const swapThreshold = config?.swapThresholdPercent ?? DEFAULT_SWAP_THRESHOLD_PERCENT;
 
     // Never invoke manual compaction here. A ready checkpoint can install
     // through the boundary draft above; otherwise this event only prepares.
@@ -1020,14 +955,6 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         );
       }
       return;
-    }
-
-    // Swap threshold: a ready checkpoint becomes the mandatory working
-    // context on the next request. A preparation in flight is NOT aborted:
-    // it is the path to a smaller working set, and native fallback waits
-    // for the true emergency threshold.
-    if (config && percent !== null && percent !== undefined && percent >= swapThreshold) {
-      requestActivation(ctx, "swap-threshold");
     }
 
     if (state.preparing) return;
@@ -1083,10 +1010,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       const branch = ctx.sessionManager.getBranch();
       const leafId = ctx.sessionManager.getLeafId() ?? branch[branch.length - 1]?.id;
       const coverage = effectiveCoverage(branch, published);
-      if (coverage && coverage.coverageEndEntryId === leafId) {
-        requestActivation(ctx, "idle");
-        return;
-      }
+      if (coverage && coverage.coverageEndEntryId === leafId) return;
     }
     requestCheckpoint(ctx, config, ctx.sessionManager.getBranch(), "idle");
   };
@@ -1123,7 +1047,8 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     let sessionId: string | null = null;
     let route = "entered";
     let ownedPreparation = false;
-    const trigger = nativeFallbackInFlight ? "emergency" : forceNativeOnce ? "escape" : event.reason;
+    const requestedNative = nativeMode;
+    const trigger = requestedNative === "fallback" ? "emergency" : requestedNative === "escape" ? "escape" : event.reason;
     const recordRoute = (selected: string): void => {
       route = selected;
       compactTrace = { attemptId, sessionId, route };
@@ -1139,9 +1064,9 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     try {
       sessionId = ctx.sessionManager.getSessionId();
       if (isObserveMode()) { recordRoute("observe"); return; }
-      const forced = forceNativeOnce;
-      forceNativeOnce = false;
-      if (forced && !nativeFallbackInFlight) {
+      if (requestedNative === "escape") {
+        // Escape is single-shot; fallback stays armed until an outcome event.
+        nativeMode = "none";
         recordRoute("pure-native");
         notify("shadow-compact: pure Pi compaction; token-cap recovery is disabled");
         return;
@@ -1171,7 +1096,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         traceEvent("compaction_outcome", { attemptId, sessionId, route, outcome: "ready", summaryChars: served.compaction?.summary.length ?? 0 });
         return served;
       };
-      if (forced || (event.reason === "manual" && config.manualCompactMode === "native")) {
+      if (requestedNative !== "none" || (event.reason === "manual" && config.manualCompactMode === "native")) {
         state.abortPreparing();
         return await nativeCompaction();
       }
@@ -1258,8 +1183,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
   // Failure only releases the native escape/fallback markers; the old working
   // checkpoint remains valid and can keep serving.
   const clearNativeCompactMarkers = (): void => {
-    nativeFallbackInFlight = false;
-    forceNativeOnce = false;
+    nativeMode = "none";
   };
   pi.on("session_compact", () => {
     traceEvent("compaction_outcome", { ...compactTrace, outcome: "installed" });
@@ -1270,7 +1194,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
   pi.on("session_compact_failed", (event) => {
     traceEvent("compaction_outcome", { ...compactTrace, outcome: event.aborted ? "cancelled" : "failed" });
     compactTrace = undefined;
-    const hadNativeFallback = nativeFallbackInFlight;
+    const hadNativeFallback = nativeMode === "fallback";
     clearNativeCompactMarkers();
     // The emergency hatch aborted a prepare. With nothing left to serve,
     // failure must release its disarmed refresh gate for a later attempt.
