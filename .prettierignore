@@ -1,0 +1,14 @@
+node_modules/
+dist/
+src/
+test/
+package-lock.json
+.agents/
+docs/
+analysis/
+experiments/
+.trace/
+README.md
+CHANGELOG.md
+LICENSE
+.nvmrc
