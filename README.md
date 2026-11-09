@@ -136,7 +136,8 @@ pi update git:github.com/sij0sh/pi-shadow-compact
 pi remove git:github.com/sij0sh/pi-shadow-compact
 ```
 
-Requires Node 22.19+. Development and integration tests target Pi 1.0.4.
+Requires Node 22.23.4+ (pinned in `.nvmrc`). Development and integration tests
+target Pi 1.0.4.
 
 ## Commands
 
@@ -204,7 +205,9 @@ npm ci
 ```
 
 `./scripts/verify` runs the TypeScript typecheck, test suite, and bundle
-build. `npm run check` runs only the typecheck and test suite.
+build. `npm run check` runs only the typecheck and test suite. `npm run
+format:check` verifies formatting of repository files; `src/` and `test/` are
+excluded until a bulk reformat is approved.
 
 ## License
 
