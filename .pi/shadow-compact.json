@@ -1,12 +1,13 @@
 {
   "softCompactThresholdPercent": 60,
   "summarizerModel": {
-    "provider": "azure-gateway-responses",
-    "id": "gpt-6.1-sol"
+    "provider": "commandcode",
+    "id": "deepseek/deepseek-v4.1-flash"
   },
   "verificationModel": {
-    "provider": "azure-gateway-responses",
-    "id": "gpt-6.1-sol"
+    "provider": "commandcode",
+    "id": "deepseek/deepseek-v4.1-flash"
   },
+  "thinkingLevel": "high",
   "verificationThinkingLevel": "max"
 }
