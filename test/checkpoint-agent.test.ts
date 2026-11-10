@@ -226,6 +226,42 @@ describe("runCheckpointBuilderAgent", () => {
     assert.match(texts, /must be an object like/);
   });
 
+  it("drops a nested coverage echo and states the envelope in the prompt", async () => {
+    const index = new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" });
+    const payload = { ...checkpointPayload(), coverageEndEntryId: "e2" };
+    const fake = scripted((context) =>
+      toolNames(context).includes("read_turn_range")
+        ? toolResponse([{ id: "c2", name: "submit_checkpoint", args: { checkpoint: payload, coverageEndEntryId: "e2" } }])
+        : toolResponse([{ id: "c1", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]));
+    const outcome = await runCheckpointBuilderAgent(ctx, index, config, { completion: fake.completion, model });
+    assert.equal(outcome.coverageEndEntryId, "e2");
+    assert.equal(fake.calls.length, 2, "one read, then acceptance on the first submit");
+    const prompt = JSON.stringify((fake.calls[0]!.messages[0] as { content: unknown }).content);
+    assert.match(prompt, /Submit arguments: coverageEndEntryId is passed beside checkpoint, not inside it\./);
+  });
+
+  it("rejects a nested coverage value that disagrees with the argument", async () => {
+    const index = new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" });
+    const conflict = { ...checkpointPayload(), coverageEndEntryId: "e1" };
+    const fake = scripted((context) => {
+      const names = toolNames(context);
+      if (!names.includes("read_turn_range")) {
+        return toolResponse([{ id: "c1", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]);
+      }
+      return toolResponse([{ id: "c2", name: "submit_checkpoint", args: {
+        checkpoint: names.includes("submit_checkpoint") ? checkpointPayload() : conflict,
+        coverageEndEntryId: "e2",
+      } }]);
+    });
+    const outcome = await runCheckpointBuilderAgent(ctx, index, config, { completion: fake.completion, model });
+    assert.equal(outcome.coverageEndEntryId, "e2");
+    const texts = fake.calls
+      .flatMap((call) => call.messages.filter((message) => message.role === "toolResult"))
+      .map((message) => JSON.stringify((message as { content: unknown }).content))
+      .join("\n");
+    assert.match(texts, /coverageEndEntryId\. A checkpoint holds sections only; submit-tool arguments belong beside checkpoint, not inside it\./);
+  });
+
   it("fails after repeated invalid submits", async () => {
     const index = new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" });
     const fake = scripted((context) => {
@@ -414,6 +450,26 @@ describe("runCheckpointVerifierAgent", () => {
     });
     assert.equal(outcome.verdict, "repair");
     assert.ok(outcome.summary.includes("Repaired goal"));
+  });
+
+  it("drops a nested verdict echo and states the envelope in the prompt", async () => {
+    const index = new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" });
+    const payload = { ...checkpointPayload("Repaired goal"), verdict: "repair", coverageEndEntryId: "e2" };
+    const fake = scripted((context) => {
+      if (!toolNames(context).includes("read_turn_range")) {
+        return toolResponse([{ id: "c1", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]);
+      }
+      return toolResponse([{ id: "c2", name: "submit_verdict", args: { verdict: "repair", checkpoint: payload, coverageEndEntryId: "e2" } }]);
+    });
+    const outcome = await runCheckpointVerifierAgent(ctx, index, draft, draftCoverage, config, {
+      completion: fake.completion,
+      model,
+    });
+    assert.equal(outcome.verdict, "repair");
+    assert.ok(outcome.summary.includes("Repaired goal"));
+    assert.equal(fake.calls.length, 2, "one read, then acceptance on the first submit");
+    const prompt = JSON.stringify((fake.calls[0]!.messages[0] as { content: unknown }).content);
+    assert.match(prompt, /Submit arguments: verdict, coverageEndEntryId, reason are passed beside checkpoint, not inside it\./);
   });
 
   it("requires full independent coverage before accepting a compressed recovery checkpoint", async () => {

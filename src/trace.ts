@@ -34,6 +34,8 @@ export type TraceEventType =
   | "checkpoint_persisted"
   | "checkpoint_restored"
   | "checkpoint_restore_rejected"
+  | "checkpoint_submit_rejected"
+  | "checkpoint_argument_echo_dropped"
   | "native_fallback"
   | "compaction_served"
   | "compaction_fallback"

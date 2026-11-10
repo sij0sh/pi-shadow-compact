@@ -134,7 +134,9 @@ export function validateCheckpointObject(value: unknown, knownRefs: Set<string>)
       key !== VERIFICATION_SECTION &&
       key !== CONTINUATION_KEY
     ) {
-      throw new Error(`Unexpected checkpoint key: ${key}`);
+      throw new Error(
+        `Unexpected checkpoint key: ${key}. A checkpoint holds sections only; submit-tool arguments belong beside checkpoint, not inside it.`,
+      );
     }
   }
   const checkpoint = {} as Checkpoint;

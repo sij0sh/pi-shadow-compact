@@ -300,6 +300,7 @@ export class UnusableCheckpointError extends Error {
 
 interface RunState {
   index: SessionHistoryIndex;
+  stage: AgentSetup["stage"];
   pageChars: number;
   servedRefs: Set<string>;
   submitAttempts: number;
@@ -310,6 +311,50 @@ interface RunState {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+/** Submit argument names: a tool schema's properties minus the checkpoint body. */
+function submitArgumentNames(tool: Tool): string[] {
+  const properties = (tool.parameters as { properties?: Record<string, unknown> }).properties;
+  return Object.keys(properties ?? {}).filter((name) => name !== "checkpoint");
+}
+
+/**
+ * Models occasionally fold a submit argument into the checkpoint body. A body
+ * copy that equals the top-level argument adds nothing, so it is dropped as a
+ * no-op; any other nested copy still fails validation.
+ */
+function dropSubmitArgumentEchoes(
+  state: RunState,
+  tool: Tool,
+  args: Record<string, unknown>,
+): Record<string, unknown> {
+  const body = args.checkpoint;
+  if (!isRecord(body)) return args;
+  const echoes = submitArgumentNames(tool).filter((name) => name in body && body[name] === args[name]);
+  if (echoes.length === 0) return args;
+  const cleaned = { ...body };
+  for (const name of echoes) delete cleaned[name];
+  traceEvent("checkpoint_argument_echo_dropped", { stage: state.stage, tool: tool.name, keys: echoes });
+  return { ...args, checkpoint: cleaned };
+}
+
+/** Records a rejected submit and returns its message for the tool result. */
+function reportSubmitRejection(state: RunState, tool: Tool, error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  traceEvent("checkpoint_submit_rejected", {
+    stage: state.stage,
+    tool: tool.name,
+    attempt: state.submitAttempts,
+    error: message,
+  });
+  return message;
+}
+
+/** One prompt sentence: submit arguments live beside the checkpoint, not in it. */
+function submitEnvelopeHint(tool: Tool): string {
+  const names = submitArgumentNames(tool);
+  return `Submit arguments: ${names.join(", ")} ${names.length === 1 ? "is" : "are"} passed beside checkpoint, not inside it.`;
 }
 
 function asInteger(value: unknown): number | undefined {
@@ -444,7 +489,7 @@ Rules:
 - Record what the evidence actually verified vs explicitly left unverified in verificationState; never mark unresolved work complete.
 - Fill continuationState with the current goal, the approach in progress, and the immediate next step.
 - Cite only evidence ids served to you by the read tools (plus E0000 for the previous checkpoint once fetched).
-- Be dense but readable. Call submit_checkpoint once with the complete checkpoint shaped:
+- Be dense but readable. ${submitEnvelopeHint(SUBMIT_CHECKPOINT_TOOL)} Call submit_checkpoint once with the complete checkpoint shaped:
 ${JSON.stringify({ objective: [{ text: "string", evidenceRefs: ["E0001"] }], constraints: [], completedWork: [{ text: "string", evidenceRefs: ["E0001"] }], currentState: [], decisions: [], openIssues: [], nextActions: [], criticalContext: [], modifiedFiles: [], referencedFiles: [], verificationState: [{ text: "string", status: "verified", evidenceRefs: ["E0001"] }], continuationState: { currentGoal: "string", currentApproach: "string", immediateNextStep: "string" } })}
 
 Every item in every list section (objective, completedWork, currentState, and the rest) must be an object shaped { text: "...", evidenceRefs: ["E0001"] }. Never submit a bare string such as completedWork: ["did X"]; resubmit the same entry as { text: "did X", evidenceRefs: ["E0001"] }.`;
@@ -484,6 +529,7 @@ Repair rules:
 - Preserve exact identifiers continuation depends on: file paths, symbols, commands, flags, versions, URLs, error text, literal values, and API names.
 - Keep verificationState honest: verified only with direct supporting evidence, everything else unverified.
 - Keep continuationState accurate: the true current goal, approach, and immediate next step.
+- ${submitEnvelopeHint(SUBMIT_VERDICT_TOOL)}
 - Every repaired list item must be an object { text: "...", evidenceRefs: ["E0001"] } (verificationState adds status), never a bare string.
 - Cite only evidence ids served to you by the read tools (plus E0000 for the previous checkpoint once fetched).
 - Distinguish facts from assumptions. Do not invent details. Do not continue the task.
@@ -712,6 +758,7 @@ function startAgent(options: AgentSetup): {
     request.targetSummaryChars ?? checkpointSummaryTarget(model, request.maxTokens ?? config.summaryMaxTokens);
   const state: RunState = {
     index,
+    stage: options.stage,
     pageChars: readPageChars(model),
     servedRefs: new Set(),
     submitAttempts: 0,
@@ -766,14 +813,15 @@ export async function runCheckpointBuilderAgent(
             throw new Error("submit_checkpoint attempts exhausted");
           }
           requireCompletion(state);
-          const { entryId } = validateCoverage(index, args.coverageEndEntryId);
-          const checkpoint = validateCheckpointObject(args.checkpoint, state.servedRefs);
+          const submit = dropSubmitArgumentEchoes(state, SUBMIT_CHECKPOINT_TOOL, args);
+          const { entryId } = validateCoverage(index, submit.coverageEndEntryId);
+          const checkpoint = validateCheckpointObject(submit.checkpoint, state.servedRefs);
           requireContinuation(checkpoint);
           requireConciseSummary(checkpoint, target, hardTarget, state.sizeCorrected);
           accepted = { checkpoint, coverageEndEntryId: entryId };
           return { done: true };
         } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
+          const message = reportSubmitRejection(state, SUBMIT_CHECKPOINT_TOOL, error);
           if (error instanceof OversizedCheckpointError) state.sizeCorrected = true;
           if (state.submitAttempts >= MAX_SUBMIT_ATTEMPTS) return { fatal: new Error(message) };
           return { done: false, error: `submit_checkpoint rejected: ${message}` };
@@ -829,9 +877,10 @@ export async function runCheckpointVerifierAgent(
           if (state.readCalls < 1) {
             throw new Error("inspect session history with at least one read tool before submitting a verdict");
           }
-          const verdict = args.verdict;
+          const submit = dropSubmitArgumentEchoes(state, SUBMIT_VERDICT_TOOL, args);
+          const verdict = submit.verdict;
           if (verdict === "unusable") {
-            const reason = typeof args.reason === "string" && args.reason.trim() ? args.reason.trim() : "no reason given";
+            const reason = typeof submit.reason === "string" && submit.reason.trim() ? submit.reason.trim() : "no reason given";
             return { fatal: new UnusableCheckpointError(reason) };
           }
           if (verdict === "accept") {
@@ -845,8 +894,8 @@ export async function runCheckpointVerifierAgent(
           }
           if (verdict === "repair") {
             requireCompletion(state);
-            const { entryId } = validateCoverage(index, args.coverageEndEntryId);
-            const checkpoint = validateCheckpointObject(args.checkpoint, state.servedRefs);
+            const { entryId } = validateCoverage(index, submit.coverageEndEntryId);
+            const checkpoint = validateCheckpointObject(submit.checkpoint, state.servedRefs);
             requireContinuation(checkpoint);
             requireConciseSummary(checkpoint, target, hardTarget, state.sizeCorrected);
             accepted = { checkpoint, coverageEndEntryId: entryId, verdict: "repair" };
@@ -855,7 +904,7 @@ export async function runCheckpointVerifierAgent(
           throw new Error('verdict must be "accept", "repair", or "unusable"');
         } catch (error) {
           if (error instanceof UnusableCheckpointError) return { fatal: error };
-          const message = error instanceof Error ? error.message : String(error);
+          const message = reportSubmitRejection(state, SUBMIT_VERDICT_TOOL, error);
           if (error instanceof OversizedCheckpointError) state.sizeCorrected = true;
           if (state.submitAttempts >= MAX_SUBMIT_ATTEMPTS) return { fatal: new Error(message) };
           return { done: false, error: `submit_verdict rejected: ${message}` };

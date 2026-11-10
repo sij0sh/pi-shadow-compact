@@ -42,6 +42,16 @@ All notable changes to this project are documented here. Format follows
   `context_with_system`/`before_provider_request`/`after_provider_response`/
   `provider_stream_event`/`message_end` hooks are gone with it.
 
+### Fixed
+
+- A submit argument folded into the checkpoint body (for example
+  `coverageEndEntryId`) no longer costs a strike when it echoes the top-level
+  argument value; a conflicting or remaining unknown key is rejected with a
+  message that says submit arguments belong beside `checkpoint`. Both agents
+  state that envelope in one prompt sentence, and rejected submits plus dropped
+  echoes are traced (`checkpoint_submit_rejected`,
+  `checkpoint_argument_echo_dropped`).
+
 ## [0.2.2] - 2026-11-09
 
 ### Added

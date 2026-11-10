@@ -89,6 +89,10 @@ describe("checkpoint schema additions", () => {
       () => validateCheckpointObject({ ...base, surprises: [] }, REFS),
       /Unexpected checkpoint key: surprises/,
     );
+    assert.throws(
+      () => validateCheckpointObject({ ...base, coverageEndEntryId: "E0001" }, REFS),
+      /coverageEndEntryId.*beside checkpoint, not inside it/,
+    );
   });
 
   it("renders sections in schema order", () => {
