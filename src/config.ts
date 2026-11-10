@@ -504,14 +504,3 @@ export function isBelowPrepare(
 ): boolean {
   return !isAtOrAbovePrepare(usage, config);
 }
-
-export function isAtOrAboveNativeFallback(
-  usage: ThresholdUsage,
-  config: Pick<ShadowCompactConfig, "nativeFallbackThresholdPercent">,
-): boolean {
-  return (
-    usage.percent !== undefined &&
-    usage.percent !== null &&
-    usage.percent >= config.nativeFallbackThresholdPercent
-  );
-}

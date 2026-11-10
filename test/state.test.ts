@@ -404,17 +404,6 @@ describe("ShadowCompactStateController", () => {
     assert.equal(controller.fail(second.generation), false);
   });
 
-  it("active is true once a published checkpoint has swapped", () => {
-    const controller = new ShadowCompactStateController();
-    assert.equal(controller.active, false);
-    const preparing = prepare(controller);
-    assert.ok(preparing);
-    assert.equal(controller.publish(preparing.generation, prepared()), true);
-    assert.equal(controller.active, false);
-    controller.markSwapped(3);
-    assert.equal(controller.active, true);
-  });
-
   it("reset aborts preparing, clears everything, bumps generation, and re-arms", () => {
     const controller = new ShadowCompactStateController();
     const preparing = prepare(controller);

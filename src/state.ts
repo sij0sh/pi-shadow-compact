@@ -66,11 +66,6 @@ export class ShadowCompactStateController {
     return this.#publishedSwapped;
   }
 
-  /** Whether a checkpoint is actively serving (published and swapped at least once). */
-  get active(): boolean {
-    return this.#published !== undefined && this.#publishedSwapped;
-  }
-
   get preparing(): PreparingInfo | undefined {
     return this.#preparing;
   }

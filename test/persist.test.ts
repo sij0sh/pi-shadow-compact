@@ -25,7 +25,6 @@ import {
   waitFor,
   tick,
   USAGE,
-  type Fixture,
 } from "./helpers/index-fixture.js";
 
 function assistantToolCallEntry(id: string, parentId: string, callId: string): SessionEntry {

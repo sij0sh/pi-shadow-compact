@@ -34,6 +34,9 @@ All notable changes to this project are documented here. Format follows
 - v1/v2 checkpoint read path. Only the current schema version restores; older
   entries are ignored, so a session upgraded from a pre-v3 release starts cold
   once. `CHECKPOINT_CUSTOM_TYPE_LEGACY` and the per-version readers are gone.
+- `state.active` getter and `isAtOrAboveNativeFallback`: the getter was
+  only ever read by its own test (`publishedSwapped` still exposes the
+  transition), and the predicate existed inline in the hook.
 - `request-trace.ts` (190-line always-on provider observer). The
   `acting_request` trace event, the payload clamp warning, and the
   `context_with_system`/`before_provider_request`/`after_provider_response`/

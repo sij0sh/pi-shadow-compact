@@ -22,7 +22,6 @@ import {
   VERIFIER_PROVIDER_ENV_VAR,
   VERIFIER_THINKING_ENV_VAR,
   defaultConfig,
-  isAtOrAboveNativeFallback,
   isAtOrAbovePrepare,
   isBelowPrepare,
   isObserveMode,
@@ -938,17 +937,6 @@ describe("threshold comparisons", () => {
     assert.equal(isAtOrAbovePrepare({ tokens: 59000, percent: 90 }, config), false);
     assert.equal(isAtOrAbovePrepare({ percent: 60 }, { prepareThresholdPercent: 60 }), true);
     assert.equal(isAtOrAbovePrepare({ percent: 59 }, { prepareThresholdPercent: 60 }), false);
-  });
-
-  it("native fallback compares percent only", () => {
-    assert.equal(
-      isAtOrAboveNativeFallback({ percent: 92 }, { nativeFallbackThresholdPercent: 92 }),
-      true,
-    );
-    assert.equal(
-      isAtOrAboveNativeFallback({ percent: 91 }, { nativeFallbackThresholdPercent: 92 }),
-      false,
-    );
   });
 });
 
