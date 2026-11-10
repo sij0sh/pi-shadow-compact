@@ -12,7 +12,7 @@ import {
   type Usage,
 } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { ShadowCompactConfig } from "./config.js";
+import type { ModelPair, ShadowCompactConfig } from "./config.js";
 import type { FileDetails } from "./working-context.js";
 
 const MAX_ITEM_CHARS = 8_000;
@@ -88,35 +88,56 @@ export interface CompletionInterface {
     options?: ModelsSimpleStreamOptions,
   ): Promise<AssistantMessage>;
 }
+/**
+ * Resolves the checkpoint model in strict priority order:
+ *
+ * 1. the explicitly configured pair (env or either config file),
+ * 2. Pi's configured default model (`defaultProvider` / `defaultModel`),
+ * 3. the model currently running the session — the only fallback, never a
+ *    silent replacement for a configured model.
+ *
+ * A configured model that is not in the registry (unauthenticated provider,
+ * removed model) falls through instead of aborting compaction.
+ */
 export function resolveSummarizerModel(
   ctx: Pick<ExtensionContext, "model" | "modelRegistry">,
   config: ShadowCompactConfig,
+  defaultModel?: ModelPair,
 ): Model<Api> {
   const configured = config.summarizerModel;
-  const model = configured.provider
-    ? ctx.modelRegistry.find(configured.provider, configured.id)
-    : ctx.model;
-  if (model) return model;
+  if (configured.provider) {
+    const model = ctx.modelRegistry.find(configured.provider, configured.id);
+    if (model) return model;
+  }
+  if (defaultModel?.provider) {
+    const model = ctx.modelRegistry.find(defaultModel.provider, defaultModel.id);
+    if (model) return model;
+  }
+  if (ctx.model) return ctx.model;
   const name = configured.provider
     ? `${configured.provider}/${configured.id}`
-    : "current Pi session model";
+    : defaultModel?.provider
+      ? `${defaultModel.provider}/${defaultModel.id}`
+      : "current Pi session model";
   throw new Error(`Summary model not found: ${name}`);
 }
 
 /**
- * Resolves the second-pass verification model. A configured
+ * Resolves the second-pass verification model. An explicitly configured
  * `verificationModel` pair wins; otherwise the verifier reuses the resolved
- * summarizer model, so verification stays on with no config change.
+ * summarizer model, so verification stays on with no config change and an
+ * unresolvable verifier model degrades to the summarizer chain.
  */
 export function resolveVerificationModel(
   ctx: Pick<ExtensionContext, "model" | "modelRegistry">,
   config: ShadowCompactConfig,
+  defaultModel?: ModelPair,
 ): Model<Api> {
   const configured = config.verificationModel;
-  if (!configured || !configured.provider) return resolveSummarizerModel(ctx, config);
+  if (!configured || !configured.provider) return resolveSummarizerModel(ctx, config, defaultModel);
   const model = ctx.modelRegistry.find(configured.provider, configured.id);
   if (model) return model;
-  throw new Error(`Verification model not found: ${configured.provider}/${configured.id}`);
+  return resolveSummarizerModel(ctx, config, defaultModel);
 }
 
 /**

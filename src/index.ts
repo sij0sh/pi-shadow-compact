@@ -29,6 +29,7 @@ import {
   isObserveMode,
   isRollingEnabled,
   loadConfig,
+  type ModelPair,
   type ShadowCompactConfig,
 } from "./config.js";
 import {
@@ -104,6 +105,18 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     // Use Pi's live effective settings, including SDK overrides and project trust.
     const settings = SettingsManager.inMemory(pi.getSettings()).getCompactionSettings(ctx.model);
     return hasCompactableHistory(ctx.sessionManager.getBranch(), settings.keepRecentTokens);
+  };
+
+  /**
+   * Pi's configured default model (`defaultProvider` / `defaultModel`). It is
+   * the checkpoint fallback before the live session model, so a temporary
+   * session model switch never moves compaction onto that model.
+   */
+  const configuredDefaultModel = (): ModelPair | undefined => {
+    const settings = pi.getSettings();
+    const provider = settings.defaultProvider?.trim();
+    const id = settings.defaultModel?.trim();
+    return provider && id ? { provider, id } : undefined;
   };
 
   pi.registerCommand("compact-native", {
@@ -384,9 +397,10 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         }
       }
 
-      const model = resolveSummarizerModel(ctx, config);
+      const defaultModel = configuredDefaultModel();
+      const model = resolveSummarizerModel(ctx, config, defaultModel);
       const maxTokens = config.summaryMaxTokens;
-      const verifierModel = resolveVerificationModel(ctx, config);
+      const verifierModel = resolveVerificationModel(ctx, config, defaultModel);
       const targetSummaryChars = Math.min(checkpointSummaryTarget(model, maxTokens), checkpointSummaryTarget(verifierModel, maxTokens));
       const makeIndex = () => new SessionHistoryIndex({
         branch,
@@ -1064,7 +1078,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
           return;
         }
         recordRoute("wrapped-native");
-        const compaction = await compactWithRecovery(ctx, event, config, attemptId);
+        const compaction = await compactWithRecovery(ctx, event, config, attemptId, configuredDefaultModel());
         traceEvent("compaction_outcome", { attemptId, sessionId, route, outcome: "ready", summaryChars: compaction?.summary.length ?? 0 });
         return compaction ? { compaction } : undefined;
       };

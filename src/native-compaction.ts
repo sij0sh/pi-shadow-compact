@@ -9,7 +9,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { buildCoverage } from "./summary.js";
 import { checkpointSummaryTarget, runCheckpointBuilderAgent, runCheckpointVerifierAgent } from "./checkpoint-agent.js";
-import type { ShadowCompactConfig } from "./config.js";
+import type { ModelPair, ShadowCompactConfig } from "./config.js";
 import { sanitizeForContext } from "./normalize.js";
 import { SessionHistoryIndex } from "./session-reader.js";
 import { combineUsage, resolveSummarizerModel, resolveVerificationModel } from "./summary.js";
@@ -30,6 +30,7 @@ export async function compactWithRecovery(
   event: SessionBeforeCompactEvent,
   config: ShadowCompactConfig,
   attemptId = uuidv7(),
+  defaultModel?: ModelPair,
 ): Promise<CompactionResult | undefined> {
   const model = ctx.model;
   const { preparation, signal } = event;
@@ -90,8 +91,8 @@ export async function compactWithRecovery(
   } catch (error) {
     if (!(error instanceof IncompleteNativeSummary)) throw error;
     signal.throwIfAborted();
-    const summaryModel = resolveSummarizerModel(ctx, config);
-    const verifierModel = resolveVerificationModel(ctx, config);
+    const summaryModel = resolveSummarizerModel(ctx, config, defaultModel);
+    const verifierModel = resolveVerificationModel(ctx, config, defaultModel);
     const maxTokens = Math.min(
       error.maxTokens, config.summaryMaxTokens ?? Infinity,
       summaryModel.maxTokens > 0 ? summaryModel.maxTokens : Infinity,

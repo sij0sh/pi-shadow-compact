@@ -44,6 +44,9 @@ All notable changes to this project are documented here. Format follows
 
 ### Fixed
 
+- Checkpoint models resolve configured pair first, Pi's configured default
+  model second, session model last. A configured model missing from the
+  registry now falls through instead of aborting compaction.
 - A submit argument folded into the checkpoint body (for example
   `coverageEndEntryId`) no longer costs a strike when it echoes the top-level
   argument value; a conflicting or remaining unknown key is rejected with a

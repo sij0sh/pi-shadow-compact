@@ -159,15 +159,18 @@ Optional project configuration (takes precedence):
 <project>/.pi/shadow-compact.json
 ```
 
-See `.pi/shadow-compact.example.json` for the full schema. Blank provider
-and model IDs use the model already running the session.
+See `.pi/shadow-compact.example.json` for the full schema. Checkpoint models
+resolve in strict order: the configured `summarizerModel` / `verificationModel`
+pair, then Pi's configured default model (`defaultProvider` / `defaultModel`),
+then the model already running the session. A configured model that is missing
+from the registry falls through instead of aborting compaction.
 
 | Setting | Default | Behavior |
 |---|---|---|
 | `prepareThresholdPercent` | `60` | Start background checkpoint preparation |
 | `nativeFallbackThresholdPercent` | `92` | Queue one native compaction at the next safe idle point |
 | `recentTurns` | `10` | Minimum recent response/tool rounds kept verbatim |
-| `summarizerModel` / `verificationModel` | blank | Checkpoint builder/verifier models; blank reuses the session model, blank verifier reuses the summarizer |
+| `summarizerModel` / `verificationModel` | blank | Checkpoint builder/verifier models; blank uses Pi's default model, then the session model; blank verifier reuses the summarizer |
 | `thinkingLevel` / `verificationThinkingLevel` | `medium` / unset | Drafting and verification reasoning; verifier falls back to drafting level |
 | `summaryMaxTokens` | unset | Per-response generation cap; unset uses the model/provider limit |
 | `idleCompact` | enabled, `20000` | Prepare a fresh checkpoint on idle settle past coverage |
