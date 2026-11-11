@@ -1,6 +1,6 @@
 {
   "name": "pi-shadow-compact",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "type": "module",
   "description": "Silent soft-threshold compaction for Pi with native fallback",
   "keywords": [
@@ -30,8 +30,8 @@
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test test/*.test.ts",
     "check": "npm run typecheck && npm test",
-    "format": "prettier --write .github .prettierrc.json package.json tsconfig.json",
-    "format:check": "prettier --check .github .prettierrc.json package.json tsconfig.json"
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
   },
   "engines": {
     "node": "^22.23.4 || ^24.22.1 || >=26.12.1"

@@ -4,56 +4,73 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions use
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Changed
-
-- One `SECTIONS` list derives the checkpoint tool schema, validation,
-  rendering, and persisted-entry keys (was three copies).
-- One `checkpointStalenessReason` rule backs swaps, restore, and native
-  recovery, and one sync drops unservable checkpoints at `turn_start`,
-  `context`, `turn_end`, idle settle, and persist.
-- Builder and verifier agents share one runner bootstrap; the two compaction
-  paths share one projection helper.
-- `checkpoint.ts` folded into `summary.ts`, `prepare.ts` into
-  `working-context.ts` (17 → 15 modules).
-- `PreparedResult` is the persisted checkpoint: a published result is appended
-  as-is and restore hands the entry straight back, so `toPersistedCheckpoint`
-  and `toPreparedResult` no longer exist.
-- Verifier accept and repair share one validation rule; evidence reads and
-  coverage are checked for both regardless of `targetSummaryChars`.
-- One settings surface validates every file and env setting; env-only knobs
-  keep their names and messages are uniform.
+## [0.2.8] - 2026-11-10
 
 ### Removed
 
-- `swapThresholdPercent` and `SHADOW_COMPACT_HARD_THRESHOLD_PERCENT`. It never
-  gated a swap; a ready checkpoint always served. Configs or env vars that set
-  it now fail validation instead of silently accepting a dead knob.
+- Benchmark-only environment surface. `SHADOW_COMPACT_MODE`, `SHADOW_COMPACT_ROLLING`,
+  `SHADOW_COMPACT_SOFT_THRESHOLD_ABS`, the summarizer/verifier model and thinking overrides,
+  `SHADOW_COMPACT_MANUAL_MODE`, and `SHADOW_COMPACT_IDLE_MIN_TOKENS` are gone. Thresholds
+  (`SHADOW_COMPACT_SOFT_THRESHOLD_PERCENT`, `SHADOW_COMPACT_NATIVE_THRESHOLD_PERCENT`) are the only
+  env overrides left; file config is the user-facing surface. Consequence: there is no observe arm,
+  no single-shot arm, no absolute-token sweep, and no per-arm model override, so the roast harness
+  arms in `experiments/` no longer run as written.
+- `softCompactThresholdTokens` and the absolute-token prepare trigger it fed. `isAtOrAbovePrepare` /
+  `isBelowPrepare` compare `usage.percent` only.
+- `trace.prepareThresholdTokens` (was always `null` for a sane config).
+- `ShadowCheckpoint` (unused type; `PersistedShadowCheckpoint` is the durable shape). The
+  `summary-trace.ts` field helpers and label lists are no longer exported.
+- `coverage.sourceStartEntryId` (always `null`) and `generatedAt` (written, never read) from the
+  persisted checkpoint. `CHECKPOINT_SCHEMA_VERSION` is now 4; earlier entries are ignored on
+  restore, so an upgraded session starts cold once.
+
+### Changed
+
+- Prettier now covers the whole repository (`format` / `format:check` run `prettier .`); `src/` and
+  `test/` were reformatted in one mechanical commit. `.prettierignore` keeps only generated and
+  vendored paths.
+- One `SECTIONS` list derives the checkpoint tool schema, validation, rendering, and persisted-entry
+  keys (was three copies).
+- One `checkpointStalenessReason` rule backs swaps, restore, and native recovery, and one sync drops
+  unservable checkpoints at `turn_start`, `context`, `turn_end`, idle settle, and persist.
+- Builder and verifier agents share one runner bootstrap; the two compaction paths share one
+  projection helper.
+- `checkpoint.ts` folded into `summary.ts`, `prepare.ts` into `working-context.ts` (17 → 15
+  modules).
+- `PreparedResult` is the persisted checkpoint: a published result is appended as-is and restore
+  hands the entry straight back, so `toPersistedCheckpoint` and `toPreparedResult` no longer exist.
+- Verifier accept and repair share one validation rule; evidence reads and coverage are checked for
+  both regardless of `targetSummaryChars`.
+- One settings surface validates every file and env setting; env-only knobs keep their names and
+  messages are uniform.
+
+### Removed
+
+- `swapThresholdPercent` and `SHADOW_COMPACT_HARD_THRESHOLD_PERCENT`. It never gated a swap; a ready
+  checkpoint always served. Configs or env vars that set it now fail validation instead of silently
+  accepting a dead knob.
 - `SHADOW_COMPACT_ACTION_FIRST` render arm (dead experiment toggle).
-- v1/v2 checkpoint read path. Only the current schema version restores; older
-  entries are ignored, so a session upgraded from a pre-v3 release starts cold
-  once. `CHECKPOINT_CUSTOM_TYPE_LEGACY` and the per-version readers are gone.
-- `state.active` getter and `isAtOrAboveNativeFallback`: the getter was
-  only ever read by its own test (`publishedSwapped` still exposes the
-  transition), and the predicate existed inline in the hook.
-- `request-trace.ts` (190-line always-on provider observer). The
-  `acting_request` trace event, the payload clamp warning, and the
+- v1/v2 checkpoint read path. Only the current schema version restores; older entries are ignored,
+  so a session upgraded from a pre-v3 release starts cold once. `CHECKPOINT_CUSTOM_TYPE_LEGACY` and
+  the per-version readers are gone.
+- `state.active` getter and `isAtOrAboveNativeFallback`: the getter was only ever read by its own
+  test (`publishedSwapped` still exposes the transition), and the predicate existed inline in the
+  hook.
+- `request-trace.ts` (190-line always-on provider observer). The `acting_request` trace event, the
+  payload clamp warning, and the
   `context_with_system`/`before_provider_request`/`after_provider_response`/
   `provider_stream_event`/`message_end` hooks are gone with it.
 
 ### Fixed
 
-- Checkpoint models resolve configured pair first, Pi's configured default
-  model second, session model last. A configured model missing from the
-  registry now falls through instead of aborting compaction.
-- A submit argument folded into the checkpoint body (for example
-  `coverageEndEntryId`) no longer costs a strike when it echoes the top-level
-  argument value; a conflicting or remaining unknown key is rejected with a
-  message that says submit arguments belong beside `checkpoint`. Both agents
-  state that envelope in one prompt sentence, and rejected submits plus dropped
-  echoes are traced (`checkpoint_submit_rejected`,
-  `checkpoint_argument_echo_dropped`).
+- Checkpoint models resolve configured pair first, Pi's configured default model second, session
+  model last. A configured model missing from the registry now falls through instead of aborting
+  compaction.
+- A submit argument folded into the checkpoint body (for example `coverageEndEntryId`) no longer
+  costs a strike when it echoes the top-level argument value; a conflicting or remaining unknown key
+  is rejected with a message that says submit arguments belong beside `checkpoint`. Both agents
+  state that envelope in one prompt sentence, and rejected submits plus dropped echoes are traced
+  (`checkpoint_submit_rejected`, `checkpoint_argument_echo_dropped`).
 
 ## [0.2.2] - 2026-11-09
 
@@ -68,8 +85,7 @@ All notable changes to this project are documented here. Format follows
 ### Changed
 
 - README Node requirement now matches the `engines` field.
-- Project compaction and verification models use
-  `commandcode/deepseek/deepseek-v4.1-flash`.
+- Project compaction and verification models use `commandcode/deepseek/deepseek-v4.1-flash`.
 
 ## [0.2.1] - 2026-10-21
 
@@ -93,7 +109,8 @@ All notable changes to this project are documented here. Format follows
 
 - Bound private reads and transcript growth.
 
-[Unreleased]: https://github.com/sij0sh/pi-shadow-compact/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/sij0sh/pi-shadow-compact/compare/v0.2.8...HEAD
+[0.2.8]: https://github.com/sij0sh/pi-shadow-compact/compare/v0.2.2...v0.2.8
 [0.2.2]: https://github.com/sij0sh/pi-shadow-compact/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/sij0sh/pi-shadow-compact/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/sij0sh/pi-shadow-compact/releases/tag/v0.2.0
