@@ -52,11 +52,7 @@ export interface WorkingContextResult {
 }
 
 export type WorkingContextSkipReason =
-  | "stale-coverage"
-  | "no-drop"
-  | "empty-tail"
-  | "orphan"
-  | "projection";
+  "stale-coverage" | "no-drop" | "empty-tail" | "orphan" | "projection";
 
 export interface WorkingContextSkipped {
   skipped: WorkingContextSkipReason;
@@ -87,21 +83,21 @@ export function planSwap(
 
   // Empty coverageEnd means "covers nothing yet": the tail starts at the
   // first turn. Any other unknown anchor is a stale checkpoint.
-  const coverageIdx = coverageEndEntryId === ""
-    ? -1
-    : branch.findIndex((entry) => entry.id === coverageEndEntryId);
+  const coverageIdx =
+    coverageEndEntryId === "" ? -1 : branch.findIndex((entry) => entry.id === coverageEndEntryId);
   if (coverageIdx < -1 || (coverageEndEntryId !== "" && coverageIdx < 0)) return undefined;
 
   const entryIndex = new Map(branch.map((entry, index) => [entry.id, index]));
   const coverageTailStart = (
-    turns.find((turn) => (entryIndex.get(turn.endEntryId) ?? -1) > coverageIdx)
-    ?? turns[turns.length - 1]!
+    turns.find((turn) => (entryIndex.get(turn.endEntryId) ?? -1) > coverageIdx) ??
+    turns[turns.length - 1]!
   ).startEntryId;
   const recentCount = Math.max(1, Math.floor(minimumRecentTurns));
   const recentTailStart = turns[Math.max(0, turns.length - recentCount)]!.startEntryId;
-  let swapStartEntryId = (entryIndex.get(coverageTailStart) ?? 0) <= (entryIndex.get(recentTailStart) ?? 0)
-    ? coverageTailStart
-    : recentTailStart;
+  let swapStartEntryId =
+    (entryIndex.get(coverageTailStart) ?? 0) <= (entryIndex.get(recentTailStart) ?? 0)
+      ? coverageTailStart
+      : recentTailStart;
 
   if (retainedAnchor !== undefined) {
     const anchorIndex = entryIndex.get(retainedAnchor);
@@ -137,9 +133,10 @@ export function buildWorkingContext(
 
   // A swap at the branch head drops nothing: skip the projection lookup,
   // which cannot resolve a cut on a state-only leading entry.
-  const drop = plan.swapStartEntryId === branch[0]!.id
-    ? 0
-    : contextSwapDropCount(branch, plan.swapStartEntryId);
+  const drop =
+    plan.swapStartEntryId === branch[0]!.id
+      ? 0
+      : contextSwapDropCount(branch, plan.swapStartEntryId);
   if (drop === undefined || drop > messages.length) return { skipped: "projection" };
   // A swap that drops nothing is pure overhead: the summary would ride along
   // with the full context it duplicates. Skip and let the next turns grow a
@@ -174,17 +171,27 @@ export function buildWorkingContext(
  * New input joins its following assistant response; parallel results stay
  * with their call. Omitted attempts and prompt/state entries do not count.
  */
-function contextRounds(branch: SessionEntry[]): Array<{ startEntryId: string; endEntryId: string; completed: boolean }> {
+function contextRounds(
+  branch: SessionEntry[],
+): Array<{ startEntryId: string; endEntryId: string; completed: boolean }> {
   const turns: Array<{ startEntryId: string; endEntryId: string; completed: boolean }> = [];
   let hasAssistant = false;
   let pendingCalls = new Set<string>();
   for (const entry of buildSessionProjection(branch).entries) {
-    const messages = entry.messages.filter((message) => message.role !== "system" && message.role !== "compactionSummary");
+    const messages = entry.messages.filter(
+      (message) => message.role !== "system" && message.role !== "compactionSummary",
+    );
     if (messages.length === 0) continue;
     const assistant = messages.some((message) => message.role === "assistant");
-    const input = messages.some((message) => message.role !== "assistant" && message.role !== "toolResult");
+    const input = messages.some(
+      (message) => message.role !== "assistant" && message.role !== "toolResult",
+    );
     if (turns.length === 0 || input || (assistant && hasAssistant)) {
-      turns.push({ startEntryId: entry.sourceEntry.id, endEntryId: entry.sourceEntry.id, completed: false });
+      turns.push({
+        startEntryId: entry.sourceEntry.id,
+        endEntryId: entry.sourceEntry.id,
+        completed: false,
+      });
       hasAssistant = false;
       pendingCalls = new Set();
     } else {
@@ -193,7 +200,8 @@ function contextRounds(branch: SessionEntry[]): Array<{ startEntryId: string; en
     for (const message of messages) {
       if (message.role === "assistant") {
         hasAssistant = true;
-        for (const block of message.content) if (block.type === "toolCall") pendingCalls.add(block.id);
+        for (const block of message.content)
+          if (block.type === "toolCall") pendingCalls.add(block.id);
       } else if (message.role === "toolResult") {
         pendingCalls.delete(message.toolCallId);
       }
@@ -222,7 +230,9 @@ export function coverageIsUnchanged(branch: SessionEntry[], coverage: Checkpoint
   const coverageIndex = branch.findIndex((entry) => entry.id === coverage.coverageEndEntryId);
   if (preparedIndex < 0 || coverageIndex < 0) return false;
   const coveredIds = new Set(branch.slice(0, coverageIndex + 1).map((entry) => entry.id));
-  return !branch.slice(preparedIndex + 1).some((entry) => entry.type === "context_edit" && coveredIds.has(entry.targetId));
+  return !branch
+    .slice(preparedIndex + 1)
+    .some((entry) => entry.type === "context_edit" && coveredIds.has(entry.targetId));
 }
 
 /** Shared no-gap proof for request-local swaps and Pi compaction cuts. */
@@ -240,8 +250,12 @@ export function isCoveredPrefix(
   // uncovered tool outputs even when its assistant call is already covered.
   return buildSessionProjection(branch).entries.every((entry) => {
     const index = entryIndex.get(entry.sourceEntry.id) ?? -1;
-    return index <= coverageIdx || index >= swapIdx || entry.messages.every(
-      (message) => message.role === "system" || message.role === "compactionSummary",
+    return (
+      index <= coverageIdx ||
+      index >= swapIdx ||
+      entry.messages.every(
+        (message) => message.role === "system" || message.role === "compactionSummary",
+      )
     );
   });
 }
@@ -255,11 +269,18 @@ export function isCoveredPrefix(
 export function hasCompactableHistory(branch: SessionEntry[], keepRecentTokens: number): boolean {
   if (branch.at(-1)?.type === "compaction") return false;
   const projected = buildSessionProjection(branch).entries;
-  const boundary = projected.findIndex((entry) => entry.sourceEntry.type === "compaction" && entry.messages.length > 0);
-  const conversation: SessionEntry[] = projected.slice(boundary + 1).flatMap(({ sourceEntry, messages }) =>
-    sourceEntry.type === "compaction" ? [] : messages.filter((message) => message.role !== "system")
-      .map((message) => ({ ...sourceEntry, type: "message" as const, message })),
+  const boundary = projected.findIndex(
+    (entry) => entry.sourceEntry.type === "compaction" && entry.messages.length > 0,
   );
+  const conversation: SessionEntry[] = projected
+    .slice(boundary + 1)
+    .flatMap(({ sourceEntry, messages }) =>
+      sourceEntry.type === "compaction"
+        ? []
+        : messages
+            .filter((message) => message.role !== "system")
+            .map((message) => ({ ...sourceEntry, type: "message" as const, message })),
+    );
   const cut = findCutPoint(conversation, 0, conversation.length, keepRecentTokens);
   return cut.firstKeptEntryIndex > 0;
 }

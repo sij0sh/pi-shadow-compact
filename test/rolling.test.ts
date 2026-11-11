@@ -3,13 +3,8 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { isRollingEnabled } from "../src/config.js";
 import { TRACE_FILE_ENV_VAR } from "../src/trace.js";
-import {
-  fixtureWithHistory as fixture,
-  waitFor,
-  tick,
-} from "./helpers/index-fixture.js";
+import { fixtureWithHistory as fixture, waitFor, tick } from "./helpers/index-fixture.js";
 
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 
@@ -26,7 +21,9 @@ const CALLS_PER_PREPARE = 4;
 
 type TraceRecord = Record<string, unknown> & { event: string };
 
-async function withTraceFile<T>(run: (path: string) => Promise<T>): Promise<{ result: T; events: TraceRecord[] }> {
+async function withTraceFile<T>(
+  run: (path: string) => Promise<T>,
+): Promise<{ result: T; events: TraceRecord[] }> {
   const dir = await mkdtemp(join(tmpdir(), "shadow-trace-"));
   const path = join(dir, "trace.jsonl");
   const previous = process.env[TRACE_FILE_ENV_VAR];
@@ -61,29 +58,6 @@ async function turn(f: Fixture, percent: number): Promise<void> {
   f.setPercent(percent);
   await f.emit("turn_end");
 }
-
-describe("isRollingEnabled", () => {
-  it("defaults on and honors opt-outs", async () => {
-    const previous = process.env.SHADOW_COMPACT_ROLLING;
-    try {
-      delete process.env.SHADOW_COMPACT_ROLLING;
-      assert.equal(isRollingEnabled(), true);
-      process.env.SHADOW_COMPACT_ROLLING = "";
-      assert.equal(isRollingEnabled(), true);
-      for (const off of ["0", "false", "FALSE", "no", "off", " 0 "]) {
-        process.env.SHADOW_COMPACT_ROLLING = off;
-        assert.equal(isRollingEnabled(), false, off);
-      }
-      for (const on of ["1", "true", "yes"]) {
-        process.env.SHADOW_COMPACT_ROLLING = on;
-        assert.equal(isRollingEnabled(), true, on);
-      }
-    } finally {
-      if (previous === undefined) delete process.env.SHADOW_COMPACT_ROLLING;
-      else process.env.SHADOW_COMPACT_ROLLING = previous;
-    }
-  });
-});
 
 describe("rolling two-refresh smoke (fix §9)", () => {
   it("publishes A, serves it while B prepares, replaces it, and persists B once", async () => {
@@ -173,8 +147,12 @@ describe("rolling two-refresh smoke (fix §9)", () => {
     assert.equal(fallbacks.length, 0, "0 native fallback");
 
     // Ordering: A published, rearmed, B started while A served, B published, then persisted.
-    const order = (type: string, index = 0) => events.findIndex((e, i) => e.event === type &&
-      events.slice(0, i + 1).filter((x) => x.event === type).length === index + 1);
+    const order = (type: string, index = 0) =>
+      events.findIndex(
+        (e, i) =>
+          e.event === type &&
+          events.slice(0, i + 1).filter((x) => x.event === type).length === index + 1,
+      );
     assert.ok(order("checkpoint_published", 0) < order("checkpoint_rearmed", 0));
     assert.ok(order("checkpoint_rearmed", 0) < order("prepare_started", 1));
     assert.ok(order("prepare_started", 1) < order("checkpoint_published", 1));
@@ -237,7 +215,11 @@ describe("rolling two-refresh smoke (fix §9)", () => {
       // is suppressed.
       await turn(f, 5.3);
       await tick();
-      assert.equal(f.registry.calls, CALLS_PER_PREPARE + 1, "no immediate retry after a failed replacement");
+      assert.equal(
+        f.registry.calls,
+        CALLS_PER_PREPARE + 1,
+        "no immediate retry after a failed replacement",
+      );
 
       // Only an observed swap + shrink re-arms: below the threshold, then C prepares.
       await turn(f, 2.8);
@@ -288,43 +270,5 @@ describe("rolling two-refresh smoke (fix §9)", () => {
     );
     assert.ok(crossings.some((event) => event.action === "started"));
     assert.equal(ofType(events, "checkpoint_rearmed").length, 1);
-  });
-
-  it("single-shot mode never refreshes while a checkpoint is published", async () => {
-    const previous = process.env.SHADOW_COMPACT_ROLLING;
-    process.env.SHADOW_COMPACT_ROLLING = "0";
-    try {
-      const f = await fixture({ ...THRESHOLD_FIVE });
-      try {
-        await turn(f, 5.2);
-        await waitFor(() => f.registry.settled === CALLS_PER_PREPARE);
-        await tick();
-        assert.ok(await f.emit("context", { messages: f.contextMessages() }));
-
-        // Below the threshold and back above: no refresh while A is published.
-        await turn(f, 2.8);
-        await turn(f, 5.1);
-        await tick();
-        assert.equal(f.registry.calls, CALLS_PER_PREPARE);
-
-        // The idle persist keeps A serving (no stand-down): still exactly one
-        // checkpoint per run, and further crossings do not refresh.
-        await f.emit("agent_settled");
-        assert.equal(f.compactCalls.length, 0);
-        assert.equal(f.appendedEntries.length, 1);
-        assert.ok(await f.emit("context", { messages: f.contextMessages() }));
-        await turn(f, 2.8);
-        await turn(f, 5.4);
-        await tick();
-        assert.equal(f.registry.calls, CALLS_PER_PREPARE);
-        await f.emit("agent_settled");
-        assert.equal(f.appendedEntries.length, 1);
-      } finally {
-        await f.cleanup();
-      }
-    } finally {
-      if (previous === undefined) delete process.env.SHADOW_COMPACT_ROLLING;
-      else process.env.SHADOW_COMPACT_ROLLING = previous;
-    }
   });
 });

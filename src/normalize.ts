@@ -13,7 +13,8 @@ export function tokensToChars(tokens: number): number {
   return Math.floor(tokens) * CHARS_PER_TOKEN;
 }
 
-const SECRET_KEY = /(?:api[_-]?key|access[_-]?token|auth(?:orization)?|client[_-]?secret|credential|password|passwd|secret|token)/i;
+const SECRET_KEY =
+  /(?:api[_-]?key|access[_-]?token|auth(?:orization)?|client[_-]?secret|credential|password|passwd|secret|token)/i;
 
 /** Redacts a structured value whose key names a secret (tool arguments, metadata). */
 export function redactSecretValue(value: unknown, key = ""): unknown {
@@ -37,10 +38,19 @@ export function redactSecretValue(value: unknown, key = ""): unknown {
  */
 export function sanitizeForContext(value: string, cwd: string): string {
   let result = value.replace(/\r\n?/g, "\n");
-  result = result.replace(/-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----/g, "[REDACTED PRIVATE KEY]");
+  result = result.replace(
+    /-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----/g,
+    "[REDACTED PRIVATE KEY]",
+  );
   result = result.replace(/\b((?:Bearer|Basic)\s+)[A-Za-z0-9._~+/=-]+/gi, "$1[REDACTED]");
-  result = result.replace(/\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|AKIA[A-Z0-9]{16})\b/g, "[REDACTED]");
-  result = result.replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[REDACTED JWT]");
+  result = result.replace(
+    /\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|AKIA[A-Z0-9]{16})\b/g,
+    "[REDACTED]",
+  );
+  result = result.replace(
+    /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g,
+    "[REDACTED JWT]",
+  );
   result = result.replace(/(https?:\/\/)[^\s/@:]+:[^\s/@]+@/gi, "$1[REDACTED]@");
   // The secret keyword may sit anywhere in the variable name: SECRET_KEY,
   // AWS_SECRET_ACCESS_KEY, and SECRET_TOKEN are secrets even though they

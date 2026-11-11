@@ -80,7 +80,10 @@ describe("checkpoint schema additions", () => {
     assert.throws(
       () =>
         validateCheckpointObject(
-          { ...base, continuationState: { currentGoal: "", currentApproach: "a", immediateNextStep: "b" } },
+          {
+            ...base,
+            continuationState: { currentGoal: "", currentApproach: "a", immediateNextStep: "b" },
+          },
           REFS,
         ),
       /must be a non-empty string/,
@@ -111,19 +114,11 @@ describe("checkpoint schema additions", () => {
   it("rejects bare-string items with an actionable object shape", () => {
     const base = JSON.parse(legacyJson());
     assert.throws(
-      () =>
-        validateCheckpointObject(
-          { ...base, completedWork: ["Did the thing"] },
-          REFS,
-        ),
+      () => validateCheckpointObject({ ...base, completedWork: ["Did the thing"] }, REFS),
       /Item 0 in completedWork must be an object like.*got string/,
     );
     assert.throws(
-      () =>
-        validateCheckpointObject(
-          { ...base, completedWork: [["Did the thing"]] },
-          REFS,
-        ),
+      () => validateCheckpointObject({ ...base, completedWork: [["Did the thing"]] }, REFS),
       /Item 0 in completedWork must be an object like.*got array/,
     );
   });

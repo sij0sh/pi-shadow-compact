@@ -15,8 +15,18 @@ function toolRounds(count: number): SessionEntry[] {
       timestamp: "2026-01-01T00:00:00.000Z",
       message: {
         role: "assistant",
-        content: ["x", "y"].map((tool) => ({ type: "toolCall", id: `${tool}${round}`, name: "read", arguments: { path: tool } })),
-        api: "test", provider: "test", model: "test", usage: USAGE, stopReason: "toolUse", timestamp: 0,
+        content: ["x", "y"].map((tool) => ({
+          type: "toolCall",
+          id: `${tool}${round}`,
+          name: "read",
+          arguments: { path: tool },
+        })),
+        api: "test",
+        provider: "test",
+        model: "test",
+        usage: USAGE,
+        stopReason: "toolUse",
+        timestamp: 0,
       },
     });
     for (const tool of ["x", "y"]) {
@@ -26,8 +36,12 @@ function toolRounds(count: number): SessionEntry[] {
         parentId: branch.at(-1)!.id,
         timestamp: "2026-01-01T00:00:00.000Z",
         message: {
-          role: "toolResult", toolCallId: `${tool}${round}`, toolName: "read",
-          content: [{ type: "text", text: "large tool output ".repeat(100) }], isError: false, timestamp: 0,
+          role: "toolResult",
+          toolCallId: `${tool}${round}`,
+          toolName: "read",
+          content: [{ type: "text", text: "large tool output ".repeat(100) }],
+          isError: false,
+          timestamp: 0,
         },
       });
     }
@@ -39,10 +53,16 @@ function context(branch: SessionEntry[], coverageEndEntryId: string, minimumRece
   return buildWorkingContext({
     checkpoint: {
       summary: "verified checkpoint",
-      coverage: { sourceStartEntryId: null, coverageEndEntryId, preparedAtLeafId: coverageEndEntryId, publishedAtLeafId: coverageEndEntryId },
+      coverage: {
+        coverageEndEntryId,
+        preparedAtLeafId: coverageEndEntryId,
+        publishedAtLeafId: coverageEndEntryId,
+      },
     },
     branch,
-    messages: buildSessionProjection(branch).messages.filter((message) => message.role !== "system"),
+    messages: buildSessionProjection(branch).messages.filter(
+      (message) => message.role !== "system",
+    ),
     minimumRecentTurns,
   });
 }
@@ -51,7 +71,10 @@ describe("Pi turn continuity", () => {
   it("retains ten assistant/tool rounds, not an entire long user-message span", () => {
     const branch = toolRounds(15);
     const result = context(branch, "y15");
-    assert.ok(!isWorkingContextSkipped(result), "a single user prompt must not pin every model round in context");
+    assert.ok(
+      !isWorkingContextSkipped(result),
+      "a single user prompt must not pin every model round in context",
+    );
     assert.equal(result.plan.swapStartEntryId, "a6");
     assert.equal(result.messages.length, 31, "checkpoint plus ten complete parallel-tool rounds");
     assert.equal(result.droppedMessages, 16);
@@ -62,7 +85,11 @@ describe("Pi turn continuity", () => {
     const branch = toolRounds(5);
     const result = context(branch, "a2", 1);
     assert.ok(!isWorkingContextSkipped(result));
-    assert.equal(result.plan.swapStartEntryId, "a2", "coverage of the call does not cover its subsequent tool outputs");
+    assert.equal(
+      result.plan.swapStartEntryId,
+      "a2",
+      "coverage of the call does not cover its subsequent tool outputs",
+    );
     assert.equal(result.messages.length, 13);
     assert.equal(hasOrphanedToolResult(result.messages), false);
   });
@@ -76,15 +103,23 @@ describe("Pi turn continuity", () => {
       { ...toolRounds(1)[3]!, id: "y2", parentId: "x2" },
       userEntry("u3", "y2", "third task"),
     ];
-    assert.equal(planSwap(branch, "u2", 1)?.swapStartEntryId, "u2", "the uncovered reply must remain verbatim");
+    assert.equal(
+      planSwap(branch, "u2", 1)?.swapStartEntryId,
+      "u2",
+      "the uncovered reply must remain verbatim",
+    );
   });
 
   it("does not count recovery-omitted rounds toward the recent-turn minimum", () => {
     const branch = toolRounds(15);
     for (const targetId of ["a14", "x14", "y14"]) {
       branch.push({
-        type: "context_edit", id: `omit-${targetId}`, parentId: branch.at(-1)!.id,
-        timestamp: "2026-01-01T00:00:00.000Z", targetId, replacement: null,
+        type: "context_edit",
+        id: `omit-${targetId}`,
+        parentId: branch.at(-1)!.id,
+        timestamp: "2026-01-01T00:00:00.000Z",
+        targetId,
+        replacement: null,
       });
     }
     const result = context(branch, branch.at(-1)!.id);

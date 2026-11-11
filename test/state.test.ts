@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import type { Usage } from "@earendil-works/pi-ai";
 import type { PreparedResult } from "../src/persist.js";
 import { ShadowCompactStateController, type PreparingInfo } from "../src/state.js";
+import { CHECKPOINT_SCHEMA_VERSION } from "../src/summary.js";
 
 const usage: Usage = {
   input: 1,
@@ -18,7 +19,7 @@ let resultSeq = 0;
 function prepared(): PreparedResult {
   resultSeq++;
   return {
-    version: 3,
+    version: CHECKPOINT_SCHEMA_VERSION,
     checkpointId: `checkpoint-${resultSeq}`,
     sessionId: `session-${resultSeq}`,
     leafId: `leaf-${resultSeq}`,
@@ -44,13 +45,11 @@ function prepared(): PreparedResult {
       continuationState: { currentGoal: "g", currentApproach: "a", immediateNextStep: "n" },
     },
     coverage: {
-      sourceStartEntryId: null,
       coverageEndEntryId: `kept-${resultSeq}`,
       preparedAtLeafId: `leaf-${resultSeq}`,
       publishedAtLeafId: `leaf-${resultSeq}`,
     },
     prompts: { summaryPromptVersion: 3, verifierPromptVersion: 3 },
-    generatedAt: 0,
   };
 }
 

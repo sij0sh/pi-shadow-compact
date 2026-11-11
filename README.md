@@ -1,24 +1,21 @@
 # Pi Shadow Compact
 
-A Pi extension that keeps long coding sessions working without making
-the coding agent manage its own memory. It is a real compactor, not a
-tools-plus-memory shim: when compaction fires, Shadow answers with a
-**verified structured checkpoint plus the exact recent tail**
-(original messages kept verbatim, no gaps), instead of Pi's native
-summary.
+A Pi extension that keeps long coding sessions working without making the coding agent manage its
+own memory. It is a real compactor, not a tools-plus-memory shim: when compaction fires, Shadow
+answers with a **verified structured checkpoint plus the exact recent tail** (original messages kept
+verbatim, no gaps), instead of Pi's native summary.
 
 The acting model gets no context-management tools.
 
 ## Native vs Shadow
 
-Native compaction writes a prose summary of what it saw. Shadow writes a
-checked checkpoint: every claim points at saved session entries, tested work
-is marked verified, untested work stays unverified, and the checkpoint names
-exactly how far it covers. A second agent checks the first. If the check
-fails, the session falls back to native compaction.
+Native compaction writes a prose summary of what it saw. Shadow writes a checked checkpoint: every
+claim points at saved session entries, tested work is marked verified, untested work stays
+unverified, and the checkpoint names exactly how far it covers. A second agent checks the first. If
+the check fails, the session falls back to native compaction.
 
-The example is synthetic and shows the same session on each side, so
-compare shape, not size. Task and paths are generic on purpose.
+The example is synthetic and shows the same session on each side, so compare shape, not size. Task
+and paths are generic on purpose.
 
 <div align="center">
 
@@ -26,19 +23,19 @@ compare shape, not size. Task and paths are generic on purpose.
 
 </div>
 
-| Area | Native | Shadow |
-|---|---|---|
-| Grounding | Prose, no links | Each claim cites entries (`E0004` ...) |
-| Tested vs untested | Same voice | `[verified]` vs `[unverified]` ledger |
-| Resume pointer | Buried in prose | Goal, approach, next step |
-| Coverage proof | None | `coverageEndEntryId` in live transcript |
-| Failure mode | Always installs prose | Falls back to native when unsafe |
+| Area               | Native                | Shadow                                  |
+| ------------------ | --------------------- | --------------------------------------- |
+| Grounding          | Prose, no links       | Each claim cites entries (`E0004` ...)  |
+| Tested vs untested | Same voice            | `[verified]` vs `[unverified]` ledger   |
+| Resume pointer     | Buried in prose       | Goal, approach, next step               |
+| Coverage proof     | None                  | `coverageEndEntryId` in live transcript |
+| Failure mode       | Always installs prose | Falls back to native when unsafe        |
 
 <details>
 <summary>Text version of the example</summary>
 
-Synthetic session — add CSV export (`src/notes/export.ts`). Left column:
-what native prose provides per area. Right column: the Shadow checkpoint.
+Synthetic session — add CSV export (`src/notes/export.ts`). Left column: what native prose provides
+per area. Right column: the Shadow checkpoint.
 
 ```text
 Native: "Add CSV export to notes app. Updated export logic and wired
@@ -75,6 +72,7 @@ Shadow:
 - Next: open notes.csv in Excel
 Coverage through E0031. Builder + verifier; fails closed to native.
 ```
+
 </details>
 
 ## How it works
@@ -89,38 +87,29 @@ next safe request ──► request-local swap: [checkpoint] + [exact tail, no g
 no/invalid checkpoint ──► Pi native compaction (fail closed)
 ```
 
-- **Whole-session reads.** The builder starts from a compact manifest
-  (turn list with correction/error flags, coverage anchors, required
-  turns), then pages through turn ranges and searches history through
-  read-only tools. Stable evidence IDs are assigned per session position.
-  Later checkpoints re-ground on original evidence, never recursively on
-  the last summary.
-- **Builder → verifier.** Two private passes run outside the coding loop
-  with no memory tools visible to the acting model. Both must inspect the
-  first turn, every correction and error turn, and everything since the
-  previous coverage boundary. Unknown evidence references, uninspected
-  ranges, and unsupported success claims are rejected; an `unusable`
-  verifier verdict fails closed.
-- **Swap + compaction.** A ready checkpoint serves the next safe request
-  as a request-local swap: checkpoint plus every message after the
-  coverage boundary, at least `recentTurns` response/tool rounds, and the
-  frozen trigger-time overlap. A partly covered round stays verbatim so
-  no reply or tool output disappears. Real `/compact` and automatic
-  compactions use Pi's prepared cut and `compaction.keepRecentTokens`;
-  Shadow supplies the summary only when its coverage includes everything
-  Pi will discard and the result shrinks the working context.
-- **Thresholds.** Preparation starts at 60% context usage, with rolling
-  refresh re-arming after a Shadow install followed by below-checkpoint
-  context, or after native compaction. A ready checkpoint serves on the
-  next safe request at any percent; only native fallback is gated (92%,
-  one compaction queued at the next safe idle point). Idle settle with at least
-  `idleCompact.minimumTokens` (default 20,000) past the checkpoint's
-  coverage prepares a fresh checkpoint so `/compact` and reloads start
-  current.
-- **Persistence.** Verified checkpoints persist as Pi extension state; the
-  raw append-only session history remains the durable evidence source. On
-  reload Shadow restores the newest checkpoint still valid for the
-  current branch. Stale checkpoints on incompatible branches are skipped.
+- **Whole-session reads.** The builder starts from a compact manifest (turn list with
+  correction/error flags, coverage anchors, required turns), then pages through turn ranges and
+  searches history through read-only tools. Stable evidence IDs are assigned per session position.
+  Later checkpoints re-ground on original evidence, never recursively on the last summary.
+- **Builder → verifier.** Two private passes run outside the coding loop with no memory tools
+  visible to the acting model. Both must inspect the first turn, every correction and error turn,
+  and everything since the previous coverage boundary. Unknown evidence references, uninspected
+  ranges, and unsupported success claims are rejected; an `unusable` verifier verdict fails closed.
+- **Swap + compaction.** A ready checkpoint serves the next safe request as a request-local swap:
+  checkpoint plus every message after the coverage boundary, at least `recentTurns` response/tool
+  rounds, and the frozen trigger-time overlap. A partly covered round stays verbatim so no reply or
+  tool output disappears. Real `/compact` and automatic compactions use Pi's prepared cut and
+  `compaction.keepRecentTokens`; Shadow supplies the summary only when its coverage includes
+  everything Pi will discard and the result shrinks the working context.
+- **Thresholds.** Preparation starts at 60% context usage, with rolling refresh re-arming after a
+  Shadow install followed by below-checkpoint context, or after native compaction. A ready
+  checkpoint serves on the next safe request at any percent; only native fallback is gated (92%, one
+  compaction queued at the next safe idle point). Idle settle with at least
+  `idleCompact.minimumTokens` (default 20,000) past the checkpoint's coverage prepares a fresh
+  checkpoint so `/compact` and reloads start current.
+- **Persistence.** Verified checkpoints persist as Pi extension state; the raw append-only session
+  history remains the durable evidence source. On reload Shadow restores the newest checkpoint still
+  valid for the current branch. Stale checkpoints on incompatible branches are skipped.
 
 ## Install
 
@@ -135,15 +124,14 @@ pi update git:github.com/sij0sh/pi-shadow-compact
 pi remove git:github.com/sij0sh/pi-shadow-compact
 ```
 
-Requires Node 22.23.4+ (pinned in `.nvmrc`). Development and integration tests
-target Pi 1.0.4.
+Requires Node 22.23.4+ (pinned in `.nvmrc`). Development and integration tests target Pi 1.0.4.
 
 ## Commands
 
-| Command | Behavior |
-|---|---|
+| Command                          | Behavior                                                                                                            |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
 | `/shadow-compact [instructions]` | Start background preparation without aborting acting work; instructions guide only the private builder and verifier |
-| `/compact-native` | Bypass Shadow for the next compaction (pure Pi, token-cap recovery disabled) |
+| `/compact-native`                | Bypass Shadow for the next compaction (pure Pi, token-cap recovery disabled)                                        |
 
 ## Configuration
 
@@ -159,44 +147,43 @@ Optional project configuration (takes precedence):
 <project>/.pi/shadow-compact.json
 ```
 
-See `.pi/shadow-compact.example.json` for the full schema. Checkpoint models
-resolve in strict order: the configured `summarizerModel` / `verificationModel`
-pair, then Pi's configured default model (`defaultProvider` / `defaultModel`),
-then the model already running the session. A configured model that is missing
-from the registry falls through instead of aborting compaction.
+See `.pi/shadow-compact.example.json` for the full schema. Checkpoint models resolve in strict
+order: the configured `summarizerModel` / `verificationModel` pair, then Pi's configured default
+model (`defaultProvider` / `defaultModel`), then the model already running the session. A configured
+model that is missing from the registry falls through instead of aborting compaction.
 
-| Setting | Default | Behavior |
-|---|---|---|
-| `prepareThresholdPercent` | `60` | Start background checkpoint preparation |
-| `nativeFallbackThresholdPercent` | `92` | Queue one native compaction at the next safe idle point |
-| `recentTurns` | `10` | Minimum recent response/tool rounds kept verbatim |
-| `summarizerModel` / `verificationModel` | blank | Checkpoint builder/verifier models; blank uses Pi's default model, then the session model; blank verifier reuses the summarizer |
-| `thinkingLevel` / `verificationThinkingLevel` | `medium` / unset | Drafting and verification reasoning; verifier falls back to drafting level |
-| `summaryMaxTokens` | unset | Per-response generation cap; unset uses the model/provider limit |
-| `idleCompact` | enabled, `20000` | Prepare a fresh checkpoint on idle settle past coverage |
-| `manualCompactMode` | `shadow` | `shadow` or `native` for manual `/compact` |
+| Setting                                       | Default          | Behavior                                                                                                                        |
+| --------------------------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `prepareThresholdPercent`                     | `60`             | Start background checkpoint preparation                                                                                         |
+| `nativeFallbackThresholdPercent`              | `92`             | Queue one native compaction at the next safe idle point                                                                         |
+| `recentTurns`                                 | `10`             | Minimum recent response/tool rounds kept verbatim                                                                               |
+| `summarizerModel` / `verificationModel`       | blank            | Checkpoint builder/verifier models; blank uses Pi's default model, then the session model; blank verifier reuses the summarizer |
+| `thinkingLevel` / `verificationThinkingLevel` | `medium` / unset | Drafting and verification reasoning; verifier falls back to drafting level                                                      |
+| `summaryMaxTokens`                            | unset            | Per-response generation cap; unset uses the model/provider limit                                                                |
+| `idleCompact`                                 | enabled, `20000` | Prepare a fresh checkpoint on idle settle past coverage                                                                         |
+| `manualCompactMode`                           | `shadow`         | `shadow` or `native` for manual `/compact`                                                                                      |
 
-Legacy `softCompactThresholdPercent` still loads as an alias for
-`prepareThresholdPercent`.
+Legacy `softCompactThresholdPercent` still loads as an alias for `prepareThresholdPercent`.
 
-`manualCompactMode: "native"` uses Pi's original summarizer first, with one
-evidence-backed token-cap recovery. Either way, `/compact-native` runs one
-purely native compaction.
+Two environment variables override the thresholds for one session:
+`SHADOW_COMPACT_SOFT_THRESHOLD_PERCENT` and `SHADOW_COMPACT_NATIVE_THRESHOLD_PERCENT`. Every other
+setting comes from file config or defaults.
+
+`manualCompactMode: "native"` uses Pi's original summarizer first, with one evidence-backed
+token-cap recovery. Either way, `/compact-native` runs one purely native compaction.
 
 ## Beyond native
 
-- **Request-local mid-turn swaps.** Pi can rewrite an individual model
-  request without touching canonical history, so a ready checkpoint serves
-  the next safe request immediately — no extra assistant response, no
-  manual compaction call to force installation. A request already sent to
-  a provider cannot change retroactively.
-- **Native-summarizer token-cap recovery.** When a wrapped native fallback
-  hits its output cap, one "compress and complete" recovery runs instead
-  of installing partial prose. The recovery builder gets only the sanitized
-  visible draft as an explicitly incomplete aid, re-reads the frozen
-  session history, and an independent verifier checks the replacement
-  before installation. A second cap, provider failure, or failed
-  verification cancels the compaction and keeps the prior context intact.
+- **Request-local mid-turn swaps.** Pi can rewrite an individual model request without touching
+  canonical history, so a ready checkpoint serves the next safe request immediately — no extra
+  assistant response, no manual compaction call to force installation. A request already sent to a
+  provider cannot change retroactively.
+- **Native-summarizer token-cap recovery.** When a wrapped native fallback hits its output cap, one
+  "compress and complete" recovery runs instead of installing partial prose. The recovery builder
+  gets only the sanitized visible draft as an explicitly incomplete aid, re-reads the frozen session
+  history, and an independent verifier checks the replacement before installation. A second cap,
+  provider failure, or failed verification cancels the compaction and keeps the prior context
+  intact.
 
 ## Develop
 
@@ -205,10 +192,9 @@ npm ci
 ./scripts/verify
 ```
 
-`./scripts/verify` runs the TypeScript typecheck, test suite, and bundle
-build. `npm run check` runs only the typecheck and test suite. `npm run
-format:check` verifies formatting of repository files; `src/` and `test/` are
-excluded until a bulk reformat is approved.
+`./scripts/verify` runs the TypeScript typecheck, test suite, and bundle build. `npm run check` runs
+only the typecheck and test suite. `npm run format:check` checks the whole repository (Prettier);
+`npm run format` rewrites it.
 
 ## License
 

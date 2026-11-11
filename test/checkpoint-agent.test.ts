@@ -42,7 +42,10 @@ function branchFixture(): SessionEntry[] {
   ];
 }
 
-function checkpointPayload(objective = "Set up scaffolding", ref = "E0001"): Record<string, unknown> {
+function checkpointPayload(
+  objective = "Set up scaffolding",
+  ref = "E0001",
+): Record<string, unknown> {
   return {
     objective: [{ text: objective, evidenceRefs: [ref] }],
     constraints: [],
@@ -63,7 +66,9 @@ function checkpointPayload(objective = "Set up scaffolding", ref = "E0001"): Rec
   };
 }
 
-function toolResponse(calls: Array<{ id: string; name: string; args: Record<string, unknown> }>): AssistantMessage {
+function toolResponse(
+  calls: Array<{ id: string; name: string; args: Record<string, unknown> }>,
+): AssistantMessage {
   return {
     role: "assistant",
     content: calls.map((call) => ({
@@ -118,10 +123,20 @@ function toolNames(context: Context): string[] {
 describe("runCheckpointBuilderAgent", () => {
   it("reports bounded sanitized provider failures with the model and builder stage", async () => {
     const secret = "unrecognized-" + "q".repeat(40);
-    const failure = JSON.stringify({ api_key: secret, error: "gateway quota exceeded" }) + "x".repeat(2000);
-    const fake = scripted(() => ({ ...textResponse(""), stopReason: "error", errorMessage: failure }));
+    const failure =
+      JSON.stringify({ api_key: secret, error: "gateway quota exceeded" }) + "x".repeat(2000);
+    const fake = scripted(() => ({
+      ...textResponse(""),
+      stopReason: "error",
+      errorMessage: failure,
+    }));
     await assert.rejects(
-      runCheckpointBuilderAgent(ctx, new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" }), config, { completion: fake.completion, model }),
+      runCheckpointBuilderAgent(
+        ctx,
+        new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" }),
+        config,
+        { completion: fake.completion, model },
+      ),
       (error: unknown) => {
         assert.ok(error instanceof Error);
         assert.match(error.message, /Summary model \(test\/agent\) stopped with error/);
@@ -135,14 +150,24 @@ describe("runCheckpointBuilderAgent", () => {
 
   it("uses provider-neutral streaming for nested model calls", async () => {
     const index = new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" });
-    const fake = scripted((context) => toolNames(context).includes("read_turn_range")
-      ? toolResponse([{ id: "c2", name: "submit_checkpoint", args: { checkpoint: checkpointPayload(), coverageEndEntryId: "e2" } }])
-      : toolResponse([{ id: "c1", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]));
+    const fake = scripted((context) =>
+      toolNames(context).includes("read_turn_range")
+        ? toolResponse([
+            {
+              id: "c2",
+              name: "submit_checkpoint",
+              args: { checkpoint: checkpointPayload(), coverageEndEntryId: "e2" },
+            },
+          ])
+        : toolResponse([{ id: "c1", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]),
+    );
     let simpleCalls = 0;
     const streamCtx = {
       model,
       modelRegistry: {
-        complete: () => { throw new Error("provider-neutral requests must use streamSimple"); },
+        complete: () => {
+          throw new Error("provider-neutral requests must use streamSimple");
+        },
         streamSimple: (requestModel: Model<Api>, context: Context, options: unknown) => {
           simpleCalls++;
           assert.equal((options as { toolChoice: string }).toolChoice, "auto");
@@ -160,13 +185,22 @@ describe("runCheckpointBuilderAgent", () => {
     const fake = scripted((context) => {
       const names = toolNames(context);
       if (!names.includes("read_turn_range")) {
-        return toolResponse([{ id: "c1", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]);
+        return toolResponse([
+          { id: "c1", name: "read_turn_range", args: { startTurn: 1, count: 10 } },
+        ]);
       }
       return toolResponse([
-        { id: "c2", name: "submit_checkpoint", args: { checkpoint: checkpointPayload(), coverageEndEntryId: "e2" } },
+        {
+          id: "c2",
+          name: "submit_checkpoint",
+          args: { checkpoint: checkpointPayload(), coverageEndEntryId: "e2" },
+        },
       ]);
     });
-    const outcome = await runCheckpointBuilderAgent(ctx, index, config, { completion: fake.completion, model });
+    const outcome = await runCheckpointBuilderAgent(ctx, index, config, {
+      completion: fake.completion,
+      model,
+    });
     assert.ok(outcome.summary.includes("Set up scaffolding"));
     assert.equal(outcome.coverageEndEntryId, "e2");
     assert.equal(outcome.inspectedEntries, 2);
@@ -180,17 +214,30 @@ describe("runCheckpointBuilderAgent", () => {
       const submits = names.filter((name) => name === "submit_checkpoint").length;
       if (submits === 0) {
         return toolResponse([
-          { id: "c1", name: "submit_checkpoint", args: { checkpoint: checkpointPayload(), coverageEndEntryId: "e2" } },
+          {
+            id: "c1",
+            name: "submit_checkpoint",
+            args: { checkpoint: checkpointPayload(), coverageEndEntryId: "e2" },
+          },
         ]);
       }
       if (!names.includes("read_turn_range")) {
-        return toolResponse([{ id: "c2", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]);
+        return toolResponse([
+          { id: "c2", name: "read_turn_range", args: { startTurn: 1, count: 10 } },
+        ]);
       }
       return toolResponse([
-        { id: "c3", name: "submit_checkpoint", args: { checkpoint: checkpointPayload(), coverageEndEntryId: "e2" } },
+        {
+          id: "c3",
+          name: "submit_checkpoint",
+          args: { checkpoint: checkpointPayload(), coverageEndEntryId: "e2" },
+        },
       ]);
     });
-    const outcome = await runCheckpointBuilderAgent(ctx, index, config, { completion: fake.completion, model });
+    const outcome = await runCheckpointBuilderAgent(ctx, index, config, {
+      completion: fake.completion,
+      model,
+    });
     assert.equal(outcome.coverageEndEntryId, "e2");
     // The rejection travels as a tool error, not a thrown exception.
     const results = fake.calls.at(-1)!.messages.filter((message) => message.role === "toolResult");
@@ -204,25 +251,42 @@ describe("runCheckpointBuilderAgent", () => {
     const fake = scripted((context) => {
       const names = toolNames(context);
       if (!names.includes("read_turn_range")) {
-        return toolResponse([{ id: "c1", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]);
+        return toolResponse([
+          { id: "c1", name: "read_turn_range", args: { startTurn: 1, count: 10 } },
+        ]);
       }
       const submits = names.filter((name) => name === "submit_checkpoint").length;
       if (submits === 0) {
         return toolResponse([
-          { id: "c2", name: "submit_checkpoint", args: { checkpoint: bad, coverageEndEntryId: "e2" } },
+          {
+            id: "c2",
+            name: "submit_checkpoint",
+            args: { checkpoint: bad, coverageEndEntryId: "e2" },
+          },
         ]);
       }
       return toolResponse([
-        { id: "c3", name: "submit_checkpoint", args: { checkpoint: checkpointPayload(), coverageEndEntryId: "e2" } },
+        {
+          id: "c3",
+          name: "submit_checkpoint",
+          args: { checkpoint: checkpointPayload(), coverageEndEntryId: "e2" },
+        },
       ]);
     });
-    const outcome = await runCheckpointBuilderAgent(ctx, index, config, { completion: fake.completion, model });
+    const outcome = await runCheckpointBuilderAgent(ctx, index, config, {
+      completion: fake.completion,
+      model,
+    });
     assert.equal(outcome.coverageEndEntryId, "e2");
-    const texts = fake.calls.flatMap((call) =>
-      call.messages
-        .filter((message) => message.role === "toolResult")
-        .map((message) => JSON.stringify((message as { content: Array<{ text: string }> }).content)),
-    ).join("\n");
+    const texts = fake.calls
+      .flatMap((call) =>
+        call.messages
+          .filter((message) => message.role === "toolResult")
+          .map((message) =>
+            JSON.stringify((message as { content: Array<{ text: string }> }).content),
+          ),
+      )
+      .join("\n");
     assert.match(texts, /must be an object like/);
   });
 
@@ -231,13 +295,26 @@ describe("runCheckpointBuilderAgent", () => {
     const payload = { ...checkpointPayload(), coverageEndEntryId: "e2" };
     const fake = scripted((context) =>
       toolNames(context).includes("read_turn_range")
-        ? toolResponse([{ id: "c2", name: "submit_checkpoint", args: { checkpoint: payload, coverageEndEntryId: "e2" } }])
-        : toolResponse([{ id: "c1", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]));
-    const outcome = await runCheckpointBuilderAgent(ctx, index, config, { completion: fake.completion, model });
+        ? toolResponse([
+            {
+              id: "c2",
+              name: "submit_checkpoint",
+              args: { checkpoint: payload, coverageEndEntryId: "e2" },
+            },
+          ])
+        : toolResponse([{ id: "c1", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]),
+    );
+    const outcome = await runCheckpointBuilderAgent(ctx, index, config, {
+      completion: fake.completion,
+      model,
+    });
     assert.equal(outcome.coverageEndEntryId, "e2");
     assert.equal(fake.calls.length, 2, "one read, then acceptance on the first submit");
     const prompt = JSON.stringify((fake.calls[0]!.messages[0] as { content: unknown }).content);
-    assert.match(prompt, /Submit arguments: coverageEndEntryId is passed beside checkpoint, not inside it\./);
+    assert.match(
+      prompt,
+      /Submit arguments: coverageEndEntryId is passed beside checkpoint, not inside it\./,
+    );
   });
 
   it("rejects a nested coverage value that disagrees with the argument", async () => {
@@ -246,20 +323,34 @@ describe("runCheckpointBuilderAgent", () => {
     const fake = scripted((context) => {
       const names = toolNames(context);
       if (!names.includes("read_turn_range")) {
-        return toolResponse([{ id: "c1", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]);
+        return toolResponse([
+          { id: "c1", name: "read_turn_range", args: { startTurn: 1, count: 10 } },
+        ]);
       }
-      return toolResponse([{ id: "c2", name: "submit_checkpoint", args: {
-        checkpoint: names.includes("submit_checkpoint") ? checkpointPayload() : conflict,
-        coverageEndEntryId: "e2",
-      } }]);
+      return toolResponse([
+        {
+          id: "c2",
+          name: "submit_checkpoint",
+          args: {
+            checkpoint: names.includes("submit_checkpoint") ? checkpointPayload() : conflict,
+            coverageEndEntryId: "e2",
+          },
+        },
+      ]);
     });
-    const outcome = await runCheckpointBuilderAgent(ctx, index, config, { completion: fake.completion, model });
+    const outcome = await runCheckpointBuilderAgent(ctx, index, config, {
+      completion: fake.completion,
+      model,
+    });
     assert.equal(outcome.coverageEndEntryId, "e2");
     const texts = fake.calls
       .flatMap((call) => call.messages.filter((message) => message.role === "toolResult"))
       .map((message) => JSON.stringify((message as { content: unknown }).content))
       .join("\n");
-    assert.match(texts, /coverageEndEntryId\. A checkpoint holds sections only; submit-tool arguments belong beside checkpoint, not inside it\./);
+    assert.match(
+      texts,
+      /coverageEndEntryId\. A checkpoint holds sections only; submit-tool arguments belong beside checkpoint, not inside it\./,
+    );
   });
 
   it("fails after repeated invalid submits", async () => {
@@ -267,10 +358,16 @@ describe("runCheckpointBuilderAgent", () => {
     const fake = scripted((context) => {
       const names = toolNames(context);
       if (!names.includes("read_turn_range")) {
-        return toolResponse([{ id: "c1", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]);
+        return toolResponse([
+          { id: "c1", name: "read_turn_range", args: { startTurn: 1, count: 10 } },
+        ]);
       }
       return toolResponse([
-        { id: "c2", name: "submit_checkpoint", args: { checkpoint: checkpointPayload(), coverageEndEntryId: "nope" } },
+        {
+          id: "c2",
+          name: "submit_checkpoint",
+          args: { checkpoint: checkpointPayload(), coverageEndEntryId: "nope" },
+        },
       ]);
     });
     await assert.rejects(
@@ -284,7 +381,9 @@ describe("runCheckpointBuilderAgent", () => {
     const badRef = scripted((context) => {
       const names = toolNames(context);
       if (!names.includes("read_turn_range")) {
-        return toolResponse([{ id: "c1", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]);
+        return toolResponse([
+          { id: "c1", name: "read_turn_range", args: { startTurn: 1, count: 10 } },
+        ]);
       }
       return toolResponse([
         {
@@ -304,10 +403,16 @@ describe("runCheckpointBuilderAgent", () => {
     const badHandoff = scripted((context) => {
       const names = toolNames(context);
       if (!names.includes("read_turn_range")) {
-        return toolResponse([{ id: "c1", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]);
+        return toolResponse([
+          { id: "c1", name: "read_turn_range", args: { startTurn: 1, count: 10 } },
+        ]);
       }
       return toolResponse([
-        { id: "c2", name: "submit_checkpoint", args: { checkpoint: emptyHandoff, coverageEndEntryId: "e2" } },
+        {
+          id: "c2",
+          name: "submit_checkpoint",
+          args: { checkpoint: emptyHandoff, coverageEndEntryId: "e2" },
+        },
       ]);
     });
     await assert.rejects(
@@ -318,47 +423,96 @@ describe("runCheckpointBuilderAgent", () => {
 
   it("rejects token-limited checkpoint output even when it contains a submit call", async () => {
     const index = new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" });
-    const fake = scripted((context) => toolNames(context).includes("read_turn_range")
-      ? { ...toolResponse([{ id: "c2", name: "submit_checkpoint", args: { checkpoint: checkpointPayload(), coverageEndEntryId: "e2" } }]), stopReason: "length" }
-      : toolResponse([{ id: "c1", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]));
-    await assert.rejects(runCheckpointBuilderAgent(ctx, index, config, { completion: fake.completion, model }), /stopped with length/);
+    const fake = scripted((context) =>
+      toolNames(context).includes("read_turn_range")
+        ? {
+            ...toolResponse([
+              {
+                id: "c2",
+                name: "submit_checkpoint",
+                args: { checkpoint: checkpointPayload(), coverageEndEntryId: "e2" },
+              },
+            ]),
+            stopReason: "length",
+          }
+        : toolResponse([{ id: "c1", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]),
+    );
+    await assert.rejects(
+      runCheckpointBuilderAgent(ctx, index, config, { completion: fake.completion, model }),
+      /stopped with length/,
+    );
   });
 
   it("rewrites oversized recovery prose instead of slicing off the handoff", async () => {
     const index = new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" });
     const fake = scripted((context) => {
       if (!toolNames(context).includes("read_turn_range")) {
-        return toolResponse([{ id: "read", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]);
+        return toolResponse([
+          { id: "read", name: "read_turn_range", args: { startTurn: 1, count: 10 } },
+        ]);
       }
       const rewritten = toolNames(context).includes("submit_checkpoint");
-      return toolResponse([{ id: "submit", name: "submit_checkpoint", args: {
-        checkpoint: checkpointPayload(rewritten ? "Concise goal" : "Repeated historical detail ".repeat(100)),
-        coverageEndEntryId: "e2",
-      } }]);
+      return toolResponse([
+        {
+          id: "submit",
+          name: "submit_checkpoint",
+          args: {
+            checkpoint: checkpointPayload(
+              rewritten ? "Concise goal" : "Repeated historical detail ".repeat(100),
+            ),
+            coverageEndEntryId: "e2",
+          },
+        },
+      ]);
     });
     const result = await runCheckpointBuilderAgent(ctx, index, config, {
-      completion: fake.completion, model, incompleteDraft: "unfinished historical prose",
+      completion: fake.completion,
+      model,
+      incompleteDraft: "unfinished historical prose",
       targetSummaryChars: 1000,
     });
     assert.equal(fake.calls.length, 3);
     assert.ok(result.summary.length <= 1000);
     assert.equal(result.checkpoint.continuationState.immediateNextStep, "continue");
-    assert.ok(fake.calls.at(-1)!.messages.some((message) => message.role === "toolResult" &&
-      JSON.stringify(message.content).includes("Rewrite the complete checkpoint")));
+    assert.ok(
+      fake.calls
+        .at(-1)!
+        .messages.some(
+          (message) =>
+            message.role === "toolResult" &&
+            JSON.stringify(message.content).includes("Rewrite the complete checkpoint"),
+        ),
+    );
   });
 
   it("semantically rewrites ordinary checkpoints above the default prose target", async () => {
     const fake = scripted((context) => {
       if (!toolNames(context).includes("read_turn_range")) {
-        return toolResponse([{ id: "read", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]);
+        return toolResponse([
+          { id: "read", name: "read_turn_range", args: { startTurn: 1, count: 10 } },
+        ]);
       }
       const payload = checkpointPayload("Current goal");
       if (!toolNames(context).includes("submit_checkpoint")) {
-        payload.decisions = Array.from({ length: 4 }, () => ({ text: "old decisions ".repeat(400), evidenceRefs: ["E0001"] }));
+        payload.decisions = Array.from({ length: 4 }, () => ({
+          text: "old decisions ".repeat(400),
+          evidenceRefs: ["E0001"],
+        }));
       }
-      return toolResponse([{ id: "submit", name: "submit_checkpoint", args: { checkpoint: payload, coverageEndEntryId: "e2" } }]);
+      return toolResponse([
+        {
+          id: "submit",
+          name: "submit_checkpoint",
+          args: { checkpoint: payload, coverageEndEntryId: "e2" },
+        },
+      ]);
     });
-    const result = await runCheckpointBuilderAgent(ctx, new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" }), config, { completion: fake.completion, model });
+    const result = await runCheckpointBuilderAgent(
+      ctx,
+      new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" }),
+      config,
+      { completion: fake.completion, model },
+    );
     assert.equal(fake.calls.length, 3);
     assert.ok(result.summary.length <= 16000);
     assert.equal(result.checkpoint.continuationState.immediateNextStep, "continue");
@@ -367,12 +521,29 @@ describe("runCheckpointBuilderAgent", () => {
 
   it("keeps a corrected checkpoint that stays under the hard cap", async () => {
     const fake = scripted((context) => {
-      if (!toolNames(context).includes("read_turn_range")) return toolResponse([{ id: "read", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]);
+      if (!toolNames(context).includes("read_turn_range"))
+        return toolResponse([
+          { id: "read", name: "read_turn_range", args: { startTurn: 1, count: 10 } },
+        ]);
       const payload = checkpointPayload();
-      payload.decisions = Array.from({ length: 4 }, () => ({ text: "old decisions ".repeat(400), evidenceRefs: ["E0001"] }));
-      return toolResponse([{ id: "submit", name: "submit_checkpoint", args: { checkpoint: payload, coverageEndEntryId: "e2" } }]);
+      payload.decisions = Array.from({ length: 4 }, () => ({
+        text: "old decisions ".repeat(400),
+        evidenceRefs: ["E0001"],
+      }));
+      return toolResponse([
+        {
+          id: "submit",
+          name: "submit_checkpoint",
+          args: { checkpoint: payload, coverageEndEntryId: "e2" },
+        },
+      ]);
     });
-    const result = await runCheckpointBuilderAgent(ctx, new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" }), config, { completion: fake.completion, model });
+    const result = await runCheckpointBuilderAgent(
+      ctx,
+      new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" }),
+      config,
+      { completion: fake.completion, model },
+    );
     assert.equal(fake.calls.length, 3, "one read, one correction, then keep the near miss");
     assert.ok(result.summary.length > 16000);
     assert.ok(result.summary.length <= 32000);
@@ -380,12 +551,32 @@ describe("runCheckpointBuilderAgent", () => {
 
   it("fails closed when ordinary prose remains oversized through bounded corrections", async () => {
     const fake = scripted((context) => {
-      if (!toolNames(context).includes("read_turn_range")) return toolResponse([{ id: "read", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]);
+      if (!toolNames(context).includes("read_turn_range"))
+        return toolResponse([
+          { id: "read", name: "read_turn_range", args: { startTurn: 1, count: 10 } },
+        ]);
       const payload = checkpointPayload();
-      payload.decisions = Array.from({ length: 6 }, () => ({ text: "old decisions ".repeat(500), evidenceRefs: ["E0001"] }));
-      return toolResponse([{ id: "submit", name: "submit_checkpoint", args: { checkpoint: payload, coverageEndEntryId: "e2" } }]);
+      payload.decisions = Array.from({ length: 6 }, () => ({
+        text: "old decisions ".repeat(500),
+        evidenceRefs: ["E0001"],
+      }));
+      return toolResponse([
+        {
+          id: "submit",
+          name: "submit_checkpoint",
+          args: { checkpoint: payload, coverageEndEntryId: "e2" },
+        },
+      ]);
     });
-    await assert.rejects(runCheckpointBuilderAgent(ctx, new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" }), config, { completion: fake.completion, model }), /Rewrite the complete checkpoint/);
+    await assert.rejects(
+      runCheckpointBuilderAgent(
+        ctx,
+        new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" }),
+        config,
+        { completion: fake.completion, model },
+      ),
+      /Rewrite the complete checkpoint/,
+    );
     assert.equal(fake.calls.length, 4, "one read and at most three rejected submissions");
   });
 
@@ -402,7 +593,6 @@ describe("runCheckpointBuilderAgent", () => {
 describe("runCheckpointVerifierAgent", () => {
   const draft = checkpointPayload("Draft goal") as unknown as Checkpoint;
   const draftCoverage = {
-    sourceStartEntryId: null,
     coverageEndEntryId: "e2",
     preparedAtLeafId: "e2",
     publishedAtLeafId: "e2",
@@ -413,7 +603,9 @@ describe("runCheckpointVerifierAgent", () => {
     const fake = scripted((context) => {
       const names = toolNames(context);
       if (!names.includes("read_turn_range")) {
-        return toolResponse([{ id: "c1", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]);
+        return toolResponse([
+          { id: "c1", name: "read_turn_range", args: { startTurn: 1, count: 10 } },
+        ]);
       }
       return toolResponse([{ id: "c2", name: "submit_verdict", args: { verdict: "accept" } }]);
     });
@@ -430,7 +622,9 @@ describe("runCheckpointVerifierAgent", () => {
     const fake = scripted((context) => {
       const names = toolNames(context);
       if (!names.includes("read_turn_range")) {
-        return toolResponse([{ id: "c1", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]);
+        return toolResponse([
+          { id: "c1", name: "read_turn_range", args: { startTurn: 1, count: 10 } },
+        ]);
       }
       return toolResponse([
         {
@@ -454,12 +648,24 @@ describe("runCheckpointVerifierAgent", () => {
 
   it("drops a nested verdict echo and states the envelope in the prompt", async () => {
     const index = new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" });
-    const payload = { ...checkpointPayload("Repaired goal"), verdict: "repair", coverageEndEntryId: "e2" };
+    const payload = {
+      ...checkpointPayload("Repaired goal"),
+      verdict: "repair",
+      coverageEndEntryId: "e2",
+    };
     const fake = scripted((context) => {
       if (!toolNames(context).includes("read_turn_range")) {
-        return toolResponse([{ id: "c1", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]);
+        return toolResponse([
+          { id: "c1", name: "read_turn_range", args: { startTurn: 1, count: 10 } },
+        ]);
       }
-      return toolResponse([{ id: "c2", name: "submit_verdict", args: { verdict: "repair", checkpoint: payload, coverageEndEntryId: "e2" } }]);
+      return toolResponse([
+        {
+          id: "c2",
+          name: "submit_verdict",
+          args: { verdict: "repair", checkpoint: payload, coverageEndEntryId: "e2" },
+        },
+      ]);
     });
     const outcome = await runCheckpointVerifierAgent(ctx, index, draft, draftCoverage, config, {
       completion: fake.completion,
@@ -469,51 +675,122 @@ describe("runCheckpointVerifierAgent", () => {
     assert.ok(outcome.summary.includes("Repaired goal"));
     assert.equal(fake.calls.length, 2, "one read, then acceptance on the first submit");
     const prompt = JSON.stringify((fake.calls[0]!.messages[0] as { content: unknown }).content);
-    assert.match(prompt, /Submit arguments: verdict, coverageEndEntryId, reason are passed beside checkpoint, not inside it\./);
+    assert.match(
+      prompt,
+      /Submit arguments: verdict, coverageEndEntryId, reason are passed beside checkpoint, not inside it\./,
+    );
   });
 
   it("requires full independent coverage before accepting a compressed recovery checkpoint", async () => {
     const index = new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" });
     const fake = scripted((context) => {
       if (!toolNames(context).includes("read_session_turn")) {
-        return toolResponse([{ id: "read", name: "read_session_turn", args: { turnId: "turn-2" } }]);
+        return toolResponse([
+          { id: "read", name: "read_session_turn", args: { turnId: "turn-2" } },
+        ]);
       }
       return toolResponse([{ id: "accept", name: "submit_verdict", args: { verdict: "accept" } }]);
     });
-    await assert.rejects(runCheckpointVerifierAgent(ctx, index, draft, draftCoverage, config, {
-      completion: fake.completion, model, targetSummaryChars: 1000,
-    }), /inspection requirements unmet/);
+    await assert.rejects(
+      runCheckpointVerifierAgent(ctx, index, draft, draftCoverage, config, {
+        completion: fake.completion,
+        model,
+        targetSummaryChars: 1000,
+      }),
+      /inspection requirements unmet/,
+    );
   });
 
   it("rejects oversized compressed repairs and repeated token-limited verdicts", async () => {
-    const oversized = scripted((context) => toolNames(context).includes("read_turn_range")
-      ? toolResponse([{ id: "repair", name: "submit_verdict", args: {
-          verdict: "repair", checkpoint: checkpointPayload("old prose ".repeat(500)), coverageEndEntryId: "e2",
-        } }])
-      : toolResponse([{ id: "read", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]));
-    await assert.rejects(runCheckpointVerifierAgent(ctx, new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" }), draft, draftCoverage, config, {
-      completion: oversized.completion, model, targetSummaryChars: 1000,
-    }), /Rewrite the complete checkpoint/);
+    const oversized = scripted((context) =>
+      toolNames(context).includes("read_turn_range")
+        ? toolResponse([
+            {
+              id: "repair",
+              name: "submit_verdict",
+              args: {
+                verdict: "repair",
+                checkpoint: checkpointPayload("old prose ".repeat(500)),
+                coverageEndEntryId: "e2",
+              },
+            },
+          ])
+        : toolResponse([
+            { id: "read", name: "read_turn_range", args: { startTurn: 1, count: 10 } },
+          ]),
+    );
+    await assert.rejects(
+      runCheckpointVerifierAgent(
+        ctx,
+        new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" }),
+        draft,
+        draftCoverage,
+        config,
+        {
+          completion: oversized.completion,
+          model,
+          targetSummaryChars: 1000,
+        },
+      ),
+      /Rewrite the complete checkpoint/,
+    );
     const capped = scripted(() => ({
       ...toolResponse([{ id: "accept", name: "submit_verdict", args: { verdict: "accept" } }]),
       stopReason: "length",
     }));
-    await assert.rejects(runCheckpointVerifierAgent(ctx, new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" }), draft, draftCoverage, config, {
-      completion: capped.completion, model, targetSummaryChars: 1000,
-    }), /stopped with length/);
-    assert.equal(capped.calls.length, 1, "a recovery cap is terminal even with a parsed submit call");
+    await assert.rejects(
+      runCheckpointVerifierAgent(
+        ctx,
+        new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" }),
+        draft,
+        draftCoverage,
+        config,
+        {
+          completion: capped.completion,
+          model,
+          targetSummaryChars: 1000,
+        },
+      ),
+      /stopped with length/,
+    );
+    assert.equal(
+      capped.calls.length,
+      1,
+      "a recovery cap is terminal even with a parsed submit call",
+    );
   });
 
   it("keeps a corrected repair that stays under the hard cap", async () => {
     const fake = scripted((context) => {
-      if (!toolNames(context).includes("read_turn_range")) return toolResponse([{ id: "read", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]);
+      if (!toolNames(context).includes("read_turn_range"))
+        return toolResponse([
+          { id: "read", name: "read_turn_range", args: { startTurn: 1, count: 10 } },
+        ]);
       const payload = checkpointPayload();
-      payload.decisions = Array.from({ length: 4 }, () => ({ text: "old decisions ".repeat(400), evidenceRefs: ["E0001"] }));
-      return toolResponse([{ id: "repair", name: "submit_verdict", args: { verdict: "repair", checkpoint: payload, coverageEndEntryId: "e2" } }]);
+      payload.decisions = Array.from({ length: 4 }, () => ({
+        text: "old decisions ".repeat(400),
+        evidenceRefs: ["E0001"],
+      }));
+      return toolResponse([
+        {
+          id: "repair",
+          name: "submit_verdict",
+          args: { verdict: "repair", checkpoint: payload, coverageEndEntryId: "e2" },
+        },
+      ]);
     });
-    const outcome = await runCheckpointVerifierAgent(ctx, new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" }), draft, draftCoverage, config, {
-      completion: fake.completion, model, targetSummaryChars: 16000,
-    });
+    const outcome = await runCheckpointVerifierAgent(
+      ctx,
+      new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" }),
+      draft,
+      draftCoverage,
+      config,
+      {
+        completion: fake.completion,
+        model,
+        targetSummaryChars: 16000,
+      },
+    );
     assert.equal(fake.calls.length, 3, "one read, one correction, then keep the near miss");
     assert.equal(outcome.verdict, "repair");
     assert.ok(outcome.summary.length > 16000);
@@ -522,13 +799,29 @@ describe("runCheckpointVerifierAgent", () => {
 
   it("accepts an over-soft draft that the builder already corrected", async () => {
     const oversized = checkpointPayload("Draft goal") as unknown as Checkpoint;
-    oversized.decisions = Array.from({ length: 4 }, () => ({ text: "old decisions ".repeat(400), evidenceRefs: ["E0001"] }));
-    const fake = scripted((context) => toolNames(context).includes("read_turn_range")
-      ? toolResponse([{ id: "accept", name: "submit_verdict", args: { verdict: "accept" } }])
-      : toolResponse([{ id: "read", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]));
-    const outcome = await runCheckpointVerifierAgent(ctx, new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" }), oversized, draftCoverage, config, {
-      completion: fake.completion, model, targetSummaryChars: 16000,
-    });
+    oversized.decisions = Array.from({ length: 4 }, () => ({
+      text: "old decisions ".repeat(400),
+      evidenceRefs: ["E0001"],
+    }));
+    const fake = scripted((context) =>
+      toolNames(context).includes("read_turn_range")
+        ? toolResponse([{ id: "accept", name: "submit_verdict", args: { verdict: "accept" } }])
+        : toolResponse([
+            { id: "read", name: "read_turn_range", args: { startTurn: 1, count: 10 } },
+          ]),
+    );
+    const outcome = await runCheckpointVerifierAgent(
+      ctx,
+      new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" }),
+      oversized,
+      draftCoverage,
+      config,
+      {
+        completion: fake.completion,
+        model,
+        targetSummaryChars: 16000,
+      },
+    );
     assert.equal(fake.calls.length, 2, "no correction is requested for an accepted draft");
     assert.equal(outcome.verdict, "accept");
     assert.ok(outcome.summary.length > 16000);
@@ -536,12 +829,34 @@ describe("runCheckpointVerifierAgent", () => {
 
   it("rejects an oversized ordinary verifier repair instead of installing or slicing it", async () => {
     const fake = scripted((context) => {
-      if (!toolNames(context).includes("read_turn_range")) return toolResponse([{ id: "read", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]);
+      if (!toolNames(context).includes("read_turn_range"))
+        return toolResponse([
+          { id: "read", name: "read_turn_range", args: { startTurn: 1, count: 10 } },
+        ]);
       const payload = checkpointPayload();
-      payload.decisions = Array.from({ length: 6 }, () => ({ text: "old decisions ".repeat(500), evidenceRefs: ["E0001"] }));
-      return toolResponse([{ id: "repair", name: "submit_verdict", args: { verdict: "repair", checkpoint: payload, coverageEndEntryId: "e2" } }]);
+      payload.decisions = Array.from({ length: 6 }, () => ({
+        text: "old decisions ".repeat(500),
+        evidenceRefs: ["E0001"],
+      }));
+      return toolResponse([
+        {
+          id: "repair",
+          name: "submit_verdict",
+          args: { verdict: "repair", checkpoint: payload, coverageEndEntryId: "e2" },
+        },
+      ]);
     });
-    await assert.rejects(runCheckpointVerifierAgent(ctx, new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" }), draft, draftCoverage, config, { completion: fake.completion, model }), /Rewrite the complete checkpoint/);
+    await assert.rejects(
+      runCheckpointVerifierAgent(
+        ctx,
+        new SessionHistoryIndex({ branch: branchFixture(), cwd: "/repo" }),
+        draft,
+        draftCoverage,
+        config,
+        { completion: fake.completion, model },
+      ),
+      /Rewrite the complete checkpoint/,
+    );
     assert.equal(fake.calls.length, 4);
   });
 
@@ -551,7 +866,10 @@ describe("runCheckpointVerifierAgent", () => {
       toolResponse([{ id: "c1", name: "submit_verdict", args: { verdict: "accept" } }]),
     );
     await assert.rejects(
-      runCheckpointVerifierAgent(ctx, hasty, draft, draftCoverage, config, { completion: noRead.completion, model }),
+      runCheckpointVerifierAgent(ctx, hasty, draft, draftCoverage, config, {
+        completion: noRead.completion,
+        model,
+      }),
       /at least one read tool/,
     );
 
@@ -559,10 +877,16 @@ describe("runCheckpointVerifierAgent", () => {
     const unusable = scripted((context) => {
       const names = toolNames(context);
       if (!names.includes("read_turn_range")) {
-        return toolResponse([{ id: "c1", name: "read_turn_range", args: { startTurn: 1, count: 10 } }]);
+        return toolResponse([
+          { id: "c1", name: "read_turn_range", args: { startTurn: 1, count: 10 } },
+        ]);
       }
       return toolResponse([
-        { id: "c2", name: "submit_verdict", args: { verdict: "unusable", reason: "empty history" } },
+        {
+          id: "c2",
+          name: "submit_verdict",
+          args: { verdict: "unusable", reason: "empty history" },
+        },
       ]);
     });
     await assert.rejects(
@@ -579,24 +903,46 @@ describe("private transcript bounds", () => {
   it("elides older read results explicitly once the transcript exceeds its budget", async () => {
     const small = { ...model, contextWindow: 10_000 } as Model<Api>;
     const branch: SessionEntry[] = [];
-    for (let i = 1; i <= 6; i++) branch.push(userEntry(`e${i}`, i > 1 ? `e${i - 1}` : null, `task ${i} `.repeat(500)));
+    for (let i = 1; i <= 6; i++)
+      branch.push(userEntry(`e${i}`, i > 1 ? `e${i - 1}` : null, `task ${i} `.repeat(500)));
     const fake = scripted((context) => {
       const reads = toolNames(context).filter((name) => name === "read_session_entries").length;
       if (reads < 3) {
-        return toolResponse([{ id: `r${reads}`, name: "read_session_entries", args: { start: reads * 2, count: 2 } }]);
+        return toolResponse([
+          { id: `r${reads}`, name: "read_session_entries", args: { start: reads * 2, count: 2 } },
+        ]);
       }
-      return toolResponse([{ id: "submit", name: "submit_checkpoint", args: { checkpoint: checkpointPayload(), coverageEndEntryId: "e6" } }]);
+      return toolResponse([
+        {
+          id: "submit",
+          name: "submit_checkpoint",
+          args: { checkpoint: checkpointPayload(), coverageEndEntryId: "e6" },
+        },
+      ]);
     });
-    const outcome = await runCheckpointBuilderAgent(ctx, new SessionHistoryIndex({ branch, cwd: "/repo" }), config, { completion: fake.completion, model: small });
+    const outcome = await runCheckpointBuilderAgent(
+      ctx,
+      new SessionHistoryIndex({ branch, cwd: "/repo" }),
+      config,
+      { completion: fake.completion, model: small },
+    );
     assert.equal(outcome.coverageEndEntryId, "e6");
     const last = fake.calls.at(-1)!;
-    const results = last.messages.filter((message) => message.role === "toolResult")
+    const results = last.messages
+      .filter((message) => message.role === "toolResult")
       .map((message) => (message as { content: Array<{ text: string }> }).content[0]!.text);
     const elided = results.filter((text) => text.includes('"elided":true'));
     assert.ok(elided.length >= 1);
-    assert.deepEqual(JSON.parse(elided[0]!).evidenceIds, { first: "E0001", last: "E0002", count: 2 });
+    assert.deepEqual(JSON.parse(elided[0]!).evidenceIds, {
+      first: "E0001",
+      last: "E0002",
+      count: 2,
+    });
     assert.ok(!results.at(-1)!.includes('"elided":true'), "the latest read stays visible");
-    const transcript = last.messages.reduce((total, message) => total + JSON.stringify(message).length, 0);
+    const transcript = last.messages.reduce(
+      (total, message) => total + JSON.stringify(message).length,
+      0,
+    );
     assert.ok(transcript <= 20_000, `transcript ${transcript} exceeds budget`);
   });
 });

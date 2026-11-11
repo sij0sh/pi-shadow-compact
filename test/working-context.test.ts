@@ -14,14 +14,16 @@ import { userEntry } from "./helpers/index-fixture.js";
 function assertBuilt(
   result: WorkingContextResult | WorkingContextSkipped,
 ): asserts result is WorkingContextResult {
-  assert.ok(!isWorkingContextSkipped(result), `expected a built context, got ${JSON.stringify(result)}`);
+  assert.ok(
+    !isWorkingContextSkipped(result),
+    `expected a built context, got ${JSON.stringify(result)}`,
+  );
 }
 
 const TIMESTAMP = "2026-01-01T00:00:00.000Z";
 
 function coverage(coverageEndEntryId: string): CheckpointCoverage {
   return {
-    sourceStartEntryId: null,
     coverageEndEntryId,
     preparedAtLeafId: "prepared",
     publishedAtLeafId: "published",
@@ -32,7 +34,9 @@ function coverage(coverageEndEntryId: string): CheckpointCoverage {
 function userBranch(count: number): SessionEntry[] {
   const branch: SessionEntry[] = [];
   for (let i = 1; i <= count; i++) {
-    branch.push(userEntry(`e${i}`, i === 1 ? null : `e${i - 1}`, `user turn number ${i} with enough words`));
+    branch.push(
+      userEntry(`e${i}`, i === 1 ? null : `e${i - 1}`, `user turn number ${i} with enough words`),
+    );
   }
   return branch;
 }

@@ -2,12 +2,8 @@ import assert from "node:assert/strict";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import {
-  SOFT_THRESHOLD_ABS_ENV_VAR,
-  SUMMARIZER_ID_ENV_VAR,
-  SUMMARIZER_PROVIDER_ENV_VAR,
-} from "../src/config.js";
-import { CHECKPOINT_CUSTOM_TYPE } from "../src/persist.js";
+import { CHECKPOINT_CUSTOM_TYPE, type PersistedShadowCheckpoint } from "../src/persist.js";
+import { CHECKPOINT_SCHEMA_VERSION } from "../src/summary.js";
 import {
   compactionEntry,
   fixture,
@@ -29,29 +25,14 @@ const SWAP_CONFIG = {
 };
 
 let savedAgentDir: string | undefined;
-let savedAbs: string | undefined;
-let savedSummarizerProvider: string | undefined;
-let savedSummarizerId: string | undefined;
 
 beforeEach(() => {
   savedAgentDir = process.env.PI_CODING_AGENT_DIR;
-  savedAbs = process.env[SOFT_THRESHOLD_ABS_ENV_VAR];
-  savedSummarizerProvider = process.env[SUMMARIZER_PROVIDER_ENV_VAR];
-  savedSummarizerId = process.env[SUMMARIZER_ID_ENV_VAR];
-  delete process.env[SOFT_THRESHOLD_ABS_ENV_VAR];
-  delete process.env[SUMMARIZER_PROVIDER_ENV_VAR];
-  delete process.env[SUMMARIZER_ID_ENV_VAR];
 });
 
 afterEach(() => {
   if (savedAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
   else process.env.PI_CODING_AGENT_DIR = savedAgentDir;
-  if (savedAbs === undefined) delete process.env[SOFT_THRESHOLD_ABS_ENV_VAR];
-  else process.env[SOFT_THRESHOLD_ABS_ENV_VAR] = savedAbs;
-  if (savedSummarizerProvider === undefined) delete process.env[SUMMARIZER_PROVIDER_ENV_VAR];
-  else process.env[SUMMARIZER_PROVIDER_ENV_VAR] = savedSummarizerProvider;
-  if (savedSummarizerId === undefined) delete process.env[SUMMARIZER_ID_ENV_VAR];
-  else process.env[SUMMARIZER_ID_ENV_VAR] = savedSummarizerId;
 });
 
 async function startPreparation(fixture: Fixture): Promise<void> {
@@ -103,7 +84,9 @@ describe("shadowCompact extension orchestration", () => {
       await startPreparation(f);
       assert.match(f.registry.prompts[0]!, /within 2000 characters/);
       assert.match(f.registry.prompts[2]!, /within 2000 characters/);
-    } finally { await f.cleanup(); }
+    } finally {
+      await f.cleanup();
+    }
   });
 
   it("prompts the checkpoint agent with the session manifest and read-only tools", async () => {
@@ -149,26 +132,6 @@ describe("shadowCompact extension orchestration", () => {
     }
   });
 
-  it("honors the benchmark-only absolute threshold override", async () => {
-    const f = await fixture(SWAP_CONFIG);
-    try {
-      process.env[SOFT_THRESHOLD_ABS_ENV_VAR] = "601";
-      await f.emit("turn_end");
-      await tick();
-      assert.equal(f.registry.calls, 0);
-
-      // Env changes take effect at the next session start (config is memoized
-      // within a session).
-      process.env[SOFT_THRESHOLD_ABS_ENV_VAR] = "600";
-      await f.emit("session_start");
-      await f.emit("turn_end");
-      await waitFor(() => f.notifications.includes(READY_MESSAGE));
-      assert.equal(f.registry.calls, 4);
-    } finally {
-      await f.cleanup();
-    }
-  });
-
   it("persists a ready result as extension state and serves the matching before_compact from cache", async () => {
     const f = await fixture(SWAP_CONFIG);
     try {
@@ -177,8 +140,8 @@ describe("shadowCompact extension orchestration", () => {
       assert.equal(f.appendedEntries.length, 1);
       const persisted = f.appendedEntries[0];
       assert.equal(persisted?.customType, CHECKPOINT_CUSTOM_TYPE);
-      const data = persisted?.data as { version: number; summary: string };
-      assert.equal(data.version, 3);
+      const data = persisted?.data as PersistedShadowCheckpoint;
+      assert.equal(data.version, CHECKPOINT_SCHEMA_VERSION);
       assert.match(data.summary, /Prepared continuation checkpoint/);
 
       // A settled agent with no new work re-persists nothing: the same
@@ -219,7 +182,10 @@ describe("shadowCompact extension orchestration", () => {
     try {
       await startPreparation(f);
       for (const firstKeptEntryId of ["e4", "e3", "nope"]) {
-        const outcome = await f.emit("session_before_compact", f.compactEvent({ firstKeptEntryId }));
+        const outcome = await f.emit(
+          "session_before_compact",
+          f.compactEvent({ firstKeptEntryId }),
+        );
         assert.equal(outcome, undefined);
       }
       assert.deepEqual(f.compactCalls, []);
@@ -248,7 +214,10 @@ describe("shadowCompact extension orchestration", () => {
     const f = await fixture(SWAP_CONFIG);
     try {
       // The checkpoint must be smaller than the context it replaces.
-      f.setBranch([userEntry("e1", null, "old conversation detail ".repeat(1000)), ...f.branch.slice(1)]);
+      f.setBranch([
+        userEntry("e1", null, "old conversation detail ".repeat(1000)),
+        ...f.branch.slice(1),
+      ]);
       const outcome = await f.emit("session_before_compact", f.compactEvent({ reason: "manual" }));
       assert.ok(outcome.compaction.summary.includes("Prepared continuation checkpoint"));
       assert.equal(outcome.compaction.firstKeptEntryId, "e4");
@@ -320,7 +289,10 @@ describe("shadowCompact extension orchestration", () => {
   it("keeps a newer preparation alive when a superseded summary completes", async () => {
     const f = await fixture(SWAP_CONFIG);
     try {
-      f.setBranch([userEntry("e1", null, "old conversation detail ".repeat(1000)), ...f.branch.slice(1)]);
+      f.setBranch([
+        userEntry("e1", null, "old conversation detail ".repeat(1000)),
+        ...f.branch.slice(1),
+      ]);
       f.gate();
       await f.emit("turn_end");
       assert.equal(f.registry.calls, 1);
@@ -413,7 +385,9 @@ describe("shadowCompact extension orchestration", () => {
       await waitFor(() => f.registry.settled >= 1);
       await tick();
       assert.equal(f.registry.calls, 1);
-      assert.deepEqual(f.notifications, ["shadow-compact: Summary model (configured/summary-model) stopped with error: synthetic failure"]);
+      assert.deepEqual(f.notifications, [
+        "shadow-compact: Summary model (configured/summary-model) stopped with error: synthetic failure",
+      ]);
       assert.equal(f.compactCalls.length, 0);
       // A queued fallback owns the next idle point: no new preparation on top of it.
       await f.emit("turn_end");

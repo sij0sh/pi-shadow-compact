@@ -66,7 +66,13 @@ describe("sanitizeForContext secrets", () => {
   });
 
   it("redacts UPPER secret assignments even when the name ends in KEY", () => {
-    for (const name of ["SECRET_KEY", "MY_API_KEY", "AWS_SECRET_ACCESS_KEY", "SECRET_TOKEN", "DB_PASSWORD"]) {
+    for (const name of [
+      "SECRET_KEY",
+      "MY_API_KEY",
+      "AWS_SECRET_ACCESS_KEY",
+      "SECRET_TOKEN",
+      "DB_PASSWORD",
+    ]) {
       const value = "hunter2-" + "v".repeat(16);
       const text = sanitizeForContext(upperAssign(name, value), "");
       assert.ok(!text.includes("hunter2"), `${name}: ${text}`);
@@ -107,7 +113,10 @@ describe("sanitizeForContext secrets", () => {
   it("redacts unfamiliar credentials in quoted JSON keys", () => {
     const secret = "provider-" + "m".repeat(20);
     for (const key of ["api_key", "credentials", "authorization", "access_token"]) {
-      const text = sanitizeForContext(JSON.stringify({ [key]: secret, error: "quota exceeded" }), "");
+      const text = sanitizeForContext(
+        JSON.stringify({ [key]: secret, error: "quota exceeded" }),
+        "",
+      );
       assert.ok(!text.includes(secret), text);
       assert.match(text, /quota exceeded/);
     }

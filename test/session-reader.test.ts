@@ -62,7 +62,10 @@ describe("SessionHistoryIndex", () => {
     });
     assert.deepEqual(index.requiredTurnIds(), ["turn-1", "turn-2", "turn-3"]);
     const clean = new SessionHistoryIndex({
-      branch: [userEntry("e1", null, "first task here please"), userEntry("e2", "e1", "second task here please")],
+      branch: [
+        userEntry("e1", null, "first task here please"),
+        userEntry("e2", "e1", "second task here please"),
+      ],
       cwd: CWD,
       previousCoverageEndEntryId: "e1",
       previousCheckpointSummary: "old summary",
@@ -159,14 +162,27 @@ describe("SessionHistoryIndex paging", () => {
   function hugeTurnBranch(): SessionEntry[] {
     const branch: SessionEntry[] = [userEntry("u1", null, "Investigate the failing build")];
     for (let i = 0; i < 30; i++) {
-      branch.push(toolResultEntry(`t${i}`, branch.at(-1)!.id, `c${i}`, "bash", `output ${i} `.repeat(300), false));
+      branch.push(
+        toolResultEntry(
+          `t${i}`,
+          branch.at(-1)!.id,
+          `c${i}`,
+          "bash",
+          `output ${i} `.repeat(300),
+          false,
+        ),
+      );
     }
     branch.push(userEntry("u2", branch.at(-1)!.id, "Next task here please"));
     return branch;
   }
 
   it("serves an oversized turn in pages and marks only served entries inspected", () => {
-    const index = new SessionHistoryIndex({ branch: hugeTurnBranch(), cwd: CWD, maxPageChars: 20_000 });
+    const index = new SessionHistoryIndex({
+      branch: hugeTurnBranch(),
+      cwd: CWD,
+      maxPageChars: 20_000,
+    });
     const range = index.readTurnRange(1, 10);
     assert.equal(range.turns.length, 1);
     const first = range.turns[0]!;
@@ -186,22 +202,36 @@ describe("SessionHistoryIndex paging", () => {
       ids.push(...page.entries.map((entry) => entry.evidenceId));
       offset = page.nextEntryOffset;
     }
-    assert.deepEqual(ids, Array.from({ length: 31 }, (_, i) => `E${String(i + 1).padStart(4, "0")}`));
+    assert.deepEqual(
+      ids,
+      Array.from({ length: 31 }, (_, i) => `E${String(i + 1).padStart(4, "0")}`),
+    );
     assert.ok(!index.missingRequiredTurnIds().includes("turn-1"));
   });
 
   it("does not serve or mark a later turn that does not fit the remaining page", () => {
     const branch = hugeTurnBranch();
-    const index = new SessionHistoryIndex({ branch: [userEntry("u0", null, "small first turn"), ...branch], cwd: CWD, maxPageChars: 20_000 });
+    const index = new SessionHistoryIndex({
+      branch: [userEntry("u0", null, "small first turn"), ...branch],
+      cwd: CWD,
+      maxPageChars: 20_000,
+    });
     const range = index.readTurnRange(1, 2);
-    assert.deepEqual(range.turns.map((turn) => turn.turnId), ["turn-1"]);
+    assert.deepEqual(
+      range.turns.map((turn) => turn.turnId),
+      ["turn-1"],
+    );
     assert.equal(range.turns[0]!.nextEntryOffset, undefined);
     assert.equal(range.nextTurn, 2);
     assert.deepEqual([...index.inspectedEntryIds], ["u0"]);
   });
 
   it("stops entry pages at the budget and names the continuation", () => {
-    const index = new SessionHistoryIndex({ branch: hugeTurnBranch(), cwd: CWD, maxPageChars: 20_000 });
+    const index = new SessionHistoryIndex({
+      branch: hugeTurnBranch(),
+      cwd: CWD,
+      maxPageChars: 20_000,
+    });
     const page = index.readEntries(0, 50);
     assert.equal(page.nextStart, page.end);
     assert.ok(page.end < 32);

@@ -3,10 +3,7 @@ import { describe, it } from "node:test";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { defaultConfig } from "../src/config.js";
-import {
-  resolveSummarizerModel,
-  resolveVerificationModel,
-} from "../src/summary.js";
+import { resolveSummarizerModel, resolveVerificationModel } from "../src/summary.js";
 
 const config = {
   ...defaultConfig(),
@@ -26,7 +23,10 @@ const defaultModel = { provider: "default", id: "configured", api: "test" } as M
 
 type SummaryContext = Pick<ExtensionContext, "model" | "modelRegistry">;
 
-function registry(finds: Array<[string, string]>, found: Model<Api> | undefined): ExtensionContext["modelRegistry"] {
+function registry(
+  finds: Array<[string, string]>,
+  found: Model<Api> | undefined,
+): ExtensionContext["modelRegistry"] {
   return {
     find(provider: string, id: string) {
       finds.push([provider, id]);
@@ -35,10 +35,7 @@ function registry(finds: Array<[string, string]>, found: Model<Api> | undefined)
   } as unknown as ExtensionContext["modelRegistry"];
 }
 
-function context(
-  finds: Array<[string, string]>,
-  found: Model<Api> | undefined,
-): SummaryContext {
+function context(finds: Array<[string, string]>, found: Model<Api> | undefined): SummaryContext {
   return { model: sessionModel, modelRegistry: registry(finds, found) };
 }
 
@@ -113,10 +110,17 @@ describe("resolveSummarizerModel", () => {
   it("uses Pi's configured default model when the configured pair is missing", () => {
     const finds: Array<[string, string]> = [];
 
-    const resolved = resolveSummarizerModel(layeredContext(finds), { ...config, summarizerModel: { provider: "gone", id: "removed" } }, defaultPair);
+    const resolved = resolveSummarizerModel(
+      layeredContext(finds),
+      { ...config, summarizerModel: { provider: "gone", id: "removed" } },
+      defaultPair,
+    );
 
     assert.equal(resolved, defaultModel);
-    assert.deepEqual(finds, [["gone", "removed"], ["default", "configured"]]);
+    assert.deepEqual(finds, [
+      ["gone", "removed"],
+      ["default", "configured"],
+    ]);
   });
 
   it("throws when no configured, default, or session model resolves", () => {
@@ -125,7 +129,12 @@ describe("resolveSummarizerModel", () => {
       /Summary model not found: current Pi session model/,
     );
     assert.throws(
-      () => resolveSummarizerModel(contextWithoutSessionModel([], undefined), blankModelConfig, defaultPair),
+      () =>
+        resolveSummarizerModel(
+          contextWithoutSessionModel([], undefined),
+          blankModelConfig,
+          defaultPair,
+        ),
       /Summary model not found: default\/configured/,
     );
   });
@@ -142,7 +151,10 @@ describe("resolveVerificationModel", () => {
   it("reuses the session model when both pairs are blank", () => {
     const finds: Array<[string, string]> = [];
 
-    assert.equal(resolveVerificationModel(context(finds, summaryModel), blankModelConfig), sessionModel);
+    assert.equal(
+      resolveVerificationModel(context(finds, summaryModel), blankModelConfig),
+      sessionModel,
+    );
     assert.deepEqual(finds, []);
   });
 
@@ -170,7 +182,10 @@ describe("resolveVerificationModel", () => {
     const resolved = resolveVerificationModel(context(finds, undefined), verifierConfig);
 
     assert.equal(resolved, sessionModel);
-    assert.deepEqual(finds, [["configured", "verifier"], ["configured", "summary"]]);
+    assert.deepEqual(finds, [
+      ["configured", "verifier"],
+      ["configured", "summary"],
+    ]);
   });
 
   it("uses Pi's configured default model when both pairs are blank", () => {

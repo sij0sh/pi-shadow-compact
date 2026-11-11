@@ -21,8 +21,6 @@ import { CHECKPOINT_CUSTOM_TYPE } from "../../src/persist.js";
 import shadowCompact from "../../src/index.js";
 import { buildSessionProjection, SettingsManager } from "@earendil-works/pi-coding-agent";
 
-
-
 export type Handler = (event: any, ctx: ExtensionContext) => any;
 export type CompactCall = Parameters<ExtensionContext["compact"]>[0];
 
@@ -106,7 +104,11 @@ export class FakeRegistry {
     return undefined;
   }
 
-  streamSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): AssistantMessageEventStream {
+  streamSimple(
+    model: Model<Api>,
+    context: Context,
+    options?: ModelsSimpleStreamOptions,
+  ): AssistantMessageEventStream {
     return { result: () => this.complete(model, context, options) } as AssistantMessageEventStream;
   }
 
@@ -240,7 +242,6 @@ export class FakeRegistry {
     }
     return this.toolCallResponse(model, [{ name: "submit_verdict", args: { verdict: "accept" } }]);
   }
-
 }
 
 export function userEntry(id: string, parentId: string | null, text: string): SessionEntry {
@@ -294,10 +295,24 @@ export function compactionEntry(id: string, parentId: string): SessionEntry {
 
 /** ~46 tokens for the last user entry: keepRecentTokens=30 cuts right before it. */
 function makeBranch(): SessionEntry[] {
-  const e1 = userEntry("e1", null, "First user message describing the overall goal of this fixture session.");
-  const e2 = assistantToolEntry("e2", "e1", "Reading the config file.", { name: "read", path: "src/read.ts" });
-  const e3 = assistantToolEntry("e3", "e2", "Now editing the file.", { name: "edit", path: "src/edited.ts" });
-  const e4 = userEntry("e4", "e3", `Fourth user message, deliberately long: ${"detail ".repeat(20)}`);
+  const e1 = userEntry(
+    "e1",
+    null,
+    "First user message describing the overall goal of this fixture session.",
+  );
+  const e2 = assistantToolEntry("e2", "e1", "Reading the config file.", {
+    name: "read",
+    path: "src/read.ts",
+  });
+  const e3 = assistantToolEntry("e3", "e2", "Now editing the file.", {
+    name: "edit",
+    path: "src/edited.ts",
+  });
+  const e4 = userEntry(
+    "e4",
+    "e3",
+    `Fourth user message, deliberately long: ${"detail ".repeat(20)}`,
+  );
   return [e1, e2, e3, e4];
 }
 
@@ -391,13 +406,30 @@ export async function fixture(globalConfig?: Record<string, unknown>): Promise<F
 /** Disposable prefix so retention tests can keep six rounds and still shrink. */
 export async function fixtureWithHistory(config?: Record<string, unknown>): Promise<Fixture> {
   const f = await fixture(config);
-  const prefix = Array.from({ length: 8 }, (_, i) => ({
-    type: "message", id: `history-${i}`, parentId: i === 0 ? null : `history-${i - 1}`,
-    timestamp: TIMESTAMP,
-    message: { role: "assistant", content: [{ type: "text", text: "old history detail ".repeat(300) }],
-      api: "test", provider: "test", model: "test", usage: USAGE, stopReason: "stop", timestamp: 0 },
-  } as SessionEntry));
-  f.setBranch([...prefix, ...f.branch.map((entry, i) => i === 0 ? { ...entry, parentId: prefix.at(-1)!.id } : entry)]);
+  const prefix = Array.from(
+    { length: 8 },
+    (_, i) =>
+      ({
+        type: "message",
+        id: `history-${i}`,
+        parentId: i === 0 ? null : `history-${i - 1}`,
+        timestamp: TIMESTAMP,
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "old history detail ".repeat(300) }],
+          api: "test",
+          provider: "test",
+          model: "test",
+          usage: USAGE,
+          stopReason: "stop",
+          timestamp: 0,
+        },
+      }) as SessionEntry,
+  );
+  f.setBranch([
+    ...prefix,
+    ...f.branch.map((entry, i) => (i === 0 ? { ...entry, parentId: prefix.at(-1)!.id } : entry)),
+  ]);
   return f;
 }
 
@@ -435,11 +467,12 @@ function installInstance(shared: SharedSession): Fixture {
   } as unknown as ExtensionAPI;
   shadowCompact(pi);
 
-  let usage: { tokens: number | null; contextWindow: number; percent: number | null } | undefined = {
-    tokens: 600,
-    contextWindow: 1000,
-    percent: 60,
-  };
+  let usage: { tokens: number | null; contextWindow: number; percent: number | null } | undefined =
+    {
+      tokens: 600,
+      contextWindow: 1000,
+      percent: 60,
+    };
   let idle = false;
   let stale = false;
   const releases: Array<() => void> = [];
@@ -513,7 +546,8 @@ function installInstance(shared: SharedSession): Fixture {
       shared.branch = entries;
     },
     setPercent(next) {
-      usage = next === undefined ? undefined : { tokens: next * 10, contextWindow: 1000, percent: next };
+      usage =
+        next === undefined ? undefined : { tokens: next * 10, contextWindow: 1000, percent: next };
     },
     setUsage(tokens, contextWindow, percent) {
       usage = {
@@ -527,9 +561,11 @@ function installInstance(shared: SharedSession): Fixture {
     },
     gate() {
       let releaseGate!: () => void;
-      registry.pendingGates.push(new Promise<void>((resolve) => {
-        releaseGate = resolve;
-      }));
+      registry.pendingGates.push(
+        new Promise<void>((resolve) => {
+          releaseGate = resolve;
+        }),
+      );
       releases.push(releaseGate);
     },
     release() {
@@ -549,7 +585,9 @@ function installInstance(shared: SharedSession): Fixture {
       return installInstance(shared);
     },
     contextMessages(): unknown[] {
-      return buildSessionProjection(shared.branch).messages.filter((message) => message.role !== "system");
+      return buildSessionProjection(shared.branch).messages.filter(
+        (message) => message.role !== "system",
+      );
     },
     async emit(name, event = { type: name }) {
       if (name === "turn_end") idle = false;
@@ -571,7 +609,9 @@ function installInstance(shared: SharedSession): Fixture {
           fileOps: { read: new Set(), written: new Set(), edited: new Set() },
           settings: { enabled: true, reserveTokens: 100, keepRecentTokens: 30 },
         },
-        ...(options.customInstructions === undefined ? {} : { customInstructions: options.customInstructions }),
+        ...(options.customInstructions === undefined
+          ? {}
+          : { customInstructions: options.customInstructions }),
         reason: options.reason ?? "threshold",
         willRetry: false,
         signal: options.signal ?? new AbortController().signal,

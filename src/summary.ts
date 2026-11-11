@@ -13,7 +13,6 @@ import {
 } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ModelPair, ShadowCompactConfig } from "./config.js";
-import type { FileDetails } from "./working-context.js";
 
 const MAX_ITEM_CHARS = 8_000;
 const MAX_ITEMS_PER_SECTION = 100;
@@ -186,7 +185,9 @@ function parseVerificationSection(
     throw new Error(`Checkpoint section ${VERIFICATION_SECTION} must be an array`);
   }
   if (value.length > MAX_ITEMS_PER_SECTION) {
-    throw new Error(`Checkpoint section ${VERIFICATION_SECTION} exceeds ${MAX_ITEMS_PER_SECTION} items`);
+    throw new Error(
+      `Checkpoint section ${VERIFICATION_SECTION} exceeds ${MAX_ITEMS_PER_SECTION} items`,
+    );
   }
   return value.map((item, index) => parseVerificationItem(item, index, knownRefs));
 }
@@ -221,7 +222,9 @@ function parseVerificationItem(
     throw new Error(`Item ${index} in ${VERIFICATION_SECTION} needs at least one evidenceRef`);
   }
   if (refs.length > MAX_REFS_PER_ITEM) {
-    throw new Error(`Item ${index} in ${VERIFICATION_SECTION} exceeds ${MAX_REFS_PER_ITEM} evidenceRefs`);
+    throw new Error(
+      `Item ${index} in ${VERIFICATION_SECTION} exceeds ${MAX_REFS_PER_ITEM} evidenceRefs`,
+    );
   }
   for (const ref of refs) {
     if (typeof ref !== "string" || !knownRefs.has(ref)) {
@@ -248,7 +251,8 @@ function parseContinuationState(source: Record<string, unknown>): ContinuationSt
   const state = emptyContinuationState();
   for (const field of CONTINUATION_FIELDS) {
     const text = typeof record[field] === "string" ? (record[field] as string).trim() : "";
-    if (!text) throw new Error(`Checkpoint section ${CONTINUATION_KEY}.${field} must be a non-empty string`);
+    if (!text)
+      throw new Error(`Checkpoint section ${CONTINUATION_KEY}.${field} must be a non-empty string`);
     if (text.length > MAX_ITEM_CHARS) {
       throw new Error(`Checkpoint section ${CONTINUATION_KEY}.${field} exceeds text limit`);
     }
@@ -294,7 +298,8 @@ function parseItem(
   }
   const text = typeof record.text === "string" ? record.text.trim() : "";
   if (!text) throw new Error(`Item ${index} in ${section} has empty text`);
-  if (text.length > MAX_ITEM_CHARS) throw new Error(`Item ${index} in ${section} exceeds text limit`);
+  if (text.length > MAX_ITEM_CHARS)
+    throw new Error(`Item ${index} in ${section} exceeds text limit`);
 
   const refs = record.evidenceRefs;
   if (!Array.isArray(refs) || refs.length === 0) {
@@ -331,13 +336,17 @@ export function renderCheckpoint(checkpoint: Checkpoint): string {
     sections.push(`## Verification State\n${lines.join("\n")}`);
   }
   const continuation = checkpoint.continuationState;
-  if (continuation && (continuation.currentGoal || continuation.currentApproach || continuation.immediateNextStep)) {
+  if (
+    continuation &&
+    (continuation.currentGoal || continuation.currentApproach || continuation.immediateNextStep)
+  ) {
     sections.push(
       `## Continuation\n- Goal: ${safeText(continuation.currentGoal) || "(none)"}\n- Approach: ${safeText(continuation.currentApproach) || "(none)"}\n- Next: ${safeText(continuation.immediateNextStep) || "(none)"}`,
     );
   }
   const rendered = `# Continuation Checkpoint\n\n${sections.join("\n\n")}\n`;
-  if (rendered.length > MAX_RENDERED_CHARS) throw new Error("Rendered checkpoint exceeds size limit");
+  if (rendered.length > MAX_RENDERED_CHARS)
+    throw new Error("Rendered checkpoint exceeds size limit");
   return rendered;
 }
 
@@ -375,10 +384,10 @@ export function combineUsage(a: Usage, b: Usage): Usage {
 
 /**
  * Current durable checkpoint schema version. Only this version is readable:
- * pre-v3 entries (the removed historic-turn subsystem, `historicTurns`,
- * relevance prompt versions) are ignored on restore rather than migrated.
+ * pre-v4 entries (including the removed `sourceStartEntryId` and
+ * `generatedAt` fields) are ignored on restore rather than migrated.
  */
-export const CHECKPOINT_SCHEMA_VERSION = 3;
+export const CHECKPOINT_SCHEMA_VERSION = 4;
 
 /** Prompt versions carried by every checkpoint. */
 export const SUMMARY_PROMPT_VERSION = 3;
@@ -399,8 +408,6 @@ export function currentPromptVersions(): PromptVersions {
 /**
  * Where a checkpoint's evidence grounding starts and ends.
  *
- * - `sourceStartEntryId`: oldest session entry eligible as evidence (null
- *   when the checkpoint covers from the session start).
  * - `coverageEndEntryId`: the summary is guaranteed to represent session
  *   history through this entry. Never inferred from when generation
  *   completed: a checkpoint triggered at 60% that finishes at 79% covers
@@ -410,21 +417,9 @@ export function currentPromptVersions(): PromptVersions {
  *   session kept moving while the agent worked).
  */
 export interface CheckpointCoverage {
-  sourceStartEntryId: string | null;
   coverageEndEntryId: string;
   preparedAtLeafId: string;
   publishedAtLeafId: string;
-}
-
-export interface ShadowCheckpoint {
-  schemaVersion: typeof CHECKPOINT_SCHEMA_VERSION;
-  structured: Checkpoint;
-  rendered: string;
-  coverage: CheckpointCoverage;
-  generatedAt: number;
-  prompts: PromptVersions;
-  usage?: Usage;
-  details?: FileDetails;
 }
 
 /**
@@ -433,13 +428,11 @@ export interface ShadowCheckpoint {
  * during generation so the swap can prove a gap-free tail.
  */
 export function buildCoverage(options: {
-  sourceStartEntryId: string | null;
   coverageEndEntryId: string;
   preparedAtLeafId: string;
   publishedAtLeafId: string;
 }): CheckpointCoverage {
   return {
-    sourceStartEntryId: options.sourceStartEntryId,
     coverageEndEntryId: options.coverageEndEntryId,
     preparedAtLeafId: options.preparedAtLeafId,
     publishedAtLeafId: options.publishedAtLeafId,

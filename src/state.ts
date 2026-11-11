@@ -211,8 +211,7 @@ export class ShadowCompactStateController {
       this.#emptySuppressedAtTokens = undefined;
       return false;
     }
-    const threshold =
-      this.#emptySuppressedAtTokens + Math.max(1000, tailBudgetTokens * 0.25);
+    const threshold = this.#emptySuppressedAtTokens + Math.max(1000, tailBudgetTokens * 0.25);
     if (currentTokens < threshold) return false;
     this.#emptySuppressedAtTokens = undefined;
     this.#refreshArmed = true;

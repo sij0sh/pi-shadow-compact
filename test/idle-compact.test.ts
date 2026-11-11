@@ -22,7 +22,9 @@ const IDLE_CONFIG = {
 
 type TraceRecord = Record<string, unknown> & { event: string };
 
-async function withTraceFile<T>(run: () => Promise<T>): Promise<{ result: T; events: TraceRecord[] }> {
+async function withTraceFile<T>(
+  run: () => Promise<T>,
+): Promise<{ result: T; events: TraceRecord[] }> {
   const dir = await mkdtemp(join(tmpdir(), "shadow-trace-"));
   const path = join(dir, "trace.jsonl");
   const previous = process.env[TRACE_FILE_ENV_VAR];
@@ -142,7 +144,7 @@ describe("idle compaction", () => {
     }
   });
 
-  it("honors the idle opt-out and single-shot mode", async () => {
+  it("honors the idle opt-out", async () => {
     const disabled = await fixture({
       ...IDLE_CONFIG,
       idleCompact: { enabled: false, minimumTokens: 1 },
@@ -153,27 +155,6 @@ describe("idle compaction", () => {
       assert.equal(disabled.registry.calls, 0);
     } finally {
       await disabled.cleanup();
-    }
-
-    const previous = process.env.SHADOW_COMPACT_ROLLING;
-    process.env.SHADOW_COMPACT_ROLLING = "0";
-    try {
-      const single = await fixture({ ...IDLE_CONFIG, idleCompact: { enabled: true, minimumTokens: 1 } });
-      try {
-        await startPreparation(single);
-        const calls = single.registry.calls;
-        single.setBranch([
-          ...single.branch,
-          userEntry("e5", "e4", "follow-up work after the checkpoint with enough words"),
-        ]);
-        await single.emit("agent_settled");
-        assert.equal(single.registry.calls, calls, "single-shot keeps one checkpoint per run");
-      } finally {
-        await single.cleanup();
-      }
-    } finally {
-      if (previous === undefined) delete process.env.SHADOW_COMPACT_ROLLING;
-      else process.env.SHADOW_COMPACT_ROLLING = previous;
     }
   });
 

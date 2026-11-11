@@ -65,10 +65,21 @@ function chain(entries: SessionEntry[]): SessionEntry[] {
 }
 
 test("compactability excludes previous summaries, prompt state, and omitted history", () => {
-  const user = entry({ type: "message", message: { role: "user", content: "recent detail ".repeat(10), timestamp: 0 } });
+  const user = entry({
+    type: "message",
+    message: { role: "user", content: "recent detail ".repeat(10), timestamp: 0 },
+  });
   const assistant = assistantTextEntry("hello");
-  const summary = entry({ type: "compaction", summary: "previous summary ".repeat(5000), firstKeptEntryId: user.id, tokensBefore: 100000 });
-  const prompt = entry({ type: "message", message: { role: "system", content: [{ type: "text", text: "large prompt ".repeat(10000) }] } });
+  const summary = entry({
+    type: "compaction",
+    summary: "previous summary ".repeat(5000),
+    firstKeptEntryId: user.id,
+    tokensBefore: 100000,
+  });
+  const prompt = entry({
+    type: "message",
+    message: { role: "system", content: [{ type: "text", text: "large prompt ".repeat(10000) }] },
+  });
   const metadata = entry({ type: "custom", customType: "checkpoint", data: {} });
   assert.equal(hasCompactableHistory(chain([prompt, user, assistant]), 20000), false);
   assert.equal(hasCompactableHistory(chain([user, assistant, summary, metadata]), 20000), false);
@@ -76,13 +87,35 @@ test("compactability excludes previous summaries, prompt state, and omitted hist
   assert.equal(hasCompactableHistory(chain([old, user, assistant]), 20), true);
   const omit = entry({ type: "context_edit", targetId: old.id, replacement: null });
   assert.equal(hasCompactableHistory(chain([old, user, assistant, omit]), 20), false);
-  assert.equal(hasCompactableHistory(chain([old, user, assistant, summary]), 20), false, "already compacted leaf");
+  assert.equal(
+    hasCompactableHistory(chain([old, user, assistant, summary]), 20),
+    false,
+    "already compacted leaf",
+  );
 });
 
 test("compactability keeps tool results with their preceding assistant call", () => {
   const user = entry({ type: "message", message: { role: "user", content: "task", timestamp: 0 } });
   const call = assistantToolCallEntry("read", { path: "file" });
-  const result = entry({ type: "message", message: { role: "toolResult", toolCallId: "call", toolName: "read", content: [{ type: "text", text: "result ".repeat(1000) }], isError: false, timestamp: 0 } });
-  assert.equal(hasCompactableHistory(chain([user, call, result]), 30), true, "user prefix can be summarized separately");
-  assert.equal(hasCompactableHistory(chain([call, result]), 30), false, "a tool result alone cannot create a disposable prefix");
+  const result = entry({
+    type: "message",
+    message: {
+      role: "toolResult",
+      toolCallId: "call",
+      toolName: "read",
+      content: [{ type: "text", text: "result ".repeat(1000) }],
+      isError: false,
+      timestamp: 0,
+    },
+  });
+  assert.equal(
+    hasCompactableHistory(chain([user, call, result]), 30),
+    true,
+    "user prefix can be summarized separately",
+  );
+  assert.equal(
+    hasCompactableHistory(chain([call, result]), 30),
+    false,
+    "a tool result alone cannot create a disposable prefix",
+  );
 });

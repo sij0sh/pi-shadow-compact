@@ -9,10 +9,10 @@ import {
   waitFor,
   type Fixture,
 } from "./helpers/index-fixture.js";
+import { CHECKPOINT_SCHEMA_VERSION } from "../src/summary.js";
 
 const READY_MESSAGE = "shadow-compact: checkpoint ready; next safe request will use it";
-const DEFERRED_MESSAGE =
-  "shadow-compact: checkpoint still preparing in background";
+const DEFERRED_MESSAGE = "shadow-compact: checkpoint still preparing in background";
 
 const SWAP_CONFIG = {
   prepareThresholdPercent: 60,
@@ -59,7 +59,10 @@ describe("idle swap, emergency hatch, and terminal empty-snapshot failure", () =
       f.release();
       await waitFor(() => f.notifications.includes(READY_MESSAGE));
       assert.equal(f.appendedEntries.length, 1);
-      assert.equal((f.appendedEntries[0]?.data as { version: number }).version, 3);
+      assert.equal(
+        (f.appendedEntries[0]?.data as { version: number }).version,
+        CHECKPOINT_SCHEMA_VERSION,
+      );
     } finally {
       await f.cleanup();
     }
@@ -203,14 +206,19 @@ describe("idle swap, emergency hatch, and terminal empty-snapshot failure", () =
     try {
       await startPreparation(f);
       const before = await f.emit("context", { messages: f.contextMessages() });
-      await writeFile(`${f.agentDir}/settings.json`, JSON.stringify({ compaction: { keepRecentTokens: 1000000 } }));
+      await writeFile(
+        `${f.agentDir}/settings.json`,
+        JSON.stringify({ compaction: { keepRecentTokens: 1000000 } }),
+      );
       f.setPercent(92);
       await f.emit("turn_end");
       await f.emit("agent_settled");
       assert.deepEqual(f.compactCalls, []);
       const after = await f.emit("context", { messages: f.contextMessages() });
       assert.equal(after.messages[0].summary, before.messages[0].summary);
-    } finally { await f.cleanup(); }
+    } finally {
+      await f.cleanup();
+    }
   });
 
   it("rechecks skipped fallbacks after growth without leaving native markers or a latched preparation", async () => {
@@ -236,20 +244,33 @@ describe("idle swap, emergency hatch, and terminal empty-snapshot failure", () =
       await f.emit("turn_end");
       await f.emit("agent_settled");
       assert.deepEqual(f.compactCalls, [{}]);
-    } finally { await f.cleanup(); }
+    } finally {
+      await f.cleanup();
+    }
   });
 
   it("suppresses no-drop preparation with a leading Pi prompt or model entry", async () => {
     const f = await fixture();
     try {
-      f.setBranch([{
-        type: "model_change", id: "model", parentId: null,
-        timestamp: "2026-01-01T00:00:00.000Z", provider: "test", modelId: "test",
-      }, userEntry("e1", "model", "a single user prompt")]);
+      f.setBranch([
+        {
+          type: "model_change",
+          id: "model",
+          parentId: null,
+          timestamp: "2026-01-01T00:00:00.000Z",
+          provider: "test",
+          modelId: "test",
+        },
+        userEntry("e1", "model", "a single user prompt"),
+      ]);
       await f.emit("turn_end");
       await tick();
       await f.emit("agent_settled");
-      assert.equal(f.registry.calls, 0, "invisible preamble entries are not a disposable conversation prefix");
+      assert.equal(
+        f.registry.calls,
+        0,
+        "invisible preamble entries are not a disposable conversation prefix",
+      );
       assert.deepEqual(f.compactCalls, []);
     } finally {
       await f.cleanup();

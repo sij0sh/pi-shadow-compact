@@ -8,7 +8,11 @@ import {
   type SessionBeforeCompactEvent,
 } from "@earendil-works/pi-coding-agent";
 import { buildCoverage } from "./summary.js";
-import { checkpointSummaryTarget, runCheckpointBuilderAgent, runCheckpointVerifierAgent } from "./checkpoint-agent.js";
+import {
+  checkpointSummaryTarget,
+  runCheckpointBuilderAgent,
+  runCheckpointVerifierAgent,
+} from "./checkpoint-agent.js";
 import type { ModelPair, ShadowCompactConfig } from "./config.js";
 import { sanitizeForContext } from "./normalize.js";
 import { SessionHistoryIndex } from "./session-reader.js";
@@ -19,7 +23,10 @@ import { completeWithSummaryTrace } from "./summary-trace.js";
 import { traceEvent } from "./trace.js";
 
 class IncompleteNativeSummary extends Error {
-  constructor(readonly draft: string, readonly maxTokens: number) {
+  constructor(
+    readonly draft: string,
+    readonly maxTokens: number,
+  ) {
     super("Native summary hit the token cap");
   }
 }
@@ -36,14 +43,22 @@ export async function compactWithRecovery(
   const { preparation, signal } = event;
   // Empty synthetic preparations have no evidence to summarize. Virtual models
   // must remain with Pi, whose runtime routes before computing summary budgets.
-  if (!model || model.api === "pi-virtual" ||
-      (!preparation.messagesToSummarize.length && !preparation.turnPrefixMessages.length)) return;
+  if (
+    !model ||
+    model.api === "pi-virtual" ||
+    (!preparation.messagesToSummarize.length && !preparation.turnPrefixMessages.length)
+  )
+    return;
   const branch = event.branchEntries.slice();
   const leafId = branch.at(-1)?.id ?? "";
   const sessionId = ctx.sessionManager.getSessionId();
-  const settings = SettingsManager.create(ctx.cwd, undefined, { projectTrusted: ctx.isProjectTrusted() });
+  const settings = SettingsManager.create(ctx.cwd, undefined, {
+    projectTrusted: ctx.isProjectTrusted(),
+  });
   const nativeUsages: Usage[] = [];
-  let nativeStage: "native-history" | "native-prefix" = preparation.messagesToSummarize.length ? "native-history" : "native-prefix";
+  let nativeStage: "native-history" | "native-prefix" = preparation.messagesToSummarize.length
+    ? "native-history"
+    : "native-prefix";
   // Pi skips extension-owned details on the next compaction. Carry our file
   // lists explicitly so wrapping a successful native call does not lose them.
   const previous = getLatestCompactionEntry(branch);
@@ -63,30 +78,48 @@ export async function compactWithRecovery(
   }
   try {
     return await compact(
-      { ...preparation, fileOps }, model, undefined, undefined, event.customInstructions, signal,
+      { ...preparation, fileOps },
+      model,
+      undefined,
+      undefined,
+      event.customInstructions,
+      signal,
       config.thinkingLevel ?? "low",
       async (requestModel, context, options) => {
         signal.throwIfAborted();
         let stream!: ReturnType<typeof ctx.modelRegistry.streamSimple>;
-        const response = await completeWithSummaryTrace({ complete: (model, context, options) => {
-          stream = ctx.modelRegistry.streamSimple(model, context, options);
-          return stream.result();
-        } }, requestModel, context, { ...settings.getProviderRetrySettings(), ...options }, {
-          attemptId, stage: nativeStage, round: nativeUsages.length + 1,
-        });
+        const response = await completeWithSummaryTrace(
+          {
+            complete: (model, context, options) => {
+              stream = ctx.modelRegistry.streamSimple(model, context, options);
+              return stream.result();
+            },
+          },
+          requestModel,
+          context,
+          { ...settings.getProviderRetrySettings(), ...options },
+          {
+            attemptId,
+            stage: nativeStage,
+            round: nativeUsages.length + 1,
+          },
+        );
         nativeUsages.push(response.usage);
         signal.throwIfAborted();
         if (response.stopReason === "length") {
           // Capture visible prose only. Never execute partial calls or forward
           // thinking, provider metadata, response bodies, or error payloads.
           throw new IncompleteNativeSummary(
-            sanitizeForContext(contentText(response.content), ctx.cwd), options?.maxTokens ?? 0,
+            sanitizeForContext(contentText(response.content), ctx.cwd),
+            options?.maxTokens ?? 0,
           );
         }
-        if (response.stopReason === "stop" && preparation.isSplitTurn) nativeStage = "native-prefix";
+        if (response.stopReason === "stop" && preparation.isSplitTurn)
+          nativeStage = "native-prefix";
         return stream;
       },
-      undefined, settings.getRetrySettings(),
+      undefined,
+      settings.getRetrySettings(),
     );
   } catch (error) {
     if (!(error instanceof IncompleteNativeSummary)) throw error;
@@ -94,37 +127,60 @@ export async function compactWithRecovery(
     const summaryModel = resolveSummarizerModel(ctx, config, defaultModel);
     const verifierModel = resolveVerificationModel(ctx, config, defaultModel);
     const maxTokens = Math.min(
-      error.maxTokens, config.summaryMaxTokens ?? Infinity,
+      error.maxTokens,
+      config.summaryMaxTokens ?? Infinity,
       summaryModel.maxTokens > 0 ? summaryModel.maxTokens : Infinity,
       verifierModel.maxTokens > 0 ? verifierModel.maxTokens : Infinity,
     );
     if (maxTokens < 1) throw new Error("Native summary recovery has no output allowance");
     const targetSummaryChars = checkpointSummaryTarget(summaryModel, maxTokens);
     const previousSummary = preparation.previousSummary;
-    const makeIndex = () => new SessionHistoryIndex({
-      branch, cwd: ctx.cwd,
-      ...(previousSummary ? { previousCheckpointSummary: previousSummary } : {}),
-    });
+    const makeIndex = () =>
+      new SessionHistoryIndex({
+        branch,
+        cwd: ctx.cwd,
+        ...(previousSummary ? { previousCheckpointSummary: previousSummary } : {}),
+      });
     const request = {
-      signal, maxTokens, targetSummaryChars, attemptId,
+      signal,
+      maxTokens,
+      targetSummaryChars,
+      attemptId,
       // Lower only private summary reasoning; do not mutate acting settings.
       thinkingLevel: "low" as const,
       ...(event.customInstructions ? { customInstructions: event.customInstructions } : {}),
     };
-    traceEvent("summary_recovery", { attemptId, stage: "started", reason: "length", maxTokens, targetSummaryChars });
+    traceEvent("summary_recovery", {
+      attemptId,
+      stage: "started",
+      reason: "length",
+      maxTokens,
+      targetSummaryChars,
+    });
     let stage = "builder";
     try {
       const built = await runCheckpointBuilderAgent(ctx, makeIndex(), config, {
-        ...request, model: summaryModel, incompleteDraft: error.draft,
+        ...request,
+        model: summaryModel,
+        incompleteDraft: error.draft,
       });
       const coverage = buildCoverage({
-        sourceStartEntryId: null, coverageEndEntryId: built.coverageEndEntryId,
-        preparedAtLeafId: leafId, publishedAtLeafId: leafId,
+        coverageEndEntryId: built.coverageEndEntryId,
+        preparedAtLeafId: leafId,
+        publishedAtLeafId: leafId,
       });
       stage = "verifier";
-      const verified = await runCheckpointVerifierAgent(ctx, makeIndex(), built.checkpoint, coverage, config, {
-        ...request, model: verifierModel,
-      });
+      const verified = await runCheckpointVerifierAgent(
+        ctx,
+        makeIndex(),
+        built.checkpoint,
+        coverage,
+        config,
+        {
+          ...request,
+          model: verifierModel,
+        },
+      );
       stage = "freshness";
       signal.throwIfAborted();
       const current = ctx.sessionManager.getBranch();
@@ -148,14 +204,31 @@ export async function compactWithRecovery(
       }
       const modifiedFiles = [...new Set([...fileOps.written, ...fileOps.edited])].sort();
       const readFiles = [...fileOps.read].filter((path) => !modifiedFiles.includes(path)).sort();
-      const usage = nativeUsages.reduce((total, item) => combineUsage(total, item), combineUsage(built.usage, verified.usage));
-      traceEvent("summary_recovery", { attemptId, stage: "completed", reason: "length", maxTokens, summaryChars: verified.summary.length });
+      const usage = nativeUsages.reduce(
+        (total, item) => combineUsage(total, item),
+        combineUsage(built.usage, verified.usage),
+      );
+      traceEvent("summary_recovery", {
+        attemptId,
+        stage: "completed",
+        reason: "length",
+        maxTokens,
+        summaryChars: verified.summary.length,
+      });
       return {
-        summary: verified.summary, firstKeptEntryId: preparation.firstKeptEntryId,
-        tokensBefore: preparation.tokensBefore, usage, details: { readFiles, modifiedFiles },
+        summary: verified.summary,
+        firstKeptEntryId: preparation.firstKeptEntryId,
+        tokensBefore: preparation.tokensBefore,
+        usage,
+        details: { readFiles, modifiedFiles },
       };
     } catch (failure) {
-      traceEvent("summary_recovery", { attemptId, stage: "failed", reason: signal.aborted ? "cancelled" : stage, maxTokens });
+      traceEvent("summary_recovery", {
+        attemptId,
+        stage: "failed",
+        reason: signal.aborted ? "cancelled" : stage,
+        maxTokens,
+      });
       throw failure;
     }
   }

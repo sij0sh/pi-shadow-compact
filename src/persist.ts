@@ -54,7 +54,6 @@ export interface PersistedShadowCheckpoint {
   structured: Checkpoint;
   coverage: CheckpointCoverage;
   prompts: PromptVersions;
-  generatedAt: number;
 }
 
 export type PreparedResult = PersistedShadowCheckpoint;
@@ -84,7 +83,6 @@ function isNonEmptyString(value: unknown): value is string {
 function isCheckpointCoverage(value: unknown): value is CheckpointCoverage {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const coverage = value as Record<string, unknown>;
-  if (coverage.sourceStartEntryId !== null && typeof coverage.sourceStartEntryId !== "string") return false;
   for (const key of ["coverageEndEntryId", "preparedAtLeafId", "publishedAtLeafId"] as const) {
     if (!isNonEmptyString(coverage[key])) return false;
   }
@@ -117,18 +115,32 @@ export function isPersistedShadowCheckpoint(value: unknown): value is PersistedS
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const candidate = value as Record<string, unknown>;
   if (candidate.version !== CHECKPOINT_SCHEMA_VERSION) return false;
-  for (const key of ["checkpointId", "sessionId", "summary", "firstKeptEntryId", "leafId"] as const) {
+  for (const key of [
+    "checkpointId",
+    "sessionId",
+    "summary",
+    "firstKeptEntryId",
+    "leafId",
+  ] as const) {
     if (typeof candidate[key] !== "string" || (candidate[key] as string).length === 0) return false;
   }
   if (candidate.latestCompactionId !== null && typeof candidate.latestCompactionId !== "string") {
     return false;
   }
-  if (typeof candidate.contextTokensBefore !== "number" || !Number.isFinite(candidate.contextTokensBefore)) {
+  if (
+    typeof candidate.contextTokensBefore !== "number" ||
+    !Number.isFinite(candidate.contextTokensBefore)
+  ) {
     return false;
   }
-  if (typeof candidate.createdAt !== "number" || !Number.isFinite(candidate.createdAt)) return false;
+  if (typeof candidate.createdAt !== "number" || !Number.isFinite(candidate.createdAt))
+    return false;
   if (!isUsage(candidate.usage)) return false;
-  if (!candidate.details || typeof candidate.details !== "object" || Array.isArray(candidate.details)) {
+  if (
+    !candidate.details ||
+    typeof candidate.details !== "object" ||
+    Array.isArray(candidate.details)
+  ) {
     return false;
   }
   const details = candidate.details as Record<string, unknown>;
@@ -136,7 +148,7 @@ export function isPersistedShadowCheckpoint(value: unknown): value is PersistedS
   if (!isStructuredCheckpoint(candidate.structured)) return false;
   if (!isCheckpointCoverage(candidate.coverage)) return false;
   if (!isPromptVersions(candidate.prompts)) return false;
-  return typeof candidate.generatedAt === "number" && Number.isFinite(candidate.generatedAt);
+  return true;
 }
 
 /**
@@ -236,7 +248,10 @@ export function checkpointStalenessReason(
   options: { requireFirstKept?: boolean } = {},
 ): CheckpointStalenessReason | undefined {
   if (checkpoint.sessionId !== sessionId) return "session-mismatch";
-  if (options.requireFirstKept !== false && !branch.some((entry) => entry.id === checkpoint.firstKeptEntryId)) {
+  if (
+    options.requireFirstKept !== false &&
+    !branch.some((entry) => entry.id === checkpoint.firstKeptEntryId)
+  ) {
     return "missing-first-kept";
   }
   if (!branch.some((entry) => entry.id === checkpoint.leafId)) return "missing-leaf";

@@ -17,17 +17,11 @@ import {
   runCheckpointBuilderAgent,
   runCheckpointVerifierAgent,
 } from "./checkpoint-agent.js";
-import {
-  buildCoverage,
-  CHECKPOINT_SCHEMA_VERSION,
-  currentPromptVersions,
-} from "./summary.js";
+import { buildCoverage, CHECKPOINT_SCHEMA_VERSION, currentPromptVersions } from "./summary.js";
 import {
   DEFAULT_NATIVE_FALLBACK_THRESHOLD_PERCENT,
   DEFAULT_RECENT_TURNS,
   isBelowPrepare,
-  isObserveMode,
-  isRollingEnabled,
   loadConfig,
   type ModelPair,
   type ShadowCompactConfig,
@@ -45,11 +39,7 @@ import { sanitizeForContext } from "./normalize.js";
 import { fileDetails, hasCompactableHistory } from "./working-context.js";
 import { SessionHistoryIndex } from "./session-reader.js";
 import { ShadowCompactStateController } from "./state.js";
-import {
-  combineUsage,
-  resolveSummarizerModel,
-  resolveVerificationModel,
-} from "./summary.js";
+import { combineUsage, resolveSummarizerModel, resolveVerificationModel } from "./summary.js";
 import { COMPACTION_CAPABILITY, traceEvent } from "./trace.js";
 import { estimateTokens } from "./turns.js";
 import { contextSwapDropCount, hasOrphanedToolResult } from "./swap.js";
@@ -64,8 +54,7 @@ import {
 import { randomUUID } from "node:crypto";
 
 const READY_MESSAGE = "shadow-compact: checkpoint ready; next safe request will use it";
-const DEFERRED_MESSAGE =
-  "shadow-compact: checkpoint still preparing in background";
+const DEFERRED_MESSAGE = "shadow-compact: checkpoint still preparing in background";
 const MANUAL_PREPARE_MESSAGE = "shadow-compact: preparing a fresh checkpoint for /compact";
 
 /**
@@ -123,7 +112,10 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     description: "Run pure Pi compaction; Shadow token-cap recovery is disabled",
     handler: async (_args, cmdCtx) => {
       if (!canCompact(cmdCtx)) {
-        cmdCtx.ui.notify("shadow-compact: nothing to compact; recent history is still within Pi's retained tail", "info");
+        cmdCtx.ui.notify(
+          "shadow-compact: nothing to compact; recent history is still within Pi's retained tail",
+          "info",
+        );
         return;
       }
       nativeMode = "escape";
@@ -182,7 +174,10 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         generation: state.generation,
         action: "failed",
         checkpointId: result.checkpointId,
-        error: sanitizeForContext(error instanceof Error ? error.message : String(error), "").slice(0, 1400),
+        error: sanitizeForContext(error instanceof Error ? error.message : String(error), "").slice(
+          0,
+          1400,
+        ),
       });
       return;
     }
@@ -204,7 +199,6 @@ export default function shadowCompact(pi: ExtensionAPI): void {
   // session_start (initial load, reload, resume): raw history is the evidence,
   // the checkpoint is the replaceable projection over it.
   const restorePersistedCheckpoint = (ctx: ExtensionContext): void => {
-    if (isObserveMode()) return;
     let branch: SessionEntry[];
     let sessionId: string;
     try {
@@ -239,7 +233,11 @@ export default function shadowCompact(pi: ExtensionAPI): void {
   // An emergency-queued fallback recompacts only while
   // the spike is still present: context may have recovered while the run
   // drained, and a stale hatch must not compact a healthy working set.
-  const settle = (ctx: ExtensionContext, deferredNotice: boolean, nativeThreshold?: number): void => {
+  const settle = (
+    ctx: ExtensionContext,
+    deferredNotice: boolean,
+    nativeThreshold?: number,
+  ): void => {
     if (!ctx.isIdle()) return;
     if (state.preparing) {
       // A replacement is still being built. Its completion persists once Pi
@@ -268,7 +266,9 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       }
       if (!canCompact(ctx)) {
         traceEvent("native_fallback", {
-          turn: turnCount, generation: state.generation, reason: pendingReason,
+          turn: turnCount,
+          generation: state.generation,
+          reason: pendingReason,
           action: "skipped-no-prefix",
         });
         // Skipping replaces the failure event that would otherwise re-arm an
@@ -284,7 +284,9 @@ export default function shadowCompact(pi: ExtensionAPI): void {
   };
 
   const reportError = (ctx: ExtensionContext, error: unknown) => {
-    const message = sanitizeForContext(error instanceof Error ? error.message : String(error), "").replace(/[\x00-\x1f\x7f]/g, " ").slice(0, 1400);
+    const message = sanitizeForContext(error instanceof Error ? error.message : String(error), "")
+      .replace(/[\x00-\x1f\x7f]/g, " ")
+      .slice(0, 1400);
     if (reportedError === message) return;
     reportedError = message;
     ctx.ui.notify(`shadow-compact: ${message}`, "error");
@@ -357,9 +359,10 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       // queuing a native fallback instead of churning every turn; the
       // recorded size re-arms once the working set grows meaningfully.
       const lastEntry = branch[branch.length - 1];
-      const hypothetical = branch.length > 0 && lastEntry
-        ? planSwap(branch, lastEntry.id, config.recentTurns)
-        : undefined;
+      const hypothetical =
+        branch.length > 0 && lastEntry
+          ? planSwap(branch, lastEntry.id, config.recentTurns)
+          : undefined;
       if (
         branch.length === 0 ||
         lastEntry?.type === "compaction" ||
@@ -401,20 +404,25 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       const model = resolveSummarizerModel(ctx, config, defaultModel);
       const maxTokens = config.summaryMaxTokens;
       const verifierModel = resolveVerificationModel(ctx, config, defaultModel);
-      const targetSummaryChars = Math.min(checkpointSummaryTarget(model, maxTokens), checkpointSummaryTarget(verifierModel, maxTokens));
-      const makeIndex = () => new SessionHistoryIndex({
-        branch,
-        cwd: ctx.cwd,
-        previousCoverageEndEntryId: previousCoverageEnd,
-        ...(previousSummary ? { previousCheckpointSummary: previousSummary } : {}),
-      });
+      const targetSummaryChars = Math.min(
+        checkpointSummaryTarget(model, maxTokens),
+        checkpointSummaryTarget(verifierModel, maxTokens),
+      );
+      const makeIndex = () =>
+        new SessionHistoryIndex({
+          branch,
+          cwd: ctx.cwd,
+          previousCoverageEndEntryId: previousCoverageEnd,
+          ...(previousSummary ? { previousCheckpointSummary: previousSummary } : {}),
+        });
       const builderIndex = makeIndex();
       const outcome = await runCheckpointBuilderAgent(ctx, builderIndex, config, {
         signal: controller.signal,
         ...(customInstructions ? { customInstructions } : {}),
         model,
         ...(maxTokens !== undefined ? { maxTokens } : {}),
-        targetSummaryChars, attemptId,
+        targetSummaryChars,
+        attemptId,
         thinkingLevel: config.thinkingLevel ?? "low",
       });
       if (bailIfStale()) return;
@@ -426,28 +434,34 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       const verifierThinking = config.verificationThinkingLevel ?? config.thinkingLevel ?? "low";
       const verifierStartedWallMs = Date.now();
       const draftCoverage = buildCoverage({
-        sourceStartEntryId: null,
         coverageEndEntryId: outcome.coverageEndEntryId,
         preparedAtLeafId: leafIdAtStart,
         publishedAtLeafId: leafIdAtStart,
       });
-      const verified = await runCheckpointVerifierAgent(ctx, makeIndex(), outcome.checkpoint, draftCoverage, config, {
-        signal: controller.signal,
-        ...(customInstructions ? { customInstructions } : {}),
-        model: verifierModel,
-        ...(maxTokens !== undefined ? { maxTokens } : {}),
-        targetSummaryChars, attemptId,
-        thinkingLevel: verifierThinking,
-      });
+      const verified = await runCheckpointVerifierAgent(
+        ctx,
+        makeIndex(),
+        outcome.checkpoint,
+        draftCoverage,
+        config,
+        {
+          signal: controller.signal,
+          ...(customInstructions ? { customInstructions } : {}),
+          model: verifierModel,
+          ...(maxTokens !== undefined ? { maxTokens } : {}),
+          targetSummaryChars,
+          attemptId,
+          thinkingLevel: verifierThinking,
+        },
+      );
       if (bailIfStale()) return;
       const verifierWallMs = Date.now() - verifierStartedWallMs;
 
       const usage = combineUsage(outcome.usage, verified.usage);
 
       const current = ctx.sessionManager.getBranch();
-      const publishedLeaf = ctx.sessionManager.getLeafId() ?? (current[current.length - 1]?.id ?? "");
+      const publishedLeaf = ctx.sessionManager.getLeafId() ?? current[current.length - 1]?.id ?? "";
       const coverage = buildCoverage({
-        sourceStartEntryId: null,
         coverageEndEntryId: verified.coverageEndEntryId,
         preparedAtLeafId: leafIdAtStart,
         publishedAtLeafId: publishedLeaf,
@@ -467,11 +481,11 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         createdAt: Date.now(),
         coverage,
         structured: verified.checkpoint,
-        generatedAt: Date.now(),
         prompts: currentPromptVersions(),
       };
       traceEvent("prepare_completed", {
-        attemptId, targetSummaryChars,
+        attemptId,
+        targetSummaryChars,
         turn: turnCount,
         generation,
         summaryChars: verified.summary.length,
@@ -510,7 +524,9 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       // Ownership-checked: a superseded completion no-ops instead of aborting a newer prepare.
       const replaced = Boolean(state.published);
       if (!valid || !state.publish(generation, result)) {
-        failPrepare(valid ? "superseded" : "stale-branch", { coverageEnd: coverage.coverageEndEntryId });
+        failPrepare(valid ? "superseded" : "stale-branch", {
+          coverageEnd: coverage.coverageEndEntryId,
+        });
         return;
       }
       traceEvent("checkpoint_published", {
@@ -539,7 +555,14 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         });
       }
       if (state.fail(generation)) {
-        traceEvent("prepare_failed", { generation, reason: controller.signal.aborted ? "aborted" : "model-error", error: sanitizeForContext(error instanceof Error ? error.message : String(error), "").slice(0, 1400) });
+        traceEvent("prepare_failed", {
+          generation,
+          reason: controller.signal.aborted ? "aborted" : "model-error",
+          error: sanitizeForContext(
+            error instanceof Error ? error.message : String(error),
+            "",
+          ).slice(0, 1400),
+        });
       }
       settle(ctx, false, config.nativeFallbackThresholdPercent);
     }
@@ -559,7 +582,6 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     triggerEntryId?: string,
   ): boolean => {
     const manual = reason === "command";
-    if (!manual && !isRollingEnabled() && state.published) return false;
     if (state.preparing || state.pendingNativeFallback) return false;
     const usage = ctx.getContextUsage();
     if (!manual && !state.refreshArmed) {
@@ -574,7 +596,6 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         contextTokens: usage?.tokens ?? null,
         contextPercent: usage?.percent ?? null,
         prepareThreshold: config.prepareThresholdPercent,
-        prepareThresholdTokens: config.softCompactThresholdTokens ?? null,
       });
       return false;
     }
@@ -590,7 +611,6 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       contextTokens: usage?.tokens ?? null,
       contextPercent: usage?.percent ?? null,
       prepareThreshold: config.prepareThresholdPercent,
-      prepareThresholdTokens: config.softCompactThresholdTokens ?? null,
     });
     traceEvent("prepare_started", {
       turn: turnCount,
@@ -599,7 +619,6 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       contextTokens: usage?.tokens ?? null,
       contextPercent: usage?.percent ?? null,
       prepareThreshold: config.prepareThresholdPercent,
-      prepareThresholdTokens: config.softCompactThresholdTokens ?? null,
       branchEntries: branch.length,
       leafId: branch.at(-1)?.id ?? null,
       overlapStart: retainedAnchor ?? null,
@@ -607,22 +626,32 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     });
     if (manual) ctx.ui.notify("shadow-compact: checkpoint preparing in background", "info");
     // Fire and forget: the live agent run continues immediately.
-    void prepare(ctx, config, branch, prepared.controller, prepared.generation, retainedAnchor, customInstructions);
+    void prepare(
+      ctx,
+      config,
+      branch,
+      prepared.controller,
+      prepared.generation,
+      retainedAnchor,
+      customInstructions,
+    );
     return true;
   };
 
   pi.registerCommand("shadow-compact", {
     description: "Prepare a verified checkpoint in background without interrupting acting work",
     handler: async (args, ctx) => {
-      if (isObserveMode()) {
-        ctx.ui.notify("shadow-compact: disabled in observe mode", "info");
-        return;
-      }
       const branch = ctx.sessionManager.getBranch().slice();
-      const config = await configFor(ctx).catch((error: unknown) => { reportError(ctx, error); return undefined; });
+      const config = await configFor(ctx).catch((error: unknown) => {
+        reportError(ctx, error);
+        return undefined;
+      });
       if (!config || isContextStale(ctx)) return;
       if (state.preparing) {
-        ctx.ui.notify("shadow-compact: already preparing; existing attempt and instructions unchanged. Run /shadow-compact again after completion to refresh.", "info");
+        ctx.ui.notify(
+          "shadow-compact: already preparing; existing attempt and instructions unchanged. Run /shadow-compact again after completion to refresh.",
+          "info",
+        );
         return;
       }
       if (!requestCheckpoint(ctx, config, branch, "command", args.trim())) {
@@ -704,7 +733,9 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     recentTurns: number,
   ): ContextEvent["messages"] => {
     const branch = ctx.sessionManager.getBranch();
-    const messages = buildSessionProjection(branch).messages.filter((message) => message.role !== "system");
+    const messages = buildSessionProjection(branch).messages.filter(
+      (message) => message.role !== "system",
+    );
     const result = state.published;
     if (!result || !resultIsCurrent(ctx, result)) return messages;
     const built = buildWorkingContext({
@@ -738,7 +769,12 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     const firstKeptEntryId = event.preparation.firstKeptEntryId;
     if (!coversCompactionPrefix(ctx, result, firstKeptEntryId)) return undefined;
     const branch = ctx.sessionManager.getBranch();
-    const candidate = projectCheckpoint(branch, result.summary, firstKeptEntryId, event.preparation.tokensBefore);
+    const candidate = projectCheckpoint(
+      branch,
+      result.summary,
+      firstKeptEntryId,
+      event.preparation.tokensBefore,
+    );
     if (hasOrphanedToolResult(candidate)) return undefined;
     const before = estimatedTokens(messagesBefore);
     const after = estimatedTokens(candidate);
@@ -746,10 +782,20 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     // even when it drops entries from canonical history. Let Pi summarize
     // natively rather than reporting another successful non-reduction.
     if (after >= before) {
-      traceEvent("compaction_fallback", { reason: "no-reduction", firstKeptEntryId, estimatedTokensBefore: before, estimatedTokensAfter: after });
+      traceEvent("compaction_fallback", {
+        reason: "no-reduction",
+        firstKeptEntryId,
+        estimatedTokensBefore: before,
+        estimatedTokensAfter: after,
+      });
       return undefined;
     }
-    traceEvent("compaction_served", { reason: event.reason, firstKeptEntryId, estimatedTokensBefore: before, estimatedTokensAfter: after });
+    traceEvent("compaction_served", {
+      reason: event.reason,
+      firstKeptEntryId,
+      estimatedTokensBefore: before,
+      estimatedTokensAfter: after,
+    });
     return {
       compaction: {
         summary: result.summary,
@@ -769,7 +815,11 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     const latest = getLatestCompactionEntry(ctx.sessionManager.getBranch());
     const details = latest?.details as { shadowCheckpoint?: { checkpointId?: string } } | undefined;
     if (latest && details?.shadowCheckpoint?.checkpointId === result.checkpointId) {
-      traceEvent("checkpoint_installed", { checkpointId: result.checkpointId, compactionId: latest.id, firstKeptEntryId: latest.firstKeptEntryId });
+      traceEvent("checkpoint_installed", {
+        checkpointId: result.checkpointId,
+        compactionId: latest.id,
+        firstKeptEntryId: latest.firstKeptEntryId,
+      });
       state.reset();
       nativeMode = "none";
       ctx.ui.notify("shadow-compact: checkpoint installed", "info");
@@ -787,15 +837,19 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     summary: string,
     firstKeptEntryId: string,
     tokensBefore: number,
-  ): ContextEvent["messages"] => buildSessionProjection([...branch, {
-    type: "compaction",
-    id: randomUUID(),
-    parentId: branch[branch.length - 1]?.id ?? null,
-    timestamp: new Date().toISOString(),
-    summary,
-    firstKeptEntryId,
-    tokensBefore,
-  }]).messages.filter((message) => message.role !== "system");
+  ): ContextEvent["messages"] =>
+    buildSessionProjection([
+      ...branch,
+      {
+        type: "compaction",
+        id: randomUUID(),
+        parentId: branch[branch.length - 1]?.id ?? null,
+        timestamp: new Date().toISOString(),
+        summary,
+        firstKeptEntryId,
+        tokensBefore,
+      },
+    ]).messages.filter((message) => message.role !== "system");
 
   const estimatedTokens = (messages: ContextEvent["messages"]): number =>
     messages.reduce((total, message) => total + estimateMessageTokens(message), 0);
@@ -829,7 +883,9 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     const beforeMessages = event.context.contextMessages;
     const before = beforeMessages.filter((message) => message.role !== "system");
     const built = buildWorkingContext({
-      checkpoint: { summary: result.summary, coverage }, branch, messages: before,
+      checkpoint: { summary: result.summary, coverage },
+      branch,
+      messages: before,
       minimumRecentTurns: recentTurns,
       retainedAnchor: result.firstKeptEntryId,
     });
@@ -837,14 +893,34 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     const firstKeptEntryId = built.plan.swapStartEntryId;
     const candidate = projectCheckpoint(branch, result.summary, firstKeptEntryId, 0);
     // Compare canonical context, not the request-local context already served.
-    if (hasOrphanedToolResult(candidate) || estimatedTokens(candidate) >= estimatedTokens(before)) return;
+    if (hasOrphanedToolResult(candidate) || estimatedTokens(candidate) >= estimatedTokens(before))
+      return;
     // Pi's projector must produce precisely the proved summary + suffix.
     if (JSON.stringify(candidate.slice(1)) !== JSON.stringify(built.messages.slice(1))) return;
-    traceEvent("checkpoint_install_proposed", { checkpointId: result.checkpointId, firstKeptEntryId, overlapStart: result.firstKeptEntryId, coverageEnd: coverage.coverageEndEntryId });
-    return { entries: [{
-      type: "compaction", summary: result.summary, firstKeptEntryId, usage: result.usage,
-      details: { ...result.details, shadowCheckpoint: { checkpointId: result.checkpointId, coverage, retainedAnchor: result.firstKeptEntryId } },
-    }] };
+    traceEvent("checkpoint_install_proposed", {
+      checkpointId: result.checkpointId,
+      firstKeptEntryId,
+      overlapStart: result.firstKeptEntryId,
+      coverageEnd: coverage.coverageEndEntryId,
+    });
+    return {
+      entries: [
+        {
+          type: "compaction",
+          summary: result.summary,
+          firstKeptEntryId,
+          usage: result.usage,
+          details: {
+            ...result.details,
+            shadowCheckpoint: {
+              checkpointId: result.checkpointId,
+              coverage,
+              retainedAnchor: result.firstKeptEntryId,
+            },
+          },
+        },
+      ],
+    };
   };
 
   pi.on("session_start", (_event, ctx) => {
@@ -858,7 +934,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
   });
 
   pi.on("turn_end", async (event, ctx) => {
-    if (!isObserveMode()) observeInstalledCheckpoint(ctx);
+    observeInstalledCheckpoint(ctx);
     turnCount += 1;
     const triggerBranch = ctx.sessionManager.getBranch().slice();
     const usage = ctx.getContextUsage();
@@ -882,9 +958,6 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       preparing: Boolean(state.preparing),
       refreshArmed: state.refreshArmed,
     });
-    // Observe-only instrumented control: the turn_usage series above is the
-    // whole point; summaries, swaps, and compactions stay disabled.
-    if (isObserveMode()) return;
     const config = await configFor(ctx).catch((error: unknown) => {
       configErrorReported = true;
       reportError(ctx, error);
@@ -898,16 +971,11 @@ export default function shadowCompact(pi: ExtensionAPI): void {
 
     // Never invoke manual compaction here. A ready checkpoint can install
     // through the boundary draft above; otherwise this event only prepares.
-    // Single-shot mode keeps one checkpoint per run: while anything is
-    // published, no refresh starts (rolling replaces it instead).
-    if (!isRollingEnabled() && state.published) return;
-
     dropStalePublishedCheckpoint(ctx);
 
     if (
-      isRollingEnabled() &&
       config &&
-      isBelowPrepare({ tokens: usage?.tokens, percent }, config) &&
+      isBelowPrepare({ percent }, config) &&
       state.published &&
       state.publishedSwapped
     ) {
@@ -976,7 +1044,7 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       }
     }
 
-    if (!config || isBelowPrepare({ tokens: usage?.tokens, percent }, config)) {
+    if (!config || isBelowPrepare({ percent }, config)) {
       return;
     }
 
@@ -987,7 +1055,10 @@ export default function shadowCompact(pi: ExtensionAPI): void {
   // ensure a fresh extension checkpoint exists; it activates for the next
   // context request. Freshness is coverage-anchored (leaf vs coverage end),
   // and the shared refresh gate keeps consecutive settles from churning.
-  const maybeIdleCompact = (ctx: ExtensionContext, config: ShadowCompactConfig | undefined): void => {
+  const maybeIdleCompact = (
+    ctx: ExtensionContext,
+    config: ShadowCompactConfig | undefined,
+  ): void => {
     if (!config?.idleCompact.enabled) return;
     if (!ctx.isIdle()) return;
     if (state.preparing || state.pendingNativeFallback) return;
@@ -1004,29 +1075,29 @@ export default function shadowCompact(pi: ExtensionAPI): void {
   };
 
   pi.on("agent_before_settle", async (event, ctx) => {
-    if (isObserveMode()) return;
     const config = await configFor(ctx).catch(() => undefined);
     return installAtBoundary(event, ctx, config?.recentTurns ?? DEFAULT_RECENT_TURNS);
   });
 
   pi.on("turn_start", (_event, ctx) => {
-    if (isObserveMode()) return;
     observeInstalledCheckpoint(ctx);
     dropStalePublishedCheckpoint(ctx);
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
-    if (isObserveMode()) return;
     observeInstalledCheckpoint(ctx);
     // A broken config must not block the idle path: fall back to the default
     // emergency threshold for the staleness recheck (turn_end already reports it).
     const config = await configFor(ctx).catch(() => undefined);
-    settle(ctx, true, config?.nativeFallbackThresholdPercent ?? DEFAULT_NATIVE_FALLBACK_THRESHOLD_PERCENT);
+    settle(
+      ctx,
+      true,
+      config?.nativeFallbackThresholdPercent ?? DEFAULT_NATIVE_FALLBACK_THRESHOLD_PERCENT,
+    );
     maybeIdleCompact(ctx, config);
   });
 
   pi.on("context", async (event, ctx) => {
-    if (isObserveMode()) return undefined;
     observeInstalledCheckpoint(ctx);
     dropStalePublishedCheckpoint(ctx);
     const config = await configFor(ctx).catch(() => undefined);
@@ -1039,22 +1110,41 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     let route = "entered";
     let ownedPreparation = false;
     const requestedNative = nativeMode;
-    const trigger = requestedNative === "fallback" ? "emergency" : requestedNative === "escape" ? "escape" : event.reason;
+    const trigger =
+      requestedNative === "fallback"
+        ? "emergency"
+        : requestedNative === "escape"
+          ? "escape"
+          : event.reason;
     const recordRoute = (selected: string): void => {
       route = selected;
       compactTrace = { attemptId, sessionId, route };
-      traceEvent("compaction_route", { capability: COMPACTION_CAPABILITY, attemptId, sessionId, reason: event.reason, trigger, route });
+      traceEvent("compaction_route", {
+        capability: COMPACTION_CAPABILITY,
+        attemptId,
+        sessionId,
+        reason: event.reason,
+        trigger,
+        route,
+      });
     };
     // Diagnostics and notification failures must never release an owned request
     // to Pi's ignored-hook-exception fall-through.
     const notify = (message: string): void => {
-      try { ctx.ui.notify(message, "warning"); }
-      catch { traceEvent("compaction_outcome", { attemptId, sessionId, stage: "notification", outcome: "failed" }); }
+      try {
+        ctx.ui.notify(message, "warning");
+      } catch {
+        traceEvent("compaction_outcome", {
+          attemptId,
+          sessionId,
+          stage: "notification",
+          outcome: "failed",
+        });
+      }
     };
     recordRoute("entered");
     try {
       sessionId = ctx.sessionManager.getSessionId();
-      if (isObserveMode()) { recordRoute("observe"); return; }
       if (requestedNative === "escape") {
         // Escape is single-shot; fallback stays armed until an outcome event.
         nativeMode = "none";
@@ -1065,7 +1155,9 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       const config = await configFor(ctx).catch(() => undefined);
       if (!config) {
         recordRoute("invalid-config");
-        notify("shadow-compact: configuration unavailable; using pure Pi compaction without token-cap recovery");
+        notify(
+          "shadow-compact: configuration unavailable; using pure Pi compaction without token-cap recovery",
+        );
         return;
       }
       if (!ctx.model || ctx.model.api === "pi-virtual") {
@@ -1073,21 +1165,45 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         return;
       }
       const nativeCompaction = async (): Promise<SessionBeforeCompactResult | undefined> => {
-        if (!event.preparation.messagesToSummarize.length && !event.preparation.turnPrefixMessages.length) {
+        if (
+          !event.preparation.messagesToSummarize.length &&
+          !event.preparation.turnPrefixMessages.length
+        ) {
           recordRoute("no-evidence");
           return;
         }
         recordRoute("wrapped-native");
-        const compaction = await compactWithRecovery(ctx, event, config, attemptId, configuredDefaultModel());
-        traceEvent("compaction_outcome", { attemptId, sessionId, route, outcome: "ready", summaryChars: compaction?.summary.length ?? 0 });
+        const compaction = await compactWithRecovery(
+          ctx,
+          event,
+          config,
+          attemptId,
+          configuredDefaultModel(),
+        );
+        traceEvent("compaction_outcome", {
+          attemptId,
+          sessionId,
+          route,
+          outcome: "ready",
+          summaryChars: compaction?.summary.length ?? 0,
+        });
         return compaction ? { compaction } : undefined;
       };
       const servedResult = (served: SessionBeforeCompactResult): SessionBeforeCompactResult => {
         recordRoute("checkpoint");
-        traceEvent("compaction_outcome", { attemptId, sessionId, route, outcome: "ready", summaryChars: served.compaction?.summary.length ?? 0 });
+        traceEvent("compaction_outcome", {
+          attemptId,
+          sessionId,
+          route,
+          outcome: "ready",
+          summaryChars: served.compaction?.summary.length ?? 0,
+        });
         return served;
       };
-      if (requestedNative !== "none" || (event.reason === "manual" && config.manualCompactMode === "native")) {
+      if (
+        requestedNative !== "none" ||
+        (event.reason === "manual" && config.manualCompactMode === "native")
+      ) {
         state.abortPreparing();
         return await nativeCompaction();
       }
@@ -1099,7 +1215,11 @@ export default function shadowCompact(pi: ExtensionAPI): void {
           const served = serveCompaction(ctx, event, published, messagesBefore);
           return served ? servedResult(served) : await nativeCompaction();
         }
-        traceEvent("compaction_fallback", { reason: "uncovered-prefix", firstKeptEntryId: event.preparation.firstKeptEntryId, coverageEnd: published.coverage?.coverageEndEntryId ?? null });
+        traceEvent("compaction_fallback", {
+          reason: "uncovered-prefix",
+          firstKeptEntryId: event.preparation.firstKeptEntryId,
+          coverageEnd: published.coverage?.coverageEndEntryId ?? null,
+        });
       }
 
       // Manual /compact with nothing ready: Shadow becomes the compaction
@@ -1121,7 +1241,6 @@ export default function shadowCompact(pi: ExtensionAPI): void {
           contextTokens: ctx.getContextUsage()?.tokens ?? null,
           contextPercent: ctx.getContextUsage()?.percent ?? null,
           prepareThreshold: config.prepareThresholdPercent,
-          prepareThresholdTokens: config.softCompactThresholdTokens ?? null,
         });
         traceEvent("prepare_started", {
           turn: turnCount,
@@ -1130,7 +1249,6 @@ export default function shadowCompact(pi: ExtensionAPI): void {
           contextTokens: ctx.getContextUsage()?.tokens ?? null,
           contextPercent: ctx.getContextUsage()?.percent ?? null,
           prepareThreshold: config.prepareThresholdPercent,
-          prepareThresholdTokens: config.softCompactThresholdTokens ?? null,
           branchEntries: branch.length,
           leafId: ctx.sessionManager.getLeafId() ?? null,
         });
@@ -1141,7 +1259,16 @@ export default function shadowCompact(pi: ExtensionAPI): void {
         };
         event.signal.addEventListener("abort", onAbort, { once: true });
         try {
-          await prepare(ctx, config, branch.slice(), prepared.controller, prepared.generation, undefined, event.customInstructions, attemptId);
+          await prepare(
+            ctx,
+            config,
+            branch.slice(),
+            prepared.controller,
+            prepared.generation,
+            undefined,
+            event.customInstructions,
+            attemptId,
+          );
         } finally {
           event.signal.removeEventListener("abort", onAbort);
         }
@@ -1160,11 +1287,21 @@ export default function shadowCompact(pi: ExtensionAPI): void {
       return await nativeCompaction();
     } catch (error) {
       if (ownedPreparation) state.abortPreparing();
-      traceEvent("compaction_outcome", { attemptId, sessionId, route, outcome: event.signal.aborted ? "cancelled" : "failed" });
+      traceEvent("compaction_outcome", {
+        attemptId,
+        sessionId,
+        route,
+        outcome: event.signal.aborted ? "cancelled" : "failed",
+      });
       try {
         if (!event.signal.aborted && !isContextStale(ctx)) reportError(ctx, error);
       } catch {
-        traceEvent("compaction_outcome", { attemptId, sessionId, stage: "notification", outcome: "failed" });
+        traceEvent("compaction_outcome", {
+          attemptId,
+          sessionId,
+          stage: "notification",
+          outcome: "failed",
+        });
       }
       return { cancel: true };
     }
@@ -1183,7 +1320,10 @@ export default function shadowCompact(pi: ExtensionAPI): void {
     state.reset();
   });
   pi.on("session_compact_failed", (event) => {
-    traceEvent("compaction_outcome", { ...compactTrace, outcome: event.aborted ? "cancelled" : "failed" });
+    traceEvent("compaction_outcome", {
+      ...compactTrace,
+      outcome: event.aborted ? "cancelled" : "failed",
+    });
     compactTrace = undefined;
     const hadNativeFallback = nativeMode === "fallback";
     clearNativeCompactMarkers();

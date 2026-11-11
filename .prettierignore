@@ -1,14 +1,6 @@
 node_modules/
 dist/
-src/
-test/
 package-lock.json
 .agents/
-docs/
-analysis/
-experiments/
+docs/images/
 .trace/
-README.md
-CHANGELOG.md
-LICENSE
-.nvmrc

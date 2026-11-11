@@ -60,5 +60,7 @@ export function segmentTurns(branch: SessionEntry[]): SessionTurn[] {
 }
 
 function isUserEntry(entry: SessionEntry): boolean {
-  return entry.type === "message" && (entry as { message?: { role?: unknown } }).message?.role === "user";
+  return (
+    entry.type === "message" && (entry as { message?: { role?: unknown } }).message?.role === "user"
+  );
 }

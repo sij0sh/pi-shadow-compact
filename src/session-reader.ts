@@ -96,9 +96,8 @@ function contentText(content: unknown): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
   return content
-    .filter(
-      (part): part is { type: "text"; text: string } =>
-        Boolean(part && typeof part === "object" && (part as { type?: unknown }).type === "text"),
+    .filter((part): part is { type: "text"; text: string } =>
+      Boolean(part && typeof part === "object" && (part as { type?: unknown }).type === "text"),
     )
     .map((part) => part.text)
     .join("\n");
@@ -195,7 +194,10 @@ export class SessionHistoryIndex {
   missingRequiredTurnIds(): string[] {
     const required = new Set(this.requiredTurnIds());
     return this.turns
-      .filter((turn) => required.has(turn.id) && !turn.entryIds.every((id) => this.#inspectedEntryIds.has(id)))
+      .filter(
+        (turn) =>
+          required.has(turn.id) && !turn.entryIds.every((id) => this.#inspectedEntryIds.has(id)),
+      )
       .map((turn) => turn.id);
   }
 
@@ -211,7 +213,13 @@ export class SessionHistoryIndex {
     start: number,
     count: number,
     maxChars = this.#maxPageChars,
-  ): { start: number; end: number; totalEntries: number; entries: ServedEntry[]; nextStart?: number } {
+  ): {
+    start: number;
+    end: number;
+    totalEntries: number;
+    entries: ServedEntry[];
+    nextStart?: number;
+  } {
     const totalEntries = this.#branch.length;
     const clampedStart = Math.max(0, Math.min(start, totalEntries));
     const clampedCount = Math.max(1, Math.min(count, 50));
@@ -221,7 +229,13 @@ export class SessionHistoryIndex {
     const entries = this.page(indices, maxChars);
     this.markInspected(entries.map((entry) => entry.entryId));
     const end = clampedStart + entries.length;
-    return { start: clampedStart, end, totalEntries, entries, ...(end < requestedEnd ? { nextStart: end } : {}) };
+    return {
+      start: clampedStart,
+      end,
+      totalEntries,
+      entries,
+      ...(end < requestedEnd ? { nextStart: end } : {}),
+    };
   }
 
   /**
@@ -233,7 +247,13 @@ export class SessionHistoryIndex {
     startTurn: number,
     count: number,
     maxChars = this.#maxPageChars,
-  ): { startTurn: number; endTurn: number; totalTurns: number; turns: ServedTurn[]; nextTurn?: number } {
+  ): {
+    startTurn: number;
+    endTurn: number;
+    totalTurns: number;
+    turns: ServedTurn[];
+    nextTurn?: number;
+  } {
     const totalTurns = this.turns.length;
     const clampedStart = Math.max(1, Math.min(startTurn, Math.max(1, totalTurns)));
     const clampedCount = Math.max(1, Math.min(count, 25));
@@ -264,7 +284,10 @@ export class SessionHistoryIndex {
   readTurn(turnId: string, entryOffset = 0, maxChars = this.#maxPageChars): ServedTurn {
     const turn = this.turns.find((candidate) => candidate.id === turnId);
     if (!turn) throw new Error(`Unknown turn: ${turnId}`);
-    const offset = Math.max(0, Math.min(Math.floor(entryOffset), Math.max(0, turn.entryIds.length - 1)));
+    const offset = Math.max(
+      0,
+      Math.min(Math.floor(entryOffset), Math.max(0, turn.entryIds.length - 1)),
+    );
     const indices = turn.entryIds.slice(offset).map((id) => this.entryIndex.get(id) ?? 0);
     const entries = this.page(indices, maxChars);
     this.markInspected(entries.map((entry) => entry.entryId));
@@ -319,7 +342,11 @@ export class SessionHistoryIndex {
     const needle = query.trim().toLowerCase();
     if (!needle) return [];
     const hits: SearchHit[] = [];
-    for (let index = 0; index < this.#branch.length && hits.length < Math.max(1, Math.min(limit, 25)); index++) {
+    for (
+      let index = 0;
+      index < this.#branch.length && hits.length < Math.max(1, Math.min(limit, 25));
+      index++
+    ) {
       const text = this.#texts[index]!;
       const at = text.toLowerCase().indexOf(needle);
       if (at < 0) continue;
@@ -336,7 +363,11 @@ export class SessionHistoryIndex {
     return hits;
   }
 
-  previousCheckpoint(): { evidenceId: string; coverageEndEntryId: string | null; summary: string } | null {
+  previousCheckpoint(): {
+    evidenceId: string;
+    coverageEndEntryId: string | null;
+    summary: string;
+  } | null {
     if (!this.#previousCheckpointSummary?.trim()) return null;
     return {
       evidenceId: PREVIOUS_CHECKPOINT_EVIDENCE_ID,
@@ -360,7 +391,8 @@ export class SessionHistoryIndex {
         if (CORRECTION_SIGNALS.test(described.text)) hasUserCorrection = true;
         if (described.text.includes("?")) hasQuestion = true;
       }
-      if (described.kind === "tool_result_error" || described.kind === "bash_error") hasError = true;
+      if (described.kind === "tool_result_error" || described.kind === "bash_error")
+        hasError = true;
     }
     return {
       turnId: turn.id,
@@ -372,10 +404,14 @@ export class SessionHistoryIndex {
       hasUserCorrection,
       hasError,
       hasQuestion,
-      tokenEstimate: estimateTokens(this.#texts.slice(
-        this.entryIndex.get(turn.startEntryId) ?? 0,
-        (this.entryIndex.get(turn.endEntryId) ?? 0) + 1,
-      ).join("\n")),
+      tokenEstimate: estimateTokens(
+        this.#texts
+          .slice(
+            this.entryIndex.get(turn.startEntryId) ?? 0,
+            (this.entryIndex.get(turn.endEntryId) ?? 0) + 1,
+          )
+          .join("\n"),
+      ),
     };
   }
 
@@ -385,7 +421,10 @@ export class SessionHistoryIndex {
         const summary = (entry as { summary?: unknown }).summary;
         return {
           kind: "native_compaction",
-          text: typeof summary === "string" ? `native compaction summary:\n${this.bounded(summary)}` : "native compaction",
+          text:
+            typeof summary === "string"
+              ? `native compaction summary:\n${this.bounded(summary)}`
+              : "native compaction",
         };
       }
       return { kind: entry.type, text: "" };
@@ -403,11 +442,16 @@ export class SessionHistoryIndex {
       for (const part of parts) {
         if (part?.type === "text" && part.text) textParts.push(part.text);
         else if (part?.type === "toolCall") {
-          callParts.push(`tool: ${part.name}\nargs: ${JSON.stringify(redactSecretValue(part.arguments ?? {}))}`);
+          callParts.push(
+            `tool: ${part.name}\nargs: ${JSON.stringify(redactSecretValue(part.arguments ?? {}))}`,
+          );
         }
       }
       const text = [...textParts, ...callParts].join("\n").trim();
-      return { kind: callParts.length > 0 ? "assistant_tool_call" : "assistant", text: this.bounded(text) };
+      return {
+        kind: callParts.length > 0 ? "assistant_tool_call" : "assistant",
+        text: this.bounded(text),
+      };
     }
     if (role === "toolResult") {
       const isError = message.isError === true;
@@ -415,7 +459,9 @@ export class SessionHistoryIndex {
       const output = contentText(message.content);
       return {
         kind: isError ? "tool_result_error" : "tool_result",
-        text: this.bounded(`tool: ${toolName}\nstatus: ${isError ? "error" : "ok"}\noutput:\n${output}`),
+        text: this.bounded(
+          `tool: ${toolName}\nstatus: ${isError ? "error" : "ok"}\noutput:\n${output}`,
+        ),
       };
     }
     if (role === "bashExecution") {
@@ -425,11 +471,16 @@ export class SessionHistoryIndex {
       const output = typeof message.output === "string" ? message.output : "";
       return {
         kind: failed ? "bash_error" : "bash",
-        text: this.bounded(`command: ${command}\nexit: ${message.exitCode ?? "unknown"}\noutput:\n${output}`),
+        text: this.bounded(
+          `command: ${command}\nexit: ${message.exitCode ?? "unknown"}\noutput:\n${output}`,
+        ),
       };
     }
     if (role === "custom" || role === "branchSummary") {
-      return { kind: String(role), text: this.bounded(contentText(message.content) || String(message.summary ?? "")) };
+      return {
+        kind: String(role),
+        text: this.bounded(contentText(message.content) || String(message.summary ?? "")),
+      };
     }
     return { kind: String(role ?? "unknown"), text: "" };
   }
@@ -440,6 +491,8 @@ export class SessionHistoryIndex {
     const marker = `\n...[truncated ${sanitized.length - MAX_ENTRY_TEXT_CHARS} chars]...\n`;
     const available = MAX_ENTRY_TEXT_CHARS - marker.length;
     const head = Math.ceil(available / 2);
-    return sanitized.slice(0, head) + marker + sanitized.slice(sanitized.length - (available - head));
+    return (
+      sanitized.slice(0, head) + marker + sanitized.slice(sanitized.length - (available - head))
+    );
   }
 }

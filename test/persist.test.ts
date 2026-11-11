@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { buildSessionContext, type SessionEntry } from "@earendil-works/pi-coding-agent";
-import { MODE_ENV_VAR } from "../src/config.js";
 import {
   CHECKPOINT_CUSTOM_TYPE,
   collectShadowSummaries,
@@ -15,7 +14,7 @@ import {
   SHADOW_CHAIN_LIMIT,
   type PersistedShadowCheckpoint,
 } from "../src/persist.js";
-import { combineUsage } from "../src/summary.js";
+import { CHECKPOINT_SCHEMA_VERSION, combineUsage } from "../src/summary.js";
 import { SessionHistoryIndex } from "../src/session-reader.js";
 import { TRACE_FILE_ENV_VAR } from "../src/trace.js";
 import {
@@ -86,7 +85,6 @@ function structuredFixture(): PersistedShadowCheckpoint["structured"] {
 }
 
 const COVERAGE = {
-  sourceStartEntryId: null,
   coverageEndEntryId: "e3",
   preparedAtLeafId: "e4",
   publishedAtLeafId: "e4",
@@ -96,7 +94,7 @@ function checkpointData(
   overrides: Partial<PersistedShadowCheckpoint> = {},
 ): PersistedShadowCheckpoint {
   return {
-    version: 3,
+    version: CHECKPOINT_SCHEMA_VERSION,
     checkpointId: "checkpoint-test",
     sessionId: "session-1",
     summary: "# Continuation Checkpoint\n\n## Objective\n- test checkpoint",
@@ -110,14 +108,15 @@ function checkpointData(
     structured: structuredFixture(),
     coverage: COVERAGE,
     prompts: { summaryPromptVersion: 2, verifierPromptVersion: 2 },
-    generatedAt: 0,
     ...overrides,
   };
 }
 
 type TraceRecord = Record<string, unknown> & { event: string };
 
-async function withTraceFile<T>(run: () => Promise<T>): Promise<{ result: T; events: TraceRecord[] }> {
+async function withTraceFile<T>(
+  run: () => Promise<T>,
+): Promise<{ result: T; events: TraceRecord[] }> {
   const dir = await mkdtemp(join(tmpdir(), "shadow-persist-"));
   const path = join(dir, "trace.jsonl");
   const previous = process.env[TRACE_FILE_ENV_VAR];
@@ -163,10 +162,7 @@ describe("persisted checkpoint validation", () => {
       isPersistedShadowCheckpoint({ ...checkpointData(), details: { readFiles: "x" } }),
       false,
     );
-    assert.equal(
-      isPersistedShadowCheckpoint({ ...checkpointData(), usage: { input: 1 } }),
-      false,
-    );
+    assert.equal(isPersistedShadowCheckpoint({ ...checkpointData(), usage: { input: 1 } }), false);
   });
 
   it("finds the newest valid checkpoint, skipping foreign and corrupt entries", async () => {
@@ -196,7 +192,11 @@ describe("persisted checkpoint validation", () => {
         "session-mismatch",
       );
       assert.equal(
-        checkpointStalenessReason(branch, "session-1", checkpointData({ firstKeptEntryId: "missing" })),
+        checkpointStalenessReason(
+          branch,
+          "session-1",
+          checkpointData({ firstKeptEntryId: "missing" }),
+        ),
         "missing-first-kept",
       );
       assert.equal(
@@ -221,7 +221,7 @@ describe("persisted checkpoint validation", () => {
     }
   });
 
-  it("accepts v3 checkpoints and rejects malformed v3 payloads", () => {
+  it("accepts current-schema checkpoints and rejects malformed payloads", () => {
     assert.equal(isPersistedShadowCheckpoint(checkpointData()), true);
     assert.equal(isPersistedShadowCheckpoint({ ...checkpointData(), structured: {} }), false);
     assert.equal(isPersistedShadowCheckpoint({ ...checkpointData(), coverage: null }), false);
@@ -230,8 +230,10 @@ describe("persisted checkpoint validation", () => {
       false,
     );
     assert.equal(isPersistedShadowCheckpoint({ ...checkpointData(), prompts: {} }), false);
-    assert.equal(isPersistedShadowCheckpoint({ ...checkpointData(), generatedAt: "now" }), false);
-    assert.equal(isPersistedShadowCheckpoint({ ...checkpointData(), version: 4 }), false);
+    assert.equal(
+      isPersistedShadowCheckpoint({ ...checkpointData(), version: CHECKPOINT_SCHEMA_VERSION - 1 }),
+      false,
+    );
   });
 
   it("reports missing-coverage-end when the coverage end left the branch", async () => {
@@ -259,9 +261,7 @@ describe("newest current checkpoint wins", () => {
       f.appendCustom(checkpointData({ checkpointId: "B", firstKeptEntryId: "missing" }));
       const search = findLatestRestorableCheckpoint(f.branch, "session-1");
       assert.equal(search.found?.checkpoint.checkpointId, "A");
-      assert.deepEqual(search.skippedStale, [
-        { checkpointId: "B", reason: "missing-first-kept" },
-      ]);
+      assert.deepEqual(search.skippedStale, [{ checkpointId: "B", reason: "missing-first-kept" }]);
     } finally {
       await f.cleanup();
     }
@@ -328,7 +328,12 @@ describe("newest current checkpoint wins", () => {
           checkpointData({
             firstKeptEntryId: "r1",
             leafId: "e2",
-            coverage: { ...COVERAGE, coverageEndEntryId: "r1", preparedAtLeafId: "e2", publishedAtLeafId: "e2" },
+            coverage: {
+              ...COVERAGE,
+              coverageEndEntryId: "r1",
+              preparedAtLeafId: "e2",
+              publishedAtLeafId: "e2",
+            },
           }),
         );
         const g = f.restart();
@@ -353,7 +358,6 @@ describe("newest current checkpoint wins", () => {
     assert.equal(swaps[0]?.action, "skipped-orphan");
     assert.equal(swaps[0]?.messagesDropped, 2);
   });
-
 });
 
 describe("soft durability without compaction", () => {
@@ -371,8 +375,7 @@ describe("soft durability without compaction", () => {
         const [persisted] = f.appendedEntries;
         assert.equal(persisted?.customType, CHECKPOINT_CUSTOM_TYPE);
         const data = persisted?.data as PersistedShadowCheckpoint;
-        assert.equal(data.version, 3);
-        assert.ok(data.version === 3);
+        assert.equal(data.version, CHECKPOINT_SCHEMA_VERSION);
         assert.ok(typeof data.checkpointId === "string" && data.checkpointId.length > 0);
         assert.equal(data.sessionId, "session-1");
         assert.match(data.summary, /Prepared continuation checkpoint/);
@@ -593,29 +596,6 @@ describe("persistent two-turn lifecycle with reload", () => {
     assert.equal(rejected.length, 1);
     assert.equal(rejected[0]?.reason, "session-mismatch");
   });
-
-  it("observe mode restores nothing", async () => {
-    const previous = process.env[MODE_ENV_VAR];
-    process.env[MODE_ENV_VAR] = "observe";
-    try {
-      const f = await fixture();
-      try {
-        f.appendCustom(checkpointData());
-        const g = f.restart();
-        try {
-          await g.emit("session_start");
-          assert.equal(await g.emit("context", { messages: g.contextMessages() }), undefined);
-        } finally {
-          await g.cleanup();
-        }
-      } finally {
-        await f.cleanup();
-      }
-    } finally {
-      if (previous === undefined) delete process.env[MODE_ENV_VAR];
-      else process.env[MODE_ENV_VAR] = previous;
-    }
-  });
 });
 
 describe("checkpoint self-repair (summary omission is not evidence loss)", () => {
@@ -644,7 +624,12 @@ describe("checkpoint self-repair (summary omission is not evidence loss)", () =>
       summary,
       firstKeptEntryId,
       leafId,
-      coverage: { ...COVERAGE, coverageEndEntryId: leafId, preparedAtLeafId: leafId, publishedAtLeafId: leafId },
+      coverage: {
+        ...COVERAGE,
+        coverageEndEntryId: leafId,
+        preparedAtLeafId: leafId,
+        publishedAtLeafId: leafId,
+      },
     });
     assert.equal(isPersistedShadowCheckpoint(data), true);
     return {
@@ -692,14 +677,19 @@ describe("checkpoint self-repair (summary omission is not evidence loss)", () =>
     // The persisted checkpoint entry itself serves no text: recovery must
     // come from raw history, never from re-reading the stale summary.
     const served = indexB.readTurnRange(1, 10);
-    const carrier = served.turns.flatMap((turn) => turn.entries).find((item) => item.entryId === persistedA.id);
+    const carrier = served.turns
+      .flatMap((turn) => turn.entries)
+      .find((item) => item.entryId === persistedA.id);
     assert.equal(carrier?.text, "");
     assert.doesNotMatch(indexB.previousCheckpoint()?.summary ?? "", new RegExp(MARKER));
 
     // Both discovery paths recover the constraint from raw history despite
     // A's omission: keyword search and direct turn reads.
     const hits = indexB.searchSessionHistory(MARKER);
-    assert.ok(hits.some((hit) => hit.entryId === constraint.id), "search recovers the constraint");
+    assert.ok(
+      hits.some((hit) => hit.entryId === constraint.id),
+      "search recovers the constraint",
+    );
     const recovered = served.turns
       .flatMap((turn) => turn.entries)
       .filter((item) => item.text.includes(MARKER));
@@ -751,7 +741,10 @@ describe("checkpoint self-repair (summary omission is not evidence loss)", () =>
     // directly readable, so C recovers the constraint with plain reads.
     const indexC = new SessionHistoryIndex({ branch: branchC, cwd: "/work/project" });
     assert.ok(
-      indexC.readTurnRange(1, 10).turns.flatMap((turn) => turn.entries).some((item) => item.text.includes(MARKER)),
+      indexC
+        .readTurnRange(1, 10)
+        .turns.flatMap((turn) => turn.entries)
+        .some((item) => item.text.includes(MARKER)),
       "C recovers the constraint from pre-compaction raw history",
     );
     // The Shadow chain still carries A as orientation even though A is stale
@@ -760,11 +753,12 @@ describe("checkpoint self-repair (summary omission is not evidence loss)", () =>
     assert.deepEqual(collectShadowSummaries(branchC, "session-1"), [summaryA]);
     const { skippedStale } = findLatestRestorableCheckpoint(branchC, "session-1");
     assert.ok(
-      skippedStale.some((skipped) => skipped.checkpointId === "A" && skipped.reason === "compaction-mismatch"),
+      skippedStale.some(
+        (skipped) => skipped.checkpointId === "A" && skipped.reason === "compaction-mismatch",
+      ),
       "A is stale for restore/swap but remains usable as reader context",
     );
   });
-
 
   it("collectShadowSummaries keeps the newest session-matching summaries within its limit", () => {
     sequence = 0;
