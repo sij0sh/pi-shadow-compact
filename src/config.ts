@@ -271,6 +271,9 @@ const FILE_KEYS = [
   "idleCompact",
   "recentTurns",
   "manualCompactMode",
+  // Owned and validated by the separate limit-failover extension. Shadow Compact
+  // only tolerates the key so both extensions can share one global config file.
+  "limitFailover",
 ] as const;
 
 export function parseConfig(source: string, path: string): ShadowCompactConfig {

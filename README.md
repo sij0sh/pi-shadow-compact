@@ -147,6 +147,10 @@ Optional project configuration (takes precedence):
 <project>/.pi/shadow-compact.json
 ```
 
+The optional `limitFailover` section is shared with the separate `limit-failover` extension. That
+extension reads it from the global file only; a project file can contain the key, but it does not
+affect failover.
+
 See `.pi/shadow-compact.example.json` for the full schema. Checkpoint models resolve in strict
 order: the configured `summarizerModel` / `verificationModel` pair, then Pi's configured default
 model (`defaultProvider` / `defaultModel`), then the model already running the session. A configured
@@ -164,6 +168,16 @@ model that is missing from the registry falls through instead of aborting compac
 | `manualCompactMode`                           | `shadow`         | `shadow` or `native` for manual `/compact`                                                                                      |
 
 Legacy `softCompactThresholdPercent` still loads as an alias for `prepareThresholdPercent`.
+
+The shared failover section is shaped like this:
+
+```json
+"limitFailover": {
+  "enabled": true,
+  "primary": { "provider": "provider", "id": "model" },
+  "backup": { "provider": "backup-provider", "id": "backup-model", "thinkingLevel": "xhigh" }
+}
+```
 
 Two environment variables override the thresholds for one session:
 `SHADOW_COMPACT_SOFT_THRESHOLD_PERCENT` and `SHADOW_COMPACT_NATIVE_THRESHOLD_PERCENT`. Every other

@@ -15,5 +15,10 @@
     "minimumTokens": 20000
   },
   "recentTurns": 10,
-  "manualCompactMode": "shadow"
+  "manualCompactMode": "shadow",
+  "limitFailover": {
+    "enabled": true,
+    "primary": { "provider": "provider", "id": "model" },
+    "backup": { "provider": "backup-provider", "id": "backup-model", "thinkingLevel": "xhigh" }
+  }
 }

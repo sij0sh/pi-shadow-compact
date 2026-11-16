@@ -205,6 +205,23 @@ describe("shadow compact config loading", () => {
     );
   });
 
+  it("tolerates the limitFailover section owned by the failover extension", async (t) => {
+    const cwd = await temporaryCwd(t);
+    await writeJson(globalConfigPath(), {
+      ...configBody(60, "provider", "model"),
+      limitFailover: {
+        enabled: true,
+        primary: { provider: "provider", id: "primary" },
+        backup: { provider: "provider", id: "backup", thinkingLevel: "xhigh" },
+      },
+    });
+
+    assert.deepEqual(
+      await loadConfig(context(cwd)),
+      expectedConfig({ summarizerModel: { provider: "provider", id: "model" } }),
+    );
+  });
+
   it("accepts summaryMaxTokens and thinkingLevel overrides", async (t) => {
     const cwd = await temporaryCwd(t);
     await writeJson(projectConfigPath(cwd), {
